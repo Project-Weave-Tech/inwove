@@ -1,8 +1,8 @@
 {
   "_note": "The pins of the did:webvh library tests. A moved upstream head fails the job until someone updates the pin on purpose (edit this file in a reviewed change).",
-  "didwebvh-ts": { "npm": "3.1.0", "repo": "https://github.com/decentralized-identity/didwebvh-ts", "head": "2b7674cd", "licence": "Apache-2.0" },
-  "didwebvh-rs": { "crate": "0.8.2", "repo": "https://github.com/decentralized-identity/didwebvh-rs", "head": "8e42c368", "licence": "Apache-2.0" },
-  "didwebvh-test-suite": { "repo": "https://github.com/decentralized-identity/didwebvh-test-suite", "head": "43513903", "licence": "Apache-2.0" },
+  "didwebvh-ts": {"npm": "3.1.0", "repo": "https://github.com/decentralized-identity/didwebvh-ts", "head": "2b7674cd", "licence": "Apache-2.0"},
+  "didwebvh-rs": {"crate": "0.8.2", "repo": "https://github.com/decentralized-identity/didwebvh-rs", "head": "8e42c368", "licence": "Apache-2.0"},
+  "didwebvh-test-suite": {"repo": "https://github.com/decentralized-identity/didwebvh-test-suite", "head": "43513903", "licence": "Apache-2.0"},
   "negativeVectors": ["negative-path-traversal-did", "negative-pct-encoded-ip-host", "negative-pct-encoded-traversal", "negative-lowercase-pct-port-ip", "negative-fragment-leaks-into-domain"],
-  "didwebvh-py": { "repo": "https://github.com/decentralized-identity/didwebvh-py", "head": "914df014", "licence": "Apache-2.0", "pipPackage": "did-webvh" }
+  "didwebvh-py": {"repo": "https://github.com/decentralized-identity/didwebvh-py", "head": "31c63941", "licence": "Apache-2.0", "pipPackage": "did-webvh", "movedOnPurpose": {"at": "2026-11-14", "by": "Railroad (bus 16953, answering run 1)", "from": "914df014", "to": "31c63941", "why": "Python's only role is the offline tamper test, off every network path; taking upstream's head costs nothing there and run 2 re-tests it.", "commits": ["200c734e fix: do not return the DIDDoc of a deactivated DID", "31c63941 Merge pull request #52 (fix/deactivated-did-returns-no-document)"]}}
 }

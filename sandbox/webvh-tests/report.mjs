@@ -3,7 +3,7 @@
 // A missing result file is a FAIL ("no result"), never a skip. Every number a job printed is kept.
 import { existsSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { readJson } from './lib.mjs'
+import { HERE, readJson } from './lib.mjs'
 
 const [dir = 'results', outPath = 'report.md'] = process.argv.slice(2)
 const load = (f) => { try { return existsSync(join(dir, f)) ? readJson(join(dir, f)) : null } catch (e) { return { corrupt: String(e) } } }
@@ -41,6 +41,14 @@ for (const p of pins) {
   w(`**${p.job}** (${p.at ?? ''}): ${mark(p.pass)}`, '', table(['check', 'result', 'detail'], p.rows.map((r) => [r.what, r.ok ? 'ok' : 'FAIL', r.detail])), '', `tools: \`${JSON.stringify(p.tools)}\``, '')
 }
 
+// pins moved on purpose (pins.json records each move, who asked for it and the commits it took in)
+const pinFile = readJson(join(HERE, 'pins.json'))
+const moves = Object.entries(pinFile).filter(([, p]) => p && p.movedOnPurpose)
+if (moves.length) {
+  w('### Pins moved on purpose', '')
+  for (const [name, p] of moves) w(`**${name}**: \`${p.movedOnPurpose.from}\` → \`${p.movedOnPurpose.to}\` on ${p.movedOnPurpose.at}, by ${p.movedOnPurpose.by}. ${p.movedOnPurpose.why}`, '', 'Commits taken in (subject lines):', '', ...(p.movedOnPurpose.commits ?? []).map((c) => `- ${c}`), '')
+}
+
 // audit
 w('## audit', '')
 if (R.audit) {
@@ -73,6 +81,10 @@ if (R.roundtrip) {
 
 // witness
 w('## witness-entry observation (d)', '')
+w('What the spec says (did:webvh v1.0, `spec-v1.0/specification.md` in github.com/decentralized-identity/didwebvh at `bf3d9b4c8fe6d604b7e965c87bb996839762b307`, read 2026-11-14; identity.foundation itself was refused from the cloud runner):', '',
+  '> While all parameters in the first Log Entry take effect immediately, some kinds of parameters defined in later entries only take effect *after* that entry has been published. For example, updates to the `witnesses` array take effect only *after* the entry in which they are defined has been published. (lines 438-441)', '',
+  '> If the `witness` property is updated from `{}`, the change is immediately active, and the corresponding log entry **MUST** be witnessed. (line 753)', '',
+  '> If witnesses are active when the `witness` parameter is set to `{}`, that log entry **MUST** be witnessed. (lines 754-757)', '')
 if (R.witness?.cases) {
   w(`Question: ${R.witness.question}`, '', table(['case', 'didwebvh-ts', 'didwebvh-rs', 'didwebvh-py (information only)'], R.witness.cases.map((c) => [c.case, ...['ts', 'rs', 'py'].map((l) => (c.libs[l] ? (c.libs[l].accepted ? `ACCEPTS (${c.libs[l].versionId})` : `refuses: ${c.libs[l].error}`) : '-'))])), '', R.witness.note, R.witness.suiteVector ? `\n${R.witness.suiteVector}` : '', '')
   w(`Line (d): ${verdictOf(R.witness)}`, '')
