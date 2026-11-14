@@ -1,0 +1,269 @@
+name: webvh-library-tests
+# Tests the did:webvh libraries against each other: didwebvh-ts 3.1.0, didwebvh-rs 0.8.2 and (tamper and probes only, offline) didwebvh-py.
+# TEST VALUES ONLY: every key, log and host is generated inside a job and thrown away with it. No real person's key, no secret, no deploy.
+# Read-only by construction: no secrets, no environments, no id-token, no pull_request_target/workflow_run. Same rules as interop-tests.yml.
+# Edits to this file always go to Faolan as a push card (never the standing merge).
+# Gate (every run): (a) round trip between two implementations, (b) tamper test, (c) network watch, (d) witness-rule meaning split.
+# A missing result is a failure, never a skip. The `report` job writes one markdown report to the step summary and uploads it.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'claude/wpi-build-webvh-**'
+permissions:
+  contents: read
+env:
+  WPI_DIR: sandbox/webvh-tests
+jobs:
+  audit:
+    name: audit (npm audit + cargo audit on the pinned versions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: current stable Rust (didwebvh-rs 0.8.2 needs 1.95 or newer)
+        run: rustup update stable --no-self-update && rustc --version
+      - name: pins and licences (full shas recorded; fails the job at its end if a pinned repo moved)
+        id: pins
+        continue-on-error: true
+        env:
+          WPI_JOB: audit
+        run: node "$WPI_DIR/check-pins.mjs" results
+      - name: licence fields of the production dependencies are unchanged
+        run: node "$WPI_DIR/check-licences.mjs"
+      - name: install cargo-audit (pinned)
+        run: cargo install cargo-audit --locked --version =0.23.0
+      - name: npm audit and cargo audit
+        run: node "$WPI_DIR/audit.mjs" work/audit results
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: results-audit
+          path: results
+          retention-days: 14
+      - name: fail if a pin moved
+        if: always() && steps.pins.outcome == 'failure'
+        run: echo "a pinned repo moved or a licence changed (see the pins step); update pins.json on purpose" && exit 1
+
+  suite:
+    name: suite (each library's own entry, pinned test-suite sha)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: current stable Rust (didwebvh-rs 0.8.2 needs 1.95 or newer)
+        run: rustup update stable --no-self-update && rustc --version
+      - name: pins and licences (full shas recorded; fails the job at its end if a pinned repo moved)
+        id: pins
+        continue-on-error: true
+        env:
+          WPI_JOB: suite
+        run: node "$WPI_DIR/check-pins.mjs" results
+      - name: check out the pinned test suite (full sha recorded)
+        run: bash "$WPI_DIR/ci/fetch-suite.sh" "$RUNNER_TEMP/suite"
+      - name: run each library's own suite entry (Docker) and count the results
+        run: node "$WPI_DIR/suite.mjs" "$RUNNER_TEMP/suite" results
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: results-suite
+          path: results
+          retention-days: 14
+      - name: fail if a pin moved
+        if: always() && steps.pins.outcome == 'failure'
+        run: echo "a pinned repo moved or a licence changed (see the pins step); update pins.json on purpose" && exit 1
+
+  roundtrip:
+    name: roundtrip (TS <-> Rust, move, witness entry)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: current stable Rust (didwebvh-rs 0.8.2 needs 1.95 or newer)
+        run: rustup update stable --no-self-update && rustc --version
+      - uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+        with:
+          workspaces: sandbox/webvh-tests/rs
+          shared-key: webvh-harness
+      - name: build the Rust harness (locked)
+        run: cargo build --locked --manifest-path sandbox/webvh-tests/rs/Cargo.toml
+      - name: install didwebvh-py from its pinned sha (information column only here)
+        run: bash "$WPI_DIR/ci/install-py.sh" "$RUNNER_TEMP/py"
+      - name: pins and licences (full shas recorded; fails the job at its end if a pinned repo moved)
+        id: pins
+        continue-on-error: true
+        env:
+          WPI_JOB: roundtrip
+        run: node "$WPI_DIR/check-pins.mjs" results --python "$WPI_PYTHON"
+      - name: check out the pinned test suite (for the witness-update vector)
+        run: bash "$WPI_DIR/ci/fetch-suite.sh" "$RUNNER_TEMP/suite"
+      - name: roundtrip and witness-entry observation
+        env:
+          WPI_VECTORS_DIR: ${{ runner.temp }}/suite/vectors
+        run: node "$WPI_DIR/roundtrip.mjs" work/roundtrip results
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: results-roundtrip
+          path: results
+          retention-days: 14
+      - name: the valid logs (public documents, no keys) for tamper and netwatch
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: roundtrip-logs
+          path: work/roundtrip/logs-for-tamper
+          retention-days: 3
+      - name: fail if a pin moved
+        if: always() && steps.pins.outcome == 'failure'
+        run: echo "a pinned repo moved or a licence changed (see the pins step); update pins.json on purpose" && exit 1
+
+  tamper:
+    name: tamper (broken logs, three libraries)
+    needs: roundtrip
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: current stable Rust (didwebvh-rs 0.8.2 needs 1.95 or newer)
+        run: rustup update stable --no-self-update && rustc --version
+      - uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+        with:
+          workspaces: sandbox/webvh-tests/rs
+          shared-key: webvh-harness
+      - name: build the Rust harness (locked)
+        run: cargo build --locked --manifest-path sandbox/webvh-tests/rs/Cargo.toml
+      - name: install didwebvh-py from its pinned sha
+        run: bash "$WPI_DIR/ci/install-py.sh" "$RUNNER_TEMP/py"
+      - name: pins and licences (full shas recorded; fails the job at its end if a pinned repo moved)
+        id: pins
+        continue-on-error: true
+        env:
+          WPI_JOB: tamper
+        run: node "$WPI_DIR/check-pins.mjs" results --python "$WPI_PYTHON"
+      - name: check out the pinned test suite (negative vectors)
+        run: bash "$WPI_DIR/ci/fetch-suite.sh" "$RUNNER_TEMP/suite"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: roundtrip-logs
+          path: work/roundtrip-logs
+      - name: strace for the empty-namespace probes
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends strace
+      - name: tamper
+        run: node "$WPI_DIR/tamper.mjs" work/roundtrip-logs work/tamper results "$RUNNER_TEMP/suite/vectors"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: results-tamper
+          path: results
+          retention-days: 14
+      - name: fail if a pin moved
+        if: always() && steps.pins.outcome == 'failure'
+        run: echo "a pinned repo moved or a licence changed (see the pins step); update pins.json on purpose" && exit 1
+
+  netwatch:
+    name: netwatch (no network, then an egress log)
+    needs: roundtrip
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: current stable Rust (didwebvh-rs 0.8.2 needs 1.95 or newer)
+        run: rustup update stable --no-self-update && rustc --version
+      - uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+        with:
+          workspaces: sandbox/webvh-tests/rs
+          shared-key: webvh-harness
+      - name: build the Rust harness (locked)
+        run: cargo build --locked --manifest-path sandbox/webvh-tests/rs/Cargo.toml
+      - name: install didwebvh-py from its pinned sha
+        run: bash "$WPI_DIR/ci/install-py.sh" "$RUNNER_TEMP/py"
+      - name: pins and licences (full shas recorded; fails the job at its end if a pinned repo moved)
+        id: pins
+        continue-on-error: true
+        env:
+          WPI_JOB: netwatch
+        run: node "$WPI_DIR/check-pins.mjs" results --python "$WPI_PYTHON"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: roundtrip-logs
+          path: work/roundtrip-logs
+      - name: strace and unshare
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends strace util-linux
+      - name: netwatch (empty network namespace via sudo unshare -n; strace -f -e trace=connect)
+        run: node "$WPI_DIR/netwatch.mjs" work/roundtrip-logs work/netwatch results
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: results-netwatch
+          path: results
+          retention-days: 14
+      - name: fail if a pin moved
+        if: always() && steps.pins.outcome == 'failure'
+        run: echo "a pinned repo moved or a licence changed (see the pins step); update pins.json on purpose" && exit 1
+
+  report:
+    name: report
+    needs: [audit, suite, roundtrip, tamper, netwatch]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          pattern: results-*
+          merge-multiple: true
+          path: all-results
+      - name: write the report (a missing result is a failure)
+        run: |
+          mkdir -p all-results
+          node "$WPI_DIR/report.mjs" all-results report.md || echo "REPORT_FAILED=1" >> "$GITHUB_ENV"
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: webvh-report
+          path: report.md
+          retention-days: 30
+      - name: fail the run if the report says it failed
+        if: env.REPORT_FAILED == '1'
+        run: exit 1
