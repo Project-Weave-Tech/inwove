@@ -47,5 +47,5 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   if (!dataDir && !src) { console.error('usage: node agent/check-member-join-invites.js <room url | export.json | --data-dir <copy>> [--lines-out file]'); process.exit(2) }
   const r = checkMemberJoinInvites(await readEntries(src, dataDir))
   console.log(JSON.stringify({ memberJoinsWithInvite: r.memberJoinsWithInvite, stillValid: r.stillValid }))
-  if (linesOut && r.lines.length) { rmSync(linesOut, { force: true }); writeFileSync(linesOut, r.lines.join('\n') + '\n', { mode: 0o600 }) } // removed first: the mode is only set on a new file (Security 15279)
+  if (linesOut && r.lines.length) { rmSync(linesOut, { force: true }); writeFileSync(linesOut, r.lines.join('\n') + '\n', { mode: 0o600, flag: 'wx' }) } // removed first: the mode is only set on a new file (Security 15279); 'wx' refuses a link placed between the remove and the write (Security 15957)
 }
