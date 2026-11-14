@@ -45,10 +45,10 @@ export async function gate () {
     const room = session?.ok ? (session.body.room?.name ?? 'this room') : 'this room'
     const problem = (el) => (msg) => { el.textContent = msg; el.hidden = !msg }
     const busy = (btn, label) => { btn.disabled = true; const was = btn.textContent; btn.textContent = label; return () => { btn.disabled = false; btn.textContent = was } }
-    async function finish () {
+    async function finish (tab = '') {
       let s = null
       try { s = await call('/api/session') } catch {}
-      if (invite) history.replaceState(null, '', '/')
+      if (invite || tab) history.replaceState(null, '', tab ? `/#tab=${tab}` : '/')
       open(); resolve(s?.ok ? s.body : { signedIn: true })
     }
 
@@ -139,7 +139,11 @@ export async function gate () {
         const joined = group
           ? await call('/api/entries', signedDocument(me, { type: TYPES.join, payload: { name: nm, groupInvite: toHex(sha256(invite)) } }), { 'x-inwove-invite': invite })
           : await call('/api/entries', signedDocument(me, { type: TYPES.join, payload: { name: nm, invite } }))
-        if (!joined.ok) { if (made) store.set('wpi.seed', null); done(); return say(why(joined, 'The room did not take that invitation.')) }
+        if (!joined.ok) {
+          if (made) store.set('wpi.seed', null); done()
+          if (!made && joined.status === 403 && /already a member/i.test(why(joined, ''))) return alreadyMember(me) // nothing was spent: the invite stays good
+          return say(why(joined, 'The room did not take that invitation.'))
+        }
         done(); signedIn(me, nm)
       }
       card(h('h1', null, 'You\'re invited to InWove'), // the room never says who invited you: the link is the whole answer
@@ -147,6 +151,20 @@ export async function gate () {
         h('label', null, 'Your name', name), msg,
         h('div', { class: 'row' }, h('span', { class: 'grow meta' }, 'Nothing else for now. You can add more about yourself later.'), go),
         h('p', { class: 'meta' }, 'The host of this room can read everything said here.'))
+    }
+
+    // ---- a member opened an invite meant for someone else: the room did not use it (Anren Marketing 15200: the words and the button)
+    function alreadyMember (me) {
+      const msg = h('p', { class: 'gate-error', role: 'alert', hidden: true }), say = problem(msg)
+      const toMap = h('button', { class: 'btn primary', onclick: async () => {
+        const done = busy(toMap, 'Signing you in…'); say('')
+        const r = await keySignIn(me); done()
+        if (!r.ok) return say(r.error)
+        finish('map')
+      } }, 'Open the map')
+      card(h('h1', null, 'You\'re already a member, so this invite wasn\'t used.'),
+        h('p', { class: 'why' }, 'Keep it for the person it was made for.'),
+        msg, h('div', { class: 'row' }, h('span', { class: 'grow' }), toMap))
     }
 
     // ---- joined: sign in with the new key, then make a passkey

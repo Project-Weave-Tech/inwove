@@ -11,7 +11,7 @@
 // --data-dir opens the folder as a database: give it a scratch copy, never the live room's own folder.
 // --lines-out <file> (optional): when stillValid > 0, also writes, owner-only, the hash of each line that made a
 // still-valid invite (a line hash, never the code), so its maker or the host can turn that link off.
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { State } from '../src/server/state.js'
 
 async function readEntries (src, dataDir) {
@@ -47,5 +47,5 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   if (!dataDir && !src) { console.error('usage: node agent/check-member-join-invites.js <room url | export.json | --data-dir <copy>> [--lines-out file]'); process.exit(2) }
   const r = checkMemberJoinInvites(await readEntries(src, dataDir))
   console.log(JSON.stringify({ memberJoinsWithInvite: r.memberJoinsWithInvite, stillValid: r.stillValid }))
-  if (linesOut && r.lines.length) writeFileSync(linesOut, r.lines.join('\n') + '\n', { mode: 0o600 })
+  if (linesOut && r.lines.length) { rmSync(linesOut, { force: true }); writeFileSync(linesOut, r.lines.join('\n') + '\n', { mode: 0o600 }) } // removed first: the mode is only set on a new file (Security 15279)
 }

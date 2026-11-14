@@ -35,8 +35,12 @@ export async function createAccess (ctx, { send: sendIt, readBody, refuse: refus
   ctx.flushInviteMisses = async () => {
     if (!db || !pendingMisses.size) return
     const rows = [...pendingMisses]; pendingMisses.clear()
-    for (const [k, n] of rows) {
-      try { await db.query('insert into invite_misses (day, what, n) values ($1, $2, $3) on conflict (day, what) do update set n = invite_misses.n + excluded.n', [k.slice(0, 10), k.slice(11), n]) } catch (err) { pendingMisses.set(k, (pendingMisses.get(k) ?? 0) + n); throw err } // kept for the next try, never dropped
+    for (let i = 0; i < rows.length; i++) {
+      const [k, n] = rows[i]
+      try { await db.query('insert into invite_misses (day, what, n) values ($1, $2, $3) on conflict (day, what) do update set n = invite_misses.n + excluded.n', [k.slice(0, 10), k.slice(11), n]) } catch (err) {
+        for (const [k2, n2] of rows.slice(i)) pendingMisses.set(k2, (pendingMisses.get(k2) ?? 0) + n2) // this row and every one not yet written are kept for the next try, never dropped (Security 15279)
+        throw err
+      }
     }
   }
   /** The last `days` days' rows, the database's and the ones not yet written. */

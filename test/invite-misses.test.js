@@ -73,3 +73,28 @@ describe('wrong invite codes: one counter for both doors, kept per day', () => {
     assert.ok(!JSON.stringify(r.body.wrongCodesByDay).includes('127.0.0.1'))
   })
 })
+
+describe('a failed write of the counts keeps every row not yet written (Security 15279)', () => {
+  let room
+  before(async () => { room = await startRoom({ extra: { inviteMissesPerMinute: 50 } }) })
+  after(() => room.stop())
+
+  test('the first insert fails with two kinds pending: both are still counted after', async () => {
+    await room.ctx.flushInviteMisses()
+    assert.equal((await room.call('/api/invite', { method: 'POST', body: { code: newCode() } })).status, 200) // a lookup of a code the room doesn't know: a lookup miss
+    assert.equal((await room.say(newIdentity(), 'join', { name: 'Stranger', invite: newCode() })).status, 403) // a join miss
+    const db = room.ctx.db, real = db.query.bind(db)
+    db.query = async (sql, params) => { if (/^insert into invite_misses/.test(sql)) throw new Error('database hiccup'); return real(sql, params) }
+    try {
+      await assert.rejects(room.ctx.flushInviteMisses(), /database hiccup/)
+      const days = await room.ctx.inviteMissDays() // its own flush fails again, quietly; the pending rows are still shown
+      const n = (what) => days.find((x) => x.what === what)?.n ?? 0
+      assert.equal(n('lookup'), room.ctx.inviteMissCount.lookup); assert.equal(n('join'), room.ctx.inviteMissCount.join)
+      assert.ok(n('lookup') >= 1 && n('join') >= 1)
+    } finally { db.query = real }
+    await room.ctx.flushInviteMisses() // and once the database answers, both are written
+    const { rows } = await room.ctx.db.query('select what, n from invite_misses')
+    const w = (what) => Number(rows.find((r) => r.what === what)?.n ?? 0)
+    assert.equal(w('lookup'), room.ctx.inviteMissCount.lookup); assert.equal(w('join'), room.ctx.inviteMissCount.join)
+  })
+})

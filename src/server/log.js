@@ -172,7 +172,7 @@ export class Log extends EventEmitter {
     let spending = null
     // a current member's join (a fresh session, a new name) never carries an invite: the room would not spend it, so it
     // would stay live inside a signed line every AI and every downloader can read (Security 17716)
-    if (name === 'join' && st.isCurrentMember(doc.issuer) && (doc.payload.invite !== undefined || doc.payload.groupInvite !== undefined)) throw new TaskError('permissionDenied', 'you are already a member here, so this invite was not used: keep it for the person it was made for', { status: 403 })
+    if (name === 'join' && st.isCurrentMember(doc.issuer) && (doc.payload.invite !== undefined || doc.payload.groupInvite !== undefined)) throw new TaskError('permissionDenied', 'You\'re already a member, so this invite wasn\'t used. Keep it for the person it was made for.', { status: 403 })
     if (name === 'join' && !this.openRoom && !st.isCurrentMember(doc.issuer)) {
       const group = doc.payload.groupInvite
       if (!doc.payload.invite && !group) throw new TaskError('permissionDenied', 'this room is for members: join with the invite link a member gave you', { status: 403 })
