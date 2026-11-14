@@ -25,8 +25,31 @@ export async function createAccess (ctx, { send: sendIt, readBody, refuse: refus
   const misses = ctx.inviteMisses = new Limiter({ max: config.inviteMissesPerMinute ?? 10 })
   ctx.inviteMissCount = { lookup: 0, join: 0, slowed: 0 }
   const missedTooOften = (ip) => { const t = Date.now(), recent = (misses.hits.get(ip) ?? []).filter((x) => x > t - misses.windowMs); return recent.length >= misses.max }
-  ctx.inviteMissed = (ip, where) => { ctx.inviteMissCount[where] = (ctx.inviteMissCount[where] ?? 0) + 1; misses.hit(ip) }
+  // kept durably as one row per day and kind (lookup, join, slowed) in invite_misses, never an address or a code (Security 18457, follow-up 3);
+  // counted in memory and written each minute, and on stop, so a restart loses nothing already written
+  const pendingMisses = new Map()
+  const countMiss = (what) => { ctx.inviteMissCount[what] = (ctx.inviteMissCount[what] ?? 0) + 1; const k = `${new Date().toISOString().slice(0, 10)} ${what}`; pendingMisses.set(k, (pendingMisses.get(k) ?? 0) + 1) }
+  ctx.inviteMissed = (ip, where) => { countMiss(where); misses.hit(ip) }
+  ctx.inviteSlowed = () => countMiss('slowed')
   ctx.inviteMissedTooOften = missedTooOften
+  ctx.flushInviteMisses = async () => {
+    if (!db || !pendingMisses.size) return
+    const rows = [...pendingMisses]; pendingMisses.clear()
+    for (const [k, n] of rows) {
+      try { await db.query('insert into invite_misses (day, what, n) values ($1, $2, $3) on conflict (day, what) do update set n = invite_misses.n + excluded.n', [k.slice(0, 10), k.slice(11), n]) } catch (err) { pendingMisses.set(k, (pendingMisses.get(k) ?? 0) + n); throw err } // kept for the next try, never dropped
+    }
+  }
+  /** The last `days` days' rows, the database's and the ones not yet written. */
+  ctx.inviteMissDays = async (days = 7) => {
+    await ctx.flushInviteMisses().catch(() => {})
+    const since = new Date(Date.now() - (days - 1) * 86_400_000).toISOString().slice(0, 10)
+    const { rows } = await db.query('select day, what, n from invite_misses where day >= $1 order by day, what', [since])
+    const out = new Map(rows.map((r) => [`${r.day} ${r.what}`, Number(r.n)]))
+    for (const [k, n] of pendingMisses) out.set(k, (out.get(k) ?? 0) + n) // a write that failed is still shown
+    return [...out].map(([k, n]) => ({ day: k.slice(0, 10), what: k.slice(11), n })).sort((x, y) => x.day.localeCompare(y.day) || x.what.localeCompare(y.what))
+  }
+  const missTimer = setInterval(() => ctx.flushInviteMisses().catch((err) => console.error('invite misses: could not write the day\'s counts:', err.message)), 60_000); missTimer.unref?.()
+  ctx.stopInviteMisses = async () => { clearInterval(missTimer); await ctx.flushInviteMisses().catch(() => {}) }
   // every answer here returns true: the request is handled (the room's own send and refuse return nothing)
   const send = (...a) => { sendIt(...a); return true }
   const refuse = (...a) => { refuseIt(...a); return true }
@@ -89,7 +112,7 @@ export async function createAccess (ctx, { send: sendIt, readBody, refuse: refus
         const inBody = path === '/api/invite'
         if (inBody ? req.method !== 'POST' : req.method !== 'GET') return send(res, 405, { error: inBody ? 'POST only' : 'GET only' })
         const ip = ipOf(req)
-        if (missedTooOften(ip)) { ctx.inviteMissCount.slowed++; return tooMany(res) }
+        if (missedTooOften(ip)) { ctx.inviteSlowed(); return tooMany(res) }
         if (!lookups.hit(ip)) return tooMany(res)
         let code = path.slice(12)
         if (inBody) { try { code = JSON.parse(await readBody(req))?.code } catch { code = null } }
@@ -139,6 +162,7 @@ export async function createAccess (ctx, { send: sendIt, readBody, refuse: refus
         const now = Date.now(), links = [...st().invites.values()].filter((i) => i.group).sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).slice(0, GROUP_LINKS_SHOWN)
         return send(res, 200, {
           wrongCodes: { ...ctx.inviteMissCount }, // counts only: wrong codes looked up or joined with since the room started, and how often an address was slowed
+          wrongCodesByDay: await ctx.inviteMissDays(), // the same, one row per day and kind for the last week, kept across restarts
           links: links.map((i) => {
             const state = i.stopped ? 'stopped' : i.dead || !st().isCurrentMember(i.by) ? 'maker gone' : i.group.max && i.joined.length >= i.group.max ? 'full' : Date.parse(i.expiresAt) <= now ? 'ended' : 'open'
             return { hash: i.hash, name: i.group.name, max: i.group.max ?? null, by: nameOf(i.by), at: i.at, expiresAt: i.expiresAt, state, stoppedAt: i.stopped?.at ?? null, joined: i.joined.map((j) => ({ name: nameOf(j.did), at: j.at })) }

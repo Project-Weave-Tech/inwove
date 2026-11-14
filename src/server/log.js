@@ -34,6 +34,9 @@ export class TaskError extends Error {
   }
 }
 
+/** A refusal because the invite a join carried did not open (a wrong, spent, ended or full code): counted as a miss and slowed per address, the same for both doors. */
+export const inviteMiss = (message) => Object.assign(new TaskError('permissionDenied', message, { status: 403 }), { inviteMiss: true })
+
 export class Log extends EventEmitter {
   constructor ({ db, identity, resolver, config, openRoom = false }) {
     super()
@@ -174,14 +177,14 @@ export class Log extends EventEmitter {
       const group = doc.payload.groupInvite
       if (!doc.payload.invite && !group) throw new TaskError('permissionDenied', 'this room is for members: join with the invite link a member gave you', { status: 403 })
       const code = group ? inviteCode : doc.payload.invite
-      if (group && !(typeof code === 'string' && createHash('sha256').update(code, 'utf8').digest('hex') === group)) throw new TaskError('permissionDenied', 'a group link\'s code goes beside the join, and it must be the code of the link this join names: open the link again', { status: 403 })
+      if (group && !(typeof code === 'string' && createHash('sha256').update(code, 'utf8').digest('hex') === group)) throw inviteMiss('a group link\'s code goes beside the join, and it must be the code of the link this join names: open the link again')
       const ok = st.inviteFor(code, Date.now()), h = createHash('sha256').update(code, 'utf8').digest('hex')
-      if (!ok.ok) throw new TaskError('permissionDenied', INVITE_WORDS[ok.reason], { status: 403 })
+      if (!ok.ok) throw inviteMiss(INVITE_WORDS[ok.reason])
       if (!group && ok.invite.group) throw new TaskError('permissionDenied', 'that is a group link: join from its page, so its code stays out of the record', { status: 403 })
       if (group && !ok.invite.group) throw new TaskError('permissionDenied', 'that link is for one person: join with it as an invite', { status: 403 })
       const busy = this.reserved.get(h) ?? 0
-      if (!group && busy) throw new TaskError('permissionDenied', INVITE_WORDS.used, { status: 403 })
-      if (group && ok.invite.group.max && ok.invite.joined.length + busy >= ok.invite.group.max) throw new TaskError('permissionDenied', INVITE_WORDS.full, { status: 403 })
+      if (!group && busy) throw inviteMiss(INVITE_WORDS.used)
+      if (group && ok.invite.group.max && ok.invite.joined.length + busy >= ok.invite.group.max) throw inviteMiss(INVITE_WORDS.full)
       this.reserved.set(h, busy + 1); spending = h
     }
     if (name === 'note' && doc.payload.copiedFrom) this.copying.add(doc.payload.copiedFrom) // held with no await since the check above

@@ -492,11 +492,13 @@ export async function createApp (config = defaultConfig, { openRoom = false, res
       try {
         doc = JSON.parse(await readBody(req))
         const code = req.headers['x-inwove-invite'] // a group link's code rides beside a join, never inside the signed line (log.js)
-        if (code !== undefined && ctx.inviteMissedTooOften?.(ipOf(req))) { ctx.inviteMissCount.slowed++; return send(res, 429, { error: 'Too many tries. Wait a minute, then try again.' }) }
+        // both doors share one counter: a group link's code beside the join, or a one-person code inside it (Security 18457, follow-up 2)
+        const tries = code !== undefined || (doc?.type === TYPES.join && doc.payload?.invite !== undefined)
+        if (tries && ctx.inviteMissedTooOften?.(ipOf(req))) { ctx.inviteSlowed?.(); return send(res, 429, { error: 'Too many tries. Wait a minute, then try again.' }) }
         try {
           const { entry, duplicate, hosted: made } = await ctx.acceptEntry(doc, { ip: ipOf(req), origin: baseOf(req), inviteCode: typeof code === 'string' && /^[A-Za-z0-9_-]{22,64}$/.test(code) ? code : null })
           return send(res, duplicate ? 200 : 201, made ? { ...entry, hosted: made } : entry)
-        } catch (err) { if (code !== undefined && err instanceof TaskError && err.status === 403) ctx.inviteMissed?.(ipOf(req), 'join'); throw err } // a group join the room refused: counted, and slowed per address
+        } catch (err) { if (tries && err?.inviteMiss) ctx.inviteMissed?.(ipOf(req), 'join'); throw err } // a join whose invite did not open: counted, and slowed per address
       } catch (err) { return refuse(res, err, doc) }
     }
     if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'method not allowed' })
@@ -570,7 +572,7 @@ export async function createApp (config = defaultConfig, { openRoom = false, res
     ctx.sources.start()
     timers.push(setInterval(() => closeVotes(ctx).catch((e) => console.error('closing votes:', e)), 30_000))
   }
-  ctx.stop = async () => { await ctx.geb?.stop().catch(() => {}); ctx.waits.stop(); timers.forEach(clearInterval); ctx.check.stop(); ctx.host.stop(); ctx.changes.stop(); ctx.workshop.stop(); ctx.sources.stop(); ctx.shelf.flush(); ctx.cursors.save(); ctx.activitypub.stop(); waker.stop(); ctx.away.stop(); for (const r of sse.keys()) r.end(); server.close(); await db.close() }
+  ctx.stop = async () => { await ctx.geb?.stop().catch(() => {}); await ctx.stopInviteMisses?.(); ctx.waits.stop(); timers.forEach(clearInterval); ctx.check.stop(); ctx.host.stop(); ctx.changes.stop(); ctx.workshop.stop(); ctx.sources.stop(); ctx.shelf.flush(); ctx.cursors.save(); ctx.activitypub.stop(); waker.stop(); ctx.away.stop(); for (const r of sse.keys()) r.end(); server.close(); await db.close() }
   ctx.server = server
   return ctx
 }
