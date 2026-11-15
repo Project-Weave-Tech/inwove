@@ -169,6 +169,27 @@ jobs:
           test "$(git -C "$RUNNER_TEMP/med" rev-parse HEAD)" = "$MED_SHA"
           echo "mediator at $(git -C "$RUNNER_TEMP/med" rev-parse HEAD)"
           grep -q '^local_direct_delivery_allowed = ' "$RUNNER_TEMP/med/docker/test/conf/mediator.toml"
+      - name: the resolved feature set has no vta and no secrets-* (condition 16, 1a; the default build is the control)
+        # Security 11984: feature unification can switch a feature back on from inside the graph, so the resolved set
+        # is checked, not the flags. The record's sha256 goes in L8 beside the binary pin. The default build must fail
+        # the same check (it carries vta-sdk), or the check proves nothing.
+        id: feats
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/med
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/$OUT"
+          cargo tree -e features -p affinidi-messaging-mediator --no-default-features --features "$MED_FEATURES" --locked > "$RUNNER_TEMP/tree-lean.txt"
+          cargo tree -e features -p affinidi-messaging-mediator --locked > "$RUNNER_TEMP/tree-default.txt"
+          lean=0; node "$GITHUB_WORKSPACE/$WPI_DIR/mediator-features.mjs" "$RUNNER_TEMP/tree-lean.txt" "$RUNNER_TEMP/med" "$GITHUB_WORKSPACE/$OUT/features-lean.json" || lean=$?
+          ctl=0; node "$GITHUB_WORKSPACE/$WPI_DIR/mediator-features.mjs" "$RUNNER_TEMP/tree-default.txt" "$RUNNER_TEMP/med" "$GITHUB_WORKSPACE/$OUT/features-control.json" --expect-fail || ctl=$?
+          test "$lean" -eq 0 && test "$ctl" -eq 0
+      - name: every environment name the mediator's own crates read is on the allow or deny list (condition 16.2(b))
+        # Security's wording in L8: an unlisted name, a prefix read (MEDIATOR_TAG_ ...) or a name the grep can't resolve
+        # fails the job. At this pin it is red (88 names on neither list, 1 prefix read, 1 unresolved): the lists are
+        # Security's to widen, never this job's. Dependencies' reads are closed by `env -i` + the /proc environ test.
+        id: envreads
+        continue-on-error: true
+        run: node "$WPI_DIR/mediator-env-reads.mjs" "$RUNNER_TEMP/med" "$WPI_DIR/mediator-env-lists.json" "$OUT/env-reads.json"
       - name: build the mediator (locked, the lean feature set, no `vta`)
         # Railroad 11973: the running mediator never holds the admin key, so the build has no `vta` (no boot-time
         # admin-credential load, no `rotate-admin`). The set is recorded in L8 beside the pin and the conf hash; a move
@@ -186,10 +207,14 @@ jobs:
           # No subcommand list at all in a build without `vta` (the help's prose still names rotate-admin, so not grep'd).
           if grep -q '^Commands:' "$RUNNER_TEMP/help.txt"; then cmds=present; else cmds=absent; fi
           ra=0; timeout 20 "$bin" rotate-admin --help > /dev/null 2>&1 || ra=$?
-          printf '{"features":"%s","help_exit":%d,"commands_section":"%s","rotate_admin_help_exit":%d}\n' "$MED_FEATURES" "$help" "$cmds" "$ra" > "$OUT/lean-build.json"
+          # Pass = --help exits 0, no Commands section, rotate-admin --help exits non-zero and not by timeout (124),
+          # and no mediator-setup binary here.
+          # 1(b): the setup binary writes the admin credential, so it lives only in the setup job, never beside the
+          # running mediator. This job builds only the mediator package; the host image gets the same check.
+          if [ -e "$RUNNER_TEMP/med/target/release/mediator-setup" ] || command -v mediator-setup > /dev/null 2>&1; then setup=present; else setup=absent; fi
+          printf '{"features":"%s","help_exit":%d,"commands_section":"%s","rotate_admin_help_exit":%d,"mediator_setup":"%s"}\n' "$MED_FEATURES" "$help" "$cmds" "$ra" "$setup" > "$OUT/lean-build.json"
           cat "$OUT/lean-build.json"
-          # Pass = --help exits 0, no Commands section, rotate-admin --help exits non-zero and not by timeout (124).
-          test "$help" -eq 0 && test "$cmds" = absent && test "$ra" -ne 0 && test "$ra" -ne 124
+          test "$help" -eq 0 && test "$cmds" = absent && test "$ra" -ne 0 && test "$ra" -ne 124 && test "$setup" = absent
       - name: Redis by digest (fails if the digest doesn't match)
         run: |
           docker pull -q "$REDIS_IMAGE"
@@ -218,8 +243,8 @@ jobs:
           path: results/mediator-early
           retention-days: 30
       - name: fail if any step failed
-        if: always() && (steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.aclclosed.outcome == 'failure')
-        run: echo "lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed ${{ steps.aclclosed.outcome }}" && exit 1
+        if: always() && (steps.feats.outcome == 'failure' || steps.envreads.outcome == 'failure' || steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.aclclosed.outcome == 'failure')
+        run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed ${{ steps.aclclosed.outcome }}" && exit 1
 
   report:
     name: report (one markdown report; fails while a line is missing)

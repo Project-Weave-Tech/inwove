@@ -1,0 +1,33 @@
+{
+  "_what": "Condition 16.2(b) lists, as Security wrote them in register L8 (bus 11984, 2026-11-15). Changes only by a Security read. Names only, never a value.",
+  "pin": "34bbdea4717e3a8dd1fdb190ad9c2ad2b33a3316",
+  "crates": [
+    "crates/affinidi-messaging-mediator/src",
+    "crates/affinidi-messaging-mediator/affinidi-messaging-mediator-common/src",
+    "crates/affinidi-messaging-mediator/affinidi-messaging-mediator-config/src",
+    "crates/affinidi-messaging-mediator/affinidi-messaging-mediator-processors/src"
+  ],
+  "allow": [
+    "DATABASE_URL",
+    "MEDIATOR_FILE_BACKEND_PASSPHRASE_FILE",
+    "RUST_LOG",
+    "PATH",
+    "HOME"
+  ],
+  "deny": {
+    "flips": [
+      "MEDIATOR_ACL_MODE",
+      "BLOCK_REMOTE_ADMIN_MSGS",
+      "ENABLE_INTER_MEDIATOR_RELAY",
+      "PROCESSOR_FORWARDING_EXTERNAL"
+    ],
+    "adjacent": [
+      "GLOBAL_DEFAULT_ACL",
+      "ADMIN_DID",
+      "MEDIATOR_SECRETS_BACKEND"
+    ],
+    "plain_passphrase": [
+      "MEDIATOR_FILE_BACKEND_PASSPHRASE"
+    ]
+  }
+}
