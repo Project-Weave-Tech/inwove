@@ -14,7 +14,7 @@ permissions:
   contents: read
 jobs:
   export-roundtrip:
-    name: export round trip (a room started here: export, re-import, compare)
+    name: "export round trip (a room started here: export, re-import, compare)"
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
