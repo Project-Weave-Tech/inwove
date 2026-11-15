@@ -4,5 +4,5 @@
   "vti-didcomm-js": { "npm": "@openvtc/vti-didcomm-js", "version": "0.13.0", "licence": "Apache-2.0" },
   "vti-tsp-js-rev3": { "npm": "vti-tsp-js-rev3", "version": "0.3.0", "licence": "Apache-2.0", "_why": "@openvtc/vti-tsp-js 0.3.0 packs Rev 3: the real Rev 3 frame for tamper (f)" },
   "affinidi-tsp": { "crate": "affinidi-tsp", "version": "0.3.0", "licence": "Apache-2.0" },
-  "tsp-spec": { "repo": "https://github.com/trustoverip/tswg-tsp-specification", "source": "ccda6b33" }
+  "tsp-spec": { "repo": "https://github.com/trustoverip/tswg-tsp-specification", "source": "ccda6b33", "sha": "ccda6b33159d860f05c328eb436dabe83548b705", "_why": "Appendix A test vectors; the vectors job fetches exactly this sha" }
 }

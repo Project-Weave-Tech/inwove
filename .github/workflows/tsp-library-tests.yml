@@ -3,8 +3,8 @@ name: tsp-library-tests
 # TEST VALUES ONLY: every key and DID is generated inside a job and thrown away with it. No real person's key, no secret,
 # no deploy, no outside mediator. Read-only by construction: no secrets, no environments, no id-token, no
 # pull_request_target or workflow_run. Edits to this file always go to Faolan as a push card (never the standing merge).
-# Built so far: audit, roundtrip, tamper, netwatch (roundtrip half). Not built yet, and the report says so as not
-# passed: vectors, mediator (with Security's lines A-D), netwatch's mediator half. A missing result is a failure, never a skip.
+# Built so far: audit, vectors, roundtrip, tamper, netwatch (roundtrip half). Not built yet, and the report says so as
+# not passed: mediator (with Security's lines A-D), netwatch's mediator half. A missing result is a failure, never a skip.
 on:
   workflow_dispatch:
   push:
@@ -47,6 +47,46 @@ jobs:
       - name: fail if a pin moved
         if: always() && steps.pins.outcome == 'failure'
         run: echo "a pin moved or a licence changed (see the pins step); update pins.json on purpose" && exit 1
+
+  vectors:
+    name: vectors (spec Appendix A through TS and Rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      SPEC_REPO: https://github.com/trustoverip/tswg-tsp-specification
+      SPEC_SHA: ccda6b33159d860f05c328eb436dabe83548b705
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: sandbox/tsp-tests
+      - run: rustup update stable --no-self-update && rustc --version
+      - name: build the Rust peer (affinidi-tsp 0.3.0, locked)
+        run: cargo build --locked --release --manifest-path "$WPI_DIR/rs/Cargo.toml"
+      - name: the spec at the pinned commit (fails if that exact commit can't be fetched)
+        run: |
+          git init -q "$RUNNER_TEMP/spec"
+          git -C "$RUNNER_TEMP/spec" fetch -q --depth 1 "$SPEC_REPO" "$SPEC_SHA"
+          git -C "$RUNNER_TEMP/spec" checkout -q FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/spec" rev-parse HEAD)" = "$SPEC_SHA"
+          echo "spec at $(git -C "$RUNNER_TEMP/spec" rev-parse HEAD)"
+      - name: vectors
+        id: vectors
+        continue-on-error: true
+        run: node "$WPI_DIR/vectors.mjs" results "$RUNNER_TEMP/spec/spec/spec.md"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: results-vectors
+          path: results
+          retention-days: 14
+      - name: fail if a vector failed
+        if: always() && steps.vectors.outcome == 'failure'
+        run: echo "a vector failed (see the vectors step)" && exit 1
 
   roundtrip:
     name: roundtrip (TS and Rust both ways, binding envelope, relationship) and tamper
@@ -94,7 +134,7 @@ jobs:
 
   report:
     name: report (one markdown report; fails while a line is missing)
-    needs: [audit, roundtrip]
+    needs: [audit, vectors, roundtrip]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10

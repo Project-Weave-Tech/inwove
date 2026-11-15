@@ -19,11 +19,15 @@ L.push(`| (c) every broken frame refused | ${line('tamper')} (roundtrip frames; 
 L.push(`| (d) no unexpected network | ${line('netwatch')} (roundtrip offline; the mediator egress log joins with the mediator job) |`)
 L.push(`| (e) binding envelope and the document's own proof behave | ${line('roundtrip')} |`)
 L.push(`| (f) direct-URL endpoint answer recorded | ${all.mediator ? 'see mediator' : NOT_BUILT} |`)
-L.push(`| vectors (spec Appendix A / libraries' own suites) | ${all.vectors ? line('vectors') : NOT_BUILT} |`)
+L.push(`| vectors (spec Appendix A through both libraries) | ${all.vectors ? line('vectors') : NOT_BUILT} |`)
 L.push(`| audit | ${line('audit')} |`, '')
 for (const [job, j] of Object.entries(all)) {
   L.push(`## ${job}: ${j.pass ? 'PASS' : 'FAIL'}`, '', '| | check | detail |', '|---|---|---|')
   for (const r of j.rows) L.push(`| ${r.answer ? 'answer' : r.ok ? 'ok' : '**FAIL**'} | ${r.what.replace(/\|/g, '/')} | ${String(r.detail ?? '').replace(/\|/g, '/').replace(/\n/g, ' ')} |`)
+  if (j.perLibrary) {
+    L.push('', '| vector | version | TS | Rust | TS rebuild | optional suite |', '|---|---|---|---|---|---|')
+    for (const v of j.perLibrary) L.push(`| ${[v.vector, v.version, v.ts, v.rust, v.rebuilt ?? '', v.optional ?? ''].map((x) => String(x ?? '').replace(/\|/g, '/')).join(' | ')} |`)
+  }
   for (const k of ['shas', 'tools', 'npmCounts', 'relationship']) if (j[k]) L.push('', `${k}: \`${JSON.stringify(j[k])}\``)
   L.push('')
 }
