@@ -135,7 +135,7 @@ jobs:
         run: echo "roundtrip ${{ steps.roundtrip.outcome }}, tamper ${{ steps.tamper.outcome }}, netwatch ${{ steps.netwatch.outcome }}" && exit 1
 
   mediator:
-    name: mediator early wiring (line D both ways; line C, Z1/Z2/Z3, R1 with open and closed default)
+    name: mediator early wiring (lean build; line D both ways; line C, Z1/Z2/Z3, R1 with open and closed default)
     # Railroad 11681 + Security 11742. The mediator at the pin, built here; the upstream TEST-ONLY conf
     # (docker/test/conf, its secrets.json is committed upstream as test-only); Redis by digest. Every other key is
     # made by the scripts and dies with them. The scripts print statuses and problem codes, never a key or password.
@@ -147,6 +147,7 @@ jobs:
     env:
       MED_REPO: https://github.com/affinidi/affinidi-messaging-mediator
       MED_SHA: 34bbdea4717e3a8dd1fdb190ad9c2ad2b33a3316
+      MED_FEATURES: didcomm,tsp,redis-backend,jemalloc
       REDIS_IMAGE: redis:7.4.6-alpine@sha256:3b73847e72874be07e6657b129a94761662b79bc0f679273757d4218573b2a98
       OUT: results/mediator-early
     steps:
@@ -168,9 +169,27 @@ jobs:
           test "$(git -C "$RUNNER_TEMP/med" rev-parse HEAD)" = "$MED_SHA"
           echo "mediator at $(git -C "$RUNNER_TEMP/med" rev-parse HEAD)"
           grep -q '^local_direct_delivery_allowed = ' "$RUNNER_TEMP/med/docker/test/conf/mediator.toml"
-      - name: build the mediator (locked, default features, as the host Dockerfile does)
+      - name: build the mediator (locked, the lean feature set, no `vta`)
+        # Railroad 11973: the running mediator never holds the admin key, so the build has no `vta` (no boot-time
+        # admin-credential load, no `rotate-admin`). The set is recorded in L8 beside the pin and the conf hash; a move
+        # back to `vta` or any `secrets-*` feature is a fresh Security read.
         working-directory: ${{ runner.temp }}/med
-        run: cargo build --locked --release -p affinidi-messaging-mediator 2>&1 | tail -n 40; exit ${PIPESTATUS[0]}
+        run: cargo build --locked --release -p affinidi-messaging-mediator --no-default-features --features "$MED_FEATURES" 2>&1 | tail -n 40; exit ${PIPESTATUS[0]}
+      - name: the lean build has no rotate-admin (16.4; the binary must run, the subcommand must not exist)
+        id: lean
+        continue-on-error: true
+        run: |
+          bin="$RUNNER_TEMP/med/target/release/mediator"; mkdir -p "$OUT"
+          # The binary itself answers --help, so a missing or broken binary can't pass this as "rotate-admin failed".
+          # Actions runs bash with -e, so each exit code is caught with || rather than read after the fact.
+          help=0; timeout 20 "$bin" --help > "$RUNNER_TEMP/help.txt" 2>&1 || help=$?
+          # No subcommand list at all in a build without `vta` (the help's prose still names rotate-admin, so not grep'd).
+          if grep -q '^Commands:' "$RUNNER_TEMP/help.txt"; then cmds=present; else cmds=absent; fi
+          ra=0; timeout 20 "$bin" rotate-admin --help > /dev/null 2>&1 || ra=$?
+          printf '{"features":"%s","help_exit":%d,"commands_section":"%s","rotate_admin_help_exit":%d}\n' "$MED_FEATURES" "$help" "$cmds" "$ra" > "$OUT/lean-build.json"
+          cat "$OUT/lean-build.json"
+          # Pass = --help exits 0, no Commands section, rotate-admin --help exits non-zero and not by timeout (124).
+          test "$help" -eq 0 && test "$cmds" = absent && test "$ra" -ne 0 && test "$ra" -ne 124
       - name: Redis by digest (fails if the digest doesn't match)
         run: |
           docker pull -q "$REDIS_IMAGE"
@@ -199,8 +218,8 @@ jobs:
           path: results/mediator-early
           retention-days: 30
       - name: fail if any step failed
-        if: always() && (steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.aclclosed.outcome == 'failure')
-        run: echo "line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed ${{ steps.aclclosed.outcome }}" && exit 1
+        if: always() && (steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.aclclosed.outcome == 'failure')
+        run: echo "lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed ${{ steps.aclclosed.outcome }}" && exit 1
 
   report:
     name: report (one markdown report; fails while a line is missing)

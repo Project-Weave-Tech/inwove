@@ -77,3 +77,10 @@ stands in for a local `redis-server`), and runs `mediator-line-d.sh` and `mediat
 R1, C1–C4, line A). Results go to their own artifact, `mediator-early`, not `results-*`, so the §3 report's
 `mediator` line stays NOT BUILT until steps 3–8 and the endpoint-DID half of C land. The closed-default run is
 expected red while admin calls ride TSP; it stays a fail in the record.
+
+**The lean build (Railroad 11973; 2026-11-15, w-1115-2314-wpi-build).** The job now builds with
+`--no-default-features --features didcomm,tsp,redis-backend,jemalloc`: no `vta`, so the running mediator has no
+boot-time admin-credential load and no `rotate-admin`. A 16.4 step checks it (`lean-build.json`): `mediator --help`
+exits 0 with no `Commands:` section, and `mediator rotate-admin --help` fails (not by timeout). Z1–Z3 and line D run
+on that build, so the record says which build they passed on. A move back to `vta` or any `secrets-*` feature is a
+fresh Security read.
