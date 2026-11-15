@@ -3,8 +3,10 @@ name: tsp-library-tests
 # TEST VALUES ONLY: every key and DID is generated inside a job and thrown away with it. No real person's key, no secret,
 # no deploy, no outside mediator. Read-only by construction: no secrets, no environments, no id-token, no
 # pull_request_target or workflow_run. Edits to this file always go to Faolan as a push card (never the standing merge).
-# Built so far: audit, vectors, roundtrip, tamper, netwatch (roundtrip half). Not built yet, and the report says so as
-# not passed: mediator (with Security's lines A-D), netwatch's mediator half. A missing result is a failure, never a skip.
+# Built so far: audit, vectors, roundtrip, tamper, netwatch (roundtrip half), and `mediator` early wiring (Railroad
+# 11681, Security 11742: line D both ways, line C + inbox mode, Z1/Z2/Z3, R1, open and closed default). Not built yet,
+# and the report says so as not passed: the full mediator line (steps 3-8, the endpoint-DID half of C), netwatch's
+# mediator half. A missing result is a failure, never a skip.
 on:
   workflow_dispatch:
   push:
@@ -132,6 +134,74 @@ jobs:
         if: always() && (steps.roundtrip.outcome == 'failure' || steps.tamper.outcome == 'failure' || steps.netwatch.outcome == 'failure')
         run: echo "roundtrip ${{ steps.roundtrip.outcome }}, tamper ${{ steps.tamper.outcome }}, netwatch ${{ steps.netwatch.outcome }}" && exit 1
 
+  mediator:
+    name: mediator early wiring (line D both ways; line C, Z1/Z2/Z3, R1 with open and closed default)
+    # Railroad 11681 + Security 11742. The mediator at the pin, built here; the upstream TEST-ONLY conf
+    # (docker/test/conf, its secrets.json is committed upstream as test-only); Redis by digest. Every other key is
+    # made by the scripts and dies with them. The scripts print statuses and problem codes, never a key or password.
+    # Its results go in their own artifact (not results-*): the report's `mediator` line stays NOT BUILT until
+    # steps 3-8 land. The closed-default run is expected red while admin calls ride TSP (check_admin_signature
+    # needs did#fragment); that stays a fail in the record, never a skip.
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      MED_REPO: https://github.com/affinidi/affinidi-messaging-mediator
+      MED_SHA: 34bbdea4717e3a8dd1fdb190ad9c2ad2b33a3316
+      REDIS_IMAGE: redis:7.4.6-alpine@sha256:3b73847e72874be07e6657b129a94761662b79bc0f679273757d4218573b2a98
+      OUT: results/mediator-early
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: sandbox/tsp-tests
+      - name: packages the mediator build needs (the host Dockerfile's list)
+        run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev libdbus-1-dev clang cmake
+      - name: the mediator at the pinned commit (fails if that exact commit can't be fetched)
+        run: |
+          git init -q "$RUNNER_TEMP/med"
+          git -C "$RUNNER_TEMP/med" fetch -q --depth 1 "$MED_REPO" "$MED_SHA"
+          git -C "$RUNNER_TEMP/med" checkout -q FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/med" rev-parse HEAD)" = "$MED_SHA"
+          echo "mediator at $(git -C "$RUNNER_TEMP/med" rev-parse HEAD)"
+          grep -q '^local_direct_delivery_allowed = ' "$RUNNER_TEMP/med/docker/test/conf/mediator.toml"
+      - name: build the mediator (locked, default features, as the host Dockerfile does)
+        working-directory: ${{ runner.temp }}/med
+        run: cargo build --locked --release -p affinidi-messaging-mediator 2>&1 | tail -n 40; exit ${PIPESTATUS[0]}
+      - name: Redis by digest (fails if the digest doesn't match)
+        run: |
+          docker pull -q "$REDIS_IMAGE"
+          docker image inspect --format '{{join .RepoDigests " "}}' "$REDIS_IMAGE" | grep -q "${REDIS_IMAGE#*@}"
+          mkdir -p "$OUT"
+      - name: line D both ways (marker password; counts only)
+        id: lined
+        continue-on-error: true
+        run: bash "$WPI_DIR/mediator-line-d.sh" "$RUNNER_TEMP/med/target/release/mediator" "$RUNNER_TEMP/med/docker/test/conf" "$WPI_DIR/redis-docker.sh" "$OUT/line-d.json"
+      - name: line C, Z1/Z2/Z3, R1, line A (explicit-deny default)
+        id: aclopen
+        continue-on-error: true
+        run: node "$WPI_DIR/mediator-acl.mjs" "$RUNNER_TEMP/med/target/release/mediator" "$RUNNER_TEMP/med/docker/test/conf" "$WPI_DIR/redis-docker.sh" "$OUT/acl-open.json"
+      - name: the same with --closed-default (expected red while admin calls ride TSP)
+        id: aclclosed
+        continue-on-error: true
+        run: node "$WPI_DIR/mediator-acl.mjs" "$RUNNER_TEMP/med/target/release/mediator" "$RUNNER_TEMP/med/docker/test/conf" "$WPI_DIR/redis-docker.sh" "$OUT/acl-closed.json" --closed-default
+      - name: summary (statuses and problem codes only)
+        if: always()
+        run: |
+          { echo "## mediator early wiring @ $MED_SHA"; echo; for f in "$OUT"/*.json; do [ -f "$f" ] || continue; echo "### $(basename "$f")"; echo '```json'; cat "$f"; echo '```'; done; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: mediator-early
+          path: results/mediator-early
+          retention-days: 30
+      - name: fail if any step failed
+        if: always() && (steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.aclclosed.outcome == 'failure')
+        run: echo "line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed ${{ steps.aclclosed.outcome }}" && exit 1
+
   report:
     name: report (one markdown report; fails while a line is missing)
     needs: [audit, vectors, roundtrip]
@@ -145,6 +215,7 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: results
+          pattern: results-*
       - run: node "$WPI_DIR/report.mjs" results report.md > /dev/null; s=$?; cat report.md >> "$GITHUB_STEP_SUMMARY"; exit $s
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()

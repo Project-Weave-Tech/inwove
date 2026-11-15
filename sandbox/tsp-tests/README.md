@@ -69,3 +69,11 @@ session's account type), with the sender bound to the session DID by `force_sess
 in `explicit_deny` mode any signed-in account may add. Z3 is a recorded finding, not a pass line: `account/add` on an
 existing hash overwrites its role (to Standard) and ACLs (redis `store/redis/database/accounts.rs` `account_add`, no
 existence check).
+
+**Early wiring on Actions (Railroad 11681, Security 11742; 2026-11-15, w-1115-2234-wpi-build).** Two cloud sessions
+were refused the mediator build, so the `mediator` job in `tsp-library-tests.yml` builds 0.50.0 @ `34bbdea4`
+(locked, default features, the host Dockerfile's packages), pulls Redis `7.4.6-alpine` by digest (`redis-docker.sh`
+stands in for a local `redis-server`), and runs `mediator-line-d.sh` and `mediator-acl.mjs` both ways (Z1, Z2, Z3,
+R1, C1–C4, line A). Results go to their own artifact, `mediator-early`, not `results-*`, so the §3 report's
+`mediator` line stays NOT BUILT until steps 3–8 and the endpoint-DID half of C land. The closed-default run is
+expected red while admin calls ride TSP; it stays a fail in the record.

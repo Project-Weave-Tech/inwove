@@ -24,7 +24,7 @@ RPORT=$((20000 + RANDOM % 20000)); MPORT=$((40000 + RANDOM % 20000))
 
 "$REDIS" --port "$RPORT" --bind 127.0.0.1 --requirepass "$MARK" --save '' --appendonly no --daemonize no \
   >"$WORK/redis.log" 2>&1 & RPID=$!
-for _ in $(seq 50); do (exec 3<>/dev/tcp/127.0.0.1/$RPORT) 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 150); do (exec 3<>/dev/tcp/127.0.0.1/$RPORT) 2>/dev/null && break; sleep 0.1; done
 
 # One run: $1 label, $2 password, $3 RUST_LOG ('' = unset), $4 log_json true|false.
 run() {

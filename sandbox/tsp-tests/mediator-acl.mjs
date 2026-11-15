@@ -63,7 +63,10 @@ writeFileSync(tomlPath, toml)
 results.setup = { mediator_acl_mode: 'explicit_allow', global_acl_default: DEFAULT_ACL, external_forwarding: false, enable_inter_mediator_relay: false, trust_task_verification: 'enforce' }
 
 procs.push(spawn(redisBin, ['--port', String(RPORT), '--bind', '127.0.0.1', '--requirepass', PW, '--save', '', '--appendonly', 'no'], { stdio: 'ignore' }))
-await new Promise((r) => setTimeout(r, 500))
+// Wait until Redis takes connections (a container start can take longer than a local binary), up to ~15 s.
+{ const { connect } = await import('node:net'); let open = false
+  for (let i = 0; i < 75 && !open; i++) { open = await new Promise((r) => { const c = connect(RPORT, '127.0.0.1'); c.once('connect', () => { c.end(); r(true) }); c.once('error', () => r(false)) }); if (!open) await new Promise((r) => setTimeout(r, 200)) }
+  if (!open) { console.error('redis did not start on its port'); process.exit(1) } }
 const env = { ...process.env, RUST_LOG: 'info,affinidi_messaging_mediator::common::config=warn' }
 const med = spawn(BIN, ['--config', 'conf/mediator.toml'], { cwd: work, env, stdio: ['ignore', 'pipe', 'pipe'] })
 procs.push(med)
