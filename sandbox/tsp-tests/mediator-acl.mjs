@@ -9,6 +9,7 @@
 //   C3  B (registered, never met by A, not on the list) → A: lands, A collects and opens it
 //   C4  D (on A's deny list) → A: refused
 // Every Trust Task carries an eddsa-jcs-2022 proof and the mediator runs trust_task_verification = "enforce".
+//   A   (Railroad 11506) a did:peer with an Ed25519 key and no X25519 keyAgreement can't sign in
 //   R1  (Railroad 11571, setup fact 1) a deliberate plain-DID account/add: the add's answer is not trusted; the
 //       setup check (a real sign-in + an empty /fetch) must turn it red
 // --closed-default (Railroad 11571, setup fact 2): the mediator's default for new accounts is explicit-allow (closed),
@@ -101,7 +102,7 @@ async function signIn(v) {
   if (c.status !== 200) return { ok: false, step: 'challenge', status: c.status, problem: problem(c) }
   const { challenge, session_id } = c.json.data
   const a = await post('/tsp/authenticate', JSON.stringify({ vid: v.id, session_id, signature: Buffer.from(ed25519.sign(utf8(challenge), v.sk)).toString('base64url') }))
-  if (a.status !== 200) return { ok: false, step: 'tsp/authenticate', status: a.status, problem: problem(a) }
+  if (a.status !== 200) return { ok: false, step: 'tsp/authenticate', status: a.status, problem: problem(a), kind: (a.text.match(/authentication\.[a-z.]+[a-z]/) || [null])[0] }
   return { ok: true, token: a.json.data.access_token }
 }
 // A Trust Task to the mediator, signed, sent as a direct TSP frame; the answer is sealed back to the sender's inbox.
@@ -179,6 +180,23 @@ results.checks.R1_plain_did_add_turns_check_red = { pass: !r1real.real, add_answ
 log('R1 plain-DID add', { answer: r1.answerType, check_real: r1real.real, refused_at: r1real.refused_at ?? null })
 const realA = await accountReal(A)
 results.checks.R1_hashed_add_passes_check = { pass: realA.real, check: realA }
+
+// ---- line A (Railroad 11506): a DID with no X25519 keyAgreement must not sign in ----
+// A did:peer:2 carrying only an Ed25519 key (V, authentication), no E key: registered by its hash, then a real sign-in.
+// Pass = refused somewhere in the sign-in (the record says where), never a token.
+const NK = keyVid()
+NK.id = 'did:peer:2.Vz' + b58(new Uint8Array([0xed, 0x01, ...NK.spk]))
+const nkAdd = await task(ADMIN, sAdm.token, ACCOUNT_ADD, { did: await sha256hex(NK.id) })
+const nk = await signIn(NK)
+results.checks.A_no_x25519_keyagreement_refused = { pass: !nk.ok, add_answer: nkAdd.answerType ?? nkAdd.problem ?? null, refused_at: nk.step ?? null, status: nk.status ?? null, problem: nk.problem ?? null, kind: nk.kind ?? null }
+log('A no-X25519 DID signs in', nk.ok ? 'ALLOWED (fail)' : { refused_at: nk.step, status: nk.status, problem: nk.problem, kind: nk.kind })
+// Control: the same shape with the X25519 key added (V + E) does sign in, so the refusal above is the missing key.
+const NE = keyVid()
+NE.id = 'did:peer:2.Vz' + b58(new Uint8Array([0xed, 0x01, ...NE.spk])) + '.Ez' + b58(new Uint8Array([0xec, 0x01, ...NE.epk]))
+await task(ADMIN, sAdm.token, ACCOUNT_ADD, { did: await sha256hex(NE.id) })
+const ne = await signIn(NE)
+results.checks.A_control_with_x25519_signs_in = { pass: ne.ok, refused_at: ne.step ?? null, status: ne.status ?? null, problem: ne.problem ?? null, kind: ne.kind ?? null }
+log('A control (V+E) signs in', ne.ok ? 'ok' : { refused_at: ne.step, status: ne.status, problem: ne.problem, kind: ne.kind })
 
 // ---- A denies D on its own list ----
 const upd = await task(A, sa.token, LIST_UPDATE, { did: await sha256hex(A.id), add: [await sha256hex(D.id)] })

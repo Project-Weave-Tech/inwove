@@ -52,6 +52,9 @@ and the admin account's list set to exactly the mediator's own DID hash and read
   doesn't go through it, which is why adds work. The same happens with the explicit-deny default (checked).
 - Diagnostic only, not a proposed setting: with `block_remote_admin_msgs = false` the `--closed-default` run PASSES
   (admin list = mediator only, count 1, read back; all three adds confirmed; R1 red; C1-C4 as before).
+- Line A (Railroad 11506), added in the same session: a did:peer:2 with only an Ed25519 key (no X25519
+  `keyAgreement`), registered by its hash, is refused at `/tsp/authenticate` (400, 28 `authentication.tsp.resolve`);
+  the control, the same shape with the X25519 key added, signs in. Passes in both runs.
 
 Not built yet (the report shows each as not passed): `mediator` (Affinidi mediator in Docker, REST pickup, Security's lines A–D), and netwatch's mediator egress log.
 
