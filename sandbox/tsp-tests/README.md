@@ -60,3 +60,12 @@ Not built yet (the report shows each as not passed): `mediator` (Affinidi mediat
 
 Run locally: `npm ci --ignore-scripts` here, `cargo build --locked --release --manifest-path rs/Cargo.toml`, then
 `node vectors.mjs results <tswg-tsp-specification>/spec/spec.md && node roundtrip.mjs results && node tamper.mjs results && sudo unshare -n -- node netwatch.mjs results`.
+Added after Railroad 11606 (written 2026-11-15 ~22:30Z, NOT yet run: the cloud session's permission check refused
+`cargo build` of the mediator): step 0, Z1 (a signed-in ordinary account sends `account/add` for a fresh DID's hash:
+pass = refused and the fresh DID can't sign in) and Z2 (a DID with no account: no sign-in, and a signed `account/add`
+frame to `/inbound` with no token refused). From source, 0.50.0 @ `34bbdea4`: the guard is
+`messages/protocols/trust_tasks.rs` `consume_account_add` (`mediator_acl_mode == ExplicitAllow && !is_admin`, the
+session's account type), with the sender bound to the session DID by `force_session_did_match` (`messages/inbound.rs`);
+in `explicit_deny` mode any signed-in account may add. Z3 is a recorded finding, not a pass line: `account/add` on an
+existing hash overwrites its role (to Standard) and ACLs (redis `store/redis/database/accounts.rs` `account_add`, no
+existence check).

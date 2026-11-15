@@ -10,6 +10,8 @@
 //   C4  D (on A's deny list) → A: refused
 // Every Trust Task carries an eddsa-jcs-2022 proof and the mediator runs trust_task_verification = "enforce".
 //   A   (Railroad 11506) a did:peer with an Ed25519 key and no X25519 keyAgreement can't sign in
+//   Z1/Z2 (Railroad 11606 step 0) account/add over TSP from a non-admin / a DID with no account is refused
+//   Z3  (finding) account/add on an existing hash overwrites its role and ACLs
 //   R1  (Railroad 11571, setup fact 1) a deliberate plain-DID account/add: the add's answer is not trusted; the
 //       setup check (a real sign-in + an empty /fetch) must turn it red
 // --closed-default (Railroad 11571, setup fact 2): the mediator's default for new accounts is explicit-allow (closed),
@@ -170,6 +172,27 @@ const sa = await signIn(A), sb = await signIn(B), sd = await signIn(D)
 log('A, B, D sign in', { A: sa.ok || sa, B: sb.ok || sb, D: sd.ok || sd })
 if (!sa.ok || !sb.ok || !sd.ok) { results.error = 'a registered DID could not sign in'; writeFileSync(outFile, JSON.stringify(results, null, 2) + '\n'); process.exit(1) }
 
+// ---- step 0 (Railroad 11606): account/add over TSP skips check_permissions; prove it is still admin-only ----
+// Source (0.50.0 @ 34bbdea4): trust_tasks.rs consume_account_add refuses a non-admin session in explicit_allow mode
+// (`mediator_acl_mode == ExplicitAllow && !is_admin`); is_admin is the session's account type, and the TSP sender is
+// bound to the session DID by force_session_did_match (inbound.rs). In explicit_deny mode any signed-in account may add.
+// Z1 a signed-in ordinary account (B) adds a fresh DID's hash: pass = refused AND the fresh DID then can't sign in.
+// Z2 a DID with no account: can't sign in (no token), and a signed frame to /inbound with no token is refused.
+{
+  const F = keyVid()
+  const z1 = await task(B, sb.token, ACCOUNT_ADD, { did: await sha256hex(F.id) })
+  const z1f = await accountReal(F)
+  results.checks.Z1_non_admin_account_add_refused = { pass: !(z1.answerType && !/problem|error|reject/i.test(z1.answerType)) && !z1f.real, add_status: z1.status, add_answer: z1.answerType, add_problem: z1.problem ?? null, fresh_did_check: z1f }
+  log('Z1 non-admin account/add', { status: z1.status, answer: z1.answerType ?? z1.problem, fresh_signs_in: z1f.real })
+  const N = keyVid(), G = keyVid()
+  const sn = await signIn(N)
+  const doc = attachProof({ id: 'urn:uuid:' + crypto.randomUUID(), type: ACCOUNT_ADD, issuer: N.id, recipient: medVid, issuedAt: new Date().toISOString(), payload: { did: await sha256hex(G.id) } }, N)
+  const frame = await tsp.pack(utf8(JSON.stringify(doc)), N.id, medVid, { senderSigningKey: N.sk, receiverEncryptionKey: M.epk })
+  const z2 = await post('/inbound', frame.bytes, null, 'application/tsp')
+  const z2g = await accountReal(G)
+  results.checks.Z2_no_account_did_cannot_add = { pass: !sn.ok && z2.status >= 400 && !z2g.real, sign_in: sn.ok ? 'ALLOWED' : { refused_at: sn.step, status: sn.status }, inbound_status: z2.status, inbound_problem: z2.status >= 300 ? problem(z2) : null, fresh_did_check: z2g }
+  log('Z2 no-account DID account/add', { sign_in: sn.ok, inbound: z2.status, fresh_signs_in: z2g.real })
+}
 if (CLOSED) results.checks.S2_adds_confirmed_under_closed_default = { pass: ['A', 'B', 'D'].every((n) => results.setup['account_add_' + n].confirmed) }
 
 // ---- R1: a plain-DID add is answered, but the setup check turns it red ----
@@ -233,6 +256,17 @@ const leaked = (await collect(A, sa.token, D.spk)).some((m) => m.sender === D.id
 results.checks.C4_denied_refused = { pass: c4.status >= 400 && !leaked, status: c4.status, problem: c4.problem, reached_A: leaked }
 log('C4 D → A (denied)', { status: c4.status, problem: c4.problem, reached_A: leaked })
 
+// ---- Z3 (finding, not a pass/fail line): account/add on an EXISTING hash overwrites it ----
+// Source: redis accounts.rs account_add HSETs ROLE_TYPE=Standard and ACLS with no existence check, and
+// consume_account_add has none either. Here the admin re-adds A's hash with no acl; if A's selfManageList is gone,
+// A's own access-list/update is refused afterwards. (In explicit_deny mode a non-admin could do the same to anyone.)
+{
+  const re = await task(ADMIN, sAdm.token, ACCOUNT_ADD, { did: await sha256hex(A.id) })
+  const sa2 = await signIn(A)
+  const after = sa2.ok ? await task(A, sa2.token, LIST_UPDATE, { did: await sha256hex(A.id), add: [await sha256hex(X.id)] }) : null
+  results.findings = { Z3_readd_existing_account: { readd_answer: re.answerType ?? re.problem ?? null, a_signs_in_after: sa2.ok, a_list_update_after: after ? { status: after.status, answerType: after.answerType, problem: after.problem ?? null } : null, overwritten: !!after && !after.answerType } }
+  log('Z3 re-add existing A', results.findings.Z3_readd_existing_account)
+}
 results.pass = Object.values(results.checks).every((c) => c.pass)
 results.log_lines_with_redis_password = medLog.split('\n').filter((l) => l.includes(PW)).length
 writeFileSync(outFile, JSON.stringify(results, null, 2) + '\n')
