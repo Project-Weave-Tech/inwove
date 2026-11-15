@@ -36,11 +36,22 @@ no WARN/ERROR line carries a password.
 `messaging/access-list/update`. Local run 2026-11-15: unknown DID refused at the challenge (25); B → A lands and opens;
 D → A refused (403, 73 `delivery.refused`); a frame routed to a did:key outside refused (404, 58), which does not yet
 prove forwarding-off is the reason (a did:key has no endpoint).
-Added after Railroad 11571, **not yet run** (the 2026-11-15 21:38Z cloud session was not allowed to build the
-mediator): R1, a deliberate plain-DID `account/add` that the setup check (a real sign-in + an empty `/fetch`, never
-the add's answer) must turn red, beside the hashed add passing it; and `--closed-default`, the mediator's default for
-new accounts explicit-allow and the admin account's list set to exactly the mediator's own DID hash and read back
-with `access-list/list` before any add (S2). Run it both ways to compare.
+Added after Railroad 11571, run 2026-11-15 ~22:00Z (cloud, 0.50.0 @ `34bbdea4`, valkey 7.2.13): R1, a deliberate
+plain-DID `account/add` that the setup check (a real sign-in + an empty `/fetch`, never the add's answer) must turn
+red, beside the hashed add passing it; and `--closed-default`, the mediator's default for new accounts explicit-allow
+and the admin account's list set to exactly the mediator's own DID hash and read back with `access-list/list` (S2).
+- Without the flag: PASS. R1 red as it should be: the plain-DID add is answered `#response`, then the DID is refused
+  at the challenge; the hashed add passes the check.
+- With `--closed-default`: FAIL, and not for the reason expected. The admin's `access-list/update` and
+  `access-list/list` on its own hash are refused before they run (`not permitted to access the access list`), so the
+  list stays empty and every later answer to the admin is refused (73); the adds themselves still take effect (A, B, D
+  sign in) but are never confirmed. Cause, from source: over TSP the mediator passes the bare sender VID (no `#key`
+  fragment, `messages/inbound.rs` `dispatch_tsp_trust_task`), and with `block_remote_admin_msgs = true`
+  `common/authz.rs` `check_admin_signature` needs `did#fragment`, so every admin call that goes through
+  `check_permissions` (access-list update/list, account get/update/remove, acl get) is refused over TSP. `account/add`
+  doesn't go through it, which is why adds work. The same happens with the explicit-deny default (checked).
+- Diagnostic only, not a proposed setting: with `block_remote_admin_msgs = false` the `--closed-default` run PASSES
+  (admin list = mediator only, count 1, read back; all three adds confirmed; R1 red; C1-C4 as before).
 
 Not built yet (the report shows each as not passed): `mediator` (Affinidi mediator in Docker, REST pickup, Security's lines A–D), and netwatch's mediator egress log.
 
