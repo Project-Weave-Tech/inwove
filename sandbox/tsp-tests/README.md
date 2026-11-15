@@ -17,6 +17,11 @@ no outside mediator. Not part of the app: its own `package.json`, nothing in the
 | `netwatch.mjs` | roundtrip | §2.6 roundtrip half: roundtrip inside `unshare -n`, proving the namespace had no network |
 | `report.mjs` | report | the §3 markdown report; red while any §0 line has no result |
 
+`mediator-probe.mjs` is the first cut of `mediator` steps 1-2 (open mode, not in the workflow yet): B sends A a
+routed frame over `POST /inbound`, A signs in over TSP (`/authenticate/challenge` + `/tsp/authenticate`) and collects
+by REST `/fetch`, opens it, deletes it, and fetches again to show it gone. Run against a local mediator 0.50.0 at
+`34bbdea4` with `GLOBAL_DEFAULT_ACL=DENY_ALL,LOCAL,SEND_MESSAGES,RECEIVE_MESSAGES,MODE_EXPLICIT_DENY`.
+
 Not built yet (the report shows each as not passed): `mediator` (Affinidi mediator in Docker, REST pickup, Security's lines A–D), and netwatch's mediator egress log.
 
 Run locally: `npm ci --ignore-scripts` here, `cargo build --locked --release --manifest-path rs/Cargo.toml`, then
