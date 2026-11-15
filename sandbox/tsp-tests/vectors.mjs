@@ -6,6 +6,7 @@
 // opens it; the opened body matches the vector's payload; and where the vector gives the ephemeral (ikmE), TS rebuilds
 // the message byte for byte. The suites the spec keeps only for older implementations (the libsodium sealed box) and
 // the post-quantum key types are recorded as answers, not failures: Enkara's door uses HPKE-Base over X25519 only.
+// The signed-only (unsealed) vector is an answer too (Railroad 11506): Enkara's door refuses an unsealed frame in its own code.
 import { readFileSync } from 'node:fs'
 import * as tsp from '@openvtc/vti-tsp-js'
 import * as unsafe from '@openvtc/vti-tsp-js/unsafe-testing'
@@ -56,6 +57,8 @@ R.check('Appendix A has vectors', vectors.length > 0, `${vectors.length} vectors
 
 const rs = rustPeer()
 const optional = (v, who) => /sealed-box/.test(v.name) ? 'the libsodium sealed box, kept by the spec for existing implementations only'
+  // Railroad 11506: Enkara's door takes sealed frames only and refuses an unsealed one in its own code, so the TS gap never decides anything.
+  : /signed-only/.test(v.name) ? "signed-only (unsealed): Enkara's door refuses unsealed frames itself (Railroad 11506)"
   : (ids[who]?.sigKeyType !== 'Ed25519' || ids[who]?.encKeyType !== 'X25519') ? `post-quantum key types (${ids[who]?.sigKeyType}/${ids[who]?.encKeyType})` : null
 const perLibrary = []
 
