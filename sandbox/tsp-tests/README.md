@@ -36,6 +36,11 @@ no WARN/ERROR line carries a password.
 `messaging/access-list/update`. Local run 2026-11-15: unknown DID refused at the challenge (25); B → A lands and opens;
 D → A refused (403, 73 `delivery.refused`); a frame routed to a did:key outside refused (404, 58), which does not yet
 prove forwarding-off is the reason (a did:key has no endpoint).
+Added after Railroad 11571, **not yet run** (the 2026-11-15 21:38Z cloud session was not allowed to build the
+mediator): R1, a deliberate plain-DID `account/add` that the setup check (a real sign-in + an empty `/fetch`, never
+the add's answer) must turn red, beside the hashed add passing it; and `--closed-default`, the mediator's default for
+new accounts explicit-allow and the admin account's list set to exactly the mediator's own DID hash and read back
+with `access-list/list` before any add (S2). Run it both ways to compare.
 
 Not built yet (the report shows each as not passed): `mediator` (Affinidi mediator in Docker, REST pickup, Security's lines A–D), and netwatch's mediator egress log.
 

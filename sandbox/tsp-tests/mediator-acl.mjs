@@ -9,7 +9,13 @@
 //   C3  B (registered, never met by A, not on the list) → A: lands, A collects and opens it
 //   C4  D (on A's deny list) → A: refused
 // Every Trust Task carries an eddsa-jcs-2022 proof and the mediator runs trust_task_verification = "enforce".
-// Usage: node mediator-acl.mjs <mediator binary> <conf dir> <redis-server> <out.json>
+//   R1  (Railroad 11571, setup fact 1) a deliberate plain-DID account/add: the add's answer is not trusted; the
+//       setup check (a real sign-in + an empty /fetch) must turn it red
+// --closed-default (Railroad 11571, setup fact 2): the mediator's default for new accounts is explicit-allow (closed),
+//   and the admin account is set to explicit-allow with exactly the mediator's own DID (hashed) on its list, then read
+//   back with access-list/list, before any account/add. Without the flag the run is the 2026-11-15 shape (explicit-deny
+//   default, the upstream test conf's), so the two can be compared.
+// Usage: node mediator-acl.mjs <mediator binary> <conf dir> <redis-server> <out.json> [--closed-default]
 // Test keys only; A, B, D, U are made here and die with the process. Prints statuses and problem codes, no keys.
 import { spawn } from 'node:child_process'
 import { mkdtempSync, cpSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
@@ -19,7 +25,8 @@ import * as tsp from '@openvtc/vti-tsp-js'
 import { ed25519 } from '@noble/curves/ed25519.js'
 import { b58, utf8, eq, attachProof } from './lib.mjs'
 
-const [binArg, confArg, redisBin, outFile] = process.argv.slice(2)
+const [binArg, confArg, redisBin, outFile] = process.argv.slice(2).filter((a) => !a.startsWith('--'))
+const CLOSED = process.argv.includes('--closed-default')
 const BIN = resolve(binArg), CONF = resolve(confArg)
 const work = mkdtempSync(join(process.env.RUNNER_TEMP || tmpdir(), 'medacl-'))
 const RPORT = 20000 + Math.floor(Math.random() * 20000), MPORT = 40000 + Math.floor(Math.random() * 20000)
@@ -40,7 +47,9 @@ set('listen_address', `127.0.0.1:${MPORT}`)
 set('mediator_acl_mode', 'explicit_allow')
 // MODE_EXPLICIT_DENY in the default too: the mediator seals each Trust Task's answer into the sender's own inbox, and
 // with an explicit-allow default the admin's empty list refuses the mediator's answer (73), so the add is never confirmed.
-set('global_acl_default', 'DENY_ALL,LOCAL,SEND_MESSAGES,RECEIVE_MESSAGES,MODE_EXPLICIT_DENY')
+// With --closed-default the admin's own list is set first (below), so its answers get through.
+const DEFAULT_ACL = CLOSED ? 'DENY_ALL,LOCAL,SEND_MESSAGES,RECEIVE_MESSAGES,MODE_EXPLICIT_ALLOW' : 'DENY_ALL,LOCAL,SEND_MESSAGES,RECEIVE_MESSAGES,MODE_EXPLICIT_DENY'
+set('global_acl_default', DEFAULT_ACL)
 set('local_direct_delivery_allowed', 'true')
 set('enable_inter_mediator_relay', 'false')
 set('external_forwarding', 'false')
@@ -48,7 +57,7 @@ toml = toml.replace(/^backend = "file:\/\/.*$/m, `backend = "file://${join(work,
 if (/^trust_task_verification = .*$/m.test(toml)) set('trust_task_verification', 'enforce')
 else toml = toml.replace(/^\[security\]$/m, '[security]\ntrust_task_verification = "enforce"')
 writeFileSync(tomlPath, toml)
-results.setup = { mediator_acl_mode: 'explicit_allow', global_acl_default: 'DENY_ALL,LOCAL,SEND_MESSAGES,RECEIVE_MESSAGES,MODE_EXPLICIT_DENY', external_forwarding: false, enable_inter_mediator_relay: false, trust_task_verification: 'enforce' }
+results.setup = { mediator_acl_mode: 'explicit_allow', global_acl_default: DEFAULT_ACL, external_forwarding: false, enable_inter_mediator_relay: false, trust_task_verification: 'enforce' }
 
 procs.push(spawn(redisBin, ['--port', String(RPORT), '--bind', '127.0.0.1', '--requirepass', PW, '--save', '', '--appendonly', 'no'], { stdio: 'ignore' }))
 await new Promise((r) => setTimeout(r, 500))
@@ -121,6 +130,14 @@ const LIST_UPDATE = 'https://trusttasks.org/spec/messaging/access-list/update/0.
 // Accounts and access lists are keyed by the DID's SHA-256 (hex). An account/add naming the plain DID is answered
 // as a success and echoes the DID, but registers a key no sign-in ever looks up (found 2026-11-15: A then can't sign in).
 const sha256hex = async (s) => Buffer.from(await crypto.subtle.digest('SHA-256', utf8(s))).toString('hex')
+const LIST_LIST = 'https://trusttasks.org/spec/messaging/access-list/list/0.1'
+// The setup check: an account exists only when its DID really signs in and an empty /fetch answers; never the add's answer.
+async function accountReal(v) {
+  const s = await signIn(v)
+  if (!s.ok) return { real: false, refused_at: s.step, status: s.status, problem: s.problem }
+  const f = await post('/fetch', JSON.stringify({ limit: 1, delete_policy: 'DoNotDelete' }), s.token)
+  return { real: f.status === 200 && (f.json?.data?.success ?? []).length === 0, fetch_status: f.status }
+}
 
 // ---- C1: closed mode refuses an unknown DID ----
 const su = await signIn(U)
@@ -130,16 +147,38 @@ log('C1 unknown DID signs in', su.ok ? 'ALLOWED (fail)' : { refused_at: su.step,
 // ---- the admin registers A (open inbox with a deny list), B and D ----
 const sAdm = await signIn(ADMIN); log('admin sign-in', sAdm.ok ? 'ok' : sAdm)
 if (!sAdm.ok) { results.error = 'admin could not sign in'; writeFileSync(outFile, JSON.stringify(results, null, 2) + '\n'); process.exit(1) }
+// ---- --closed-default: the admin account gets exactly the mediator's own DID on its explicit-allow list ----
+if (CLOSED) {
+  const medHash = await sha256hex(medVid), admHash = await sha256hex(ADMIN.id)
+  // The answer to this update is the mediator's, into an inbox whose list is still empty, so none is expected.
+  const u = await task(ADMIN, sAdm.token, LIST_UPDATE, { did: admHash, clear: true, add: [medHash] })
+  const l = await task(ADMIN, sAdm.token, LIST_LIST, { did: admHash, entries: [medHash] })
+  const listed = (l.answer?.entries ?? []).map(String)
+  results.setup.admin_list = { update_status: u.status, update_answer: u.answerType, list_answer: l.answerType, accessListCount: l.answer?.accessListCount ?? null, mediator_listed: listed.includes(medHash), only_entry: l.answer?.accessListCount === 1 && listed.includes(medHash) }
+  results.checks.S2_admin_allow_list_is_mediator_only = { pass: results.setup.admin_list.only_entry, ...results.setup.admin_list }
+  log('admin list = mediator only', results.setup.admin_list)
+}
 const aclA = { accessListMode: 'explicitDeny', selfManageList: true, local: true, sendMessages: true, receiveMessages: true }
 results.setup.account_A_acl = aclA
 for (const [name, v, acl] of [['A', A, aclA], ['B', B], ['D', D]]) {
   const r = await task(ADMIN, sAdm.token, ACCOUNT_ADD, { did: await sha256hex(v.id), ...(acl ? { acl } : {}) })
-  results.setup["account_add_" + name] = { status: r.status, answerType: r.answerType, problem: r.problem ?? null }
+  results.setup["account_add_" + name] = { status: r.status, answerType: r.answerType, problem: r.problem ?? null, confirmed: !!r.answerType }
   log(`admin account/add ${name}`, { status: r.status, answer: r.answerType ?? r.problem })
 }
 const sa = await signIn(A), sb = await signIn(B), sd = await signIn(D)
 log('A, B, D sign in', { A: sa.ok || sa, B: sb.ok || sb, D: sd.ok || sd })
 if (!sa.ok || !sb.ok || !sd.ok) { results.error = 'a registered DID could not sign in'; writeFileSync(outFile, JSON.stringify(results, null, 2) + '\n'); process.exit(1) }
+
+if (CLOSED) results.checks.S2_adds_confirmed_under_closed_default = { pass: ['A', 'B', 'D'].every((n) => results.setup['account_add_' + n].confirmed) }
+
+// ---- R1: a plain-DID add is answered, but the setup check turns it red ----
+const P = keyVid()
+const r1 = await task(ADMIN, sAdm.token, ACCOUNT_ADD, { did: P.id })
+const r1real = await accountReal(P)
+results.checks.R1_plain_did_add_turns_check_red = { pass: !r1real.real, add_answer: r1.answerType, add_status: r1.status, check: r1real, note: 'pass = the setup check refused it (red), whatever the add answered' }
+log('R1 plain-DID add', { answer: r1.answerType, check_real: r1real.real, refused_at: r1real.refused_at ?? null })
+const realA = await accountReal(A)
+results.checks.R1_hashed_add_passes_check = { pass: realA.real, check: realA }
 
 // ---- A denies D on its own list ----
 const upd = await task(A, sa.token, LIST_UPDATE, { did: await sha256hex(A.id), add: [await sha256hex(D.id)] })
