@@ -1,0 +1,114 @@
+name: tsp-library-tests
+# ref/09 (Railroad): TSP 1.0 between @openvtc/vti-tsp-js 0.4.0 and affinidi-tsp 0.3.0, tamper refusals, no network.
+# TEST VALUES ONLY: every key and DID is generated inside a job and thrown away with it. No real person's key, no secret,
+# no deploy, no outside mediator. Read-only by construction: no secrets, no environments, no id-token, no
+# pull_request_target or workflow_run. Edits to this file always go to Faolan as a push card (never the standing merge).
+# Built so far: audit, roundtrip, tamper, netwatch (roundtrip half). Not built yet, and the report says so as not
+# passed: vectors, mediator (with Security's lines A-D), netwatch's mediator half. A missing result is a failure, never a skip.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'claude/wpi-build-tsp-**'
+permissions:
+  contents: read
+env:
+  WPI_DIR: sandbox/tsp-tests
+jobs:
+  audit:
+    name: audit (npm audit, cargo audit, licences, pins)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: sandbox/tsp-tests
+      - run: rustup update stable --no-self-update && rustc --version
+      - name: pins and licences (full shas recorded; fails the job at its end if a pin moved)
+        id: pins
+        continue-on-error: true
+        env:
+          WPI_JOB: audit
+        run: node "$WPI_DIR/check-pins.mjs" results
+      - name: install cargo-audit (pinned)
+        run: cargo install cargo-audit --locked --version =0.23.0
+      - run: node "$WPI_DIR/audit.mjs" results
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: results-audit
+          path: results
+          retention-days: 14
+      - name: fail if a pin moved
+        if: always() && steps.pins.outcome == 'failure'
+        run: echo "a pin moved or a licence changed (see the pins step); update pins.json on purpose" && exit 1
+
+  roundtrip:
+    name: roundtrip (TS and Rust both ways, binding envelope, relationship) and tamper
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: sandbox/tsp-tests
+      - run: rustup update stable --no-self-update && rustc --version
+      - name: build the Rust peer (affinidi-tsp 0.3.0, locked)
+        run: cargo build --locked --release --manifest-path "$WPI_DIR/rs/Cargo.toml"
+      - name: roundtrip
+        id: roundtrip
+        continue-on-error: true
+        run: node "$WPI_DIR/roundtrip.mjs" results
+      - name: tamper (on the roundtrip frames)
+        id: tamper
+        continue-on-error: true
+        run: node "$WPI_DIR/tamper.mjs" results
+      - name: netwatch (roundtrip again inside a network namespace with no network)
+        id: netwatch
+        continue-on-error: true
+        run: sudo unshare -n -- sudo -u "$USER" env PATH="$PATH" HOME="$HOME" node "$WPI_DIR/netwatch.mjs" results
+      - name: the report (all jobs so far)
+        if: always()
+        run: node "$WPI_DIR/report.mjs" results "$RUNNER_TEMP/report.md" > /dev/null; cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: drop the throwaway test keys before upload
+        if: always()
+        run: rm -f results/frames.json results/offline/frames.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: results-roundtrip
+          path: results
+          retention-days: 14
+      - name: fail if any step failed
+        if: always() && (steps.roundtrip.outcome == 'failure' || steps.tamper.outcome == 'failure' || steps.netwatch.outcome == 'failure')
+        run: echo "roundtrip ${{ steps.roundtrip.outcome }}, tamper ${{ steps.tamper.outcome }}, netwatch ${{ steps.netwatch.outcome }}" && exit 1
+
+  report:
+    name: report (one markdown report; fails while a line is missing)
+    needs: [audit, roundtrip]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: results
+      - run: node "$WPI_DIR/report.mjs" results report.md > /dev/null; s=$?; cat report.md >> "$GITHUB_STEP_SUMMARY"; exit $s
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: report
+          path: report.md
+          retention-days: 30

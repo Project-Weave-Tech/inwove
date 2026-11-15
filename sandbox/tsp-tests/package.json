@@ -1,0 +1,13 @@
+{
+  "name": "wpi-tsp-tests",
+  "private": true,
+  "description": "ref/09: TSP 1.0 library and mediator tests. Test keys only; not part of the app.",
+  "type": "module",
+  "dependencies": {
+    "@openvtc/vti-tsp-js": "0.4.0",
+    "@openvtc/vti-didcomm-js": "0.13.0",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0",
+    "vti-tsp-js-rev3": "npm:@openvtc/vti-tsp-js@0.3.0"
+  }
+}
