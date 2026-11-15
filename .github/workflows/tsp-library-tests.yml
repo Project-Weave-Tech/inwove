@@ -116,9 +116,9 @@ jobs:
         id: netwatch
         continue-on-error: true
         run: sudo unshare -n -- sudo -u "$USER" env PATH="$PATH" HOME="$HOME" node "$WPI_DIR/netwatch.mjs" results
-      - name: the report (all jobs so far)
+      - name: the report (this job's lines; the report job is the one that goes red while a line is missing)
         if: always()
-        run: node "$WPI_DIR/report.mjs" results "$RUNNER_TEMP/report.md" > /dev/null; cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
+        run: node "$WPI_DIR/report.mjs" results "$RUNNER_TEMP/report.md" > /dev/null || true; cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
       - name: drop the throwaway test keys before upload
         if: always()
         run: rm -f results/frames.json results/offline/frames.json
