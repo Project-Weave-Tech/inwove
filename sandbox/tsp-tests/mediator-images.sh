@@ -87,7 +87,8 @@ saveread() {
   return $rc
 }
 BASE_DIGEST="${BASE_REF##*@}"; SVC_BASE_DIGEST="${SVC_BASE_REF##*@}"
-ss=0; saveread service service "$SVC" "$W/svc-base-chain" "$SVC_BASE_DIGEST" --inspect "$W/svc-inspect.json" || ss=$?
+# Security 12480 (2): the service base pinned as a triple (service-base.json); its own line, STOP while VERIFY
+ss=0; saveread service service "$SVC" "$W/svc-base-chain" "$SVC_BASE_DIGEST" --chain-pins "$HERE/service-base.json" --inspect "$W/svc-inspect.json" || ss=$?
 rs=0; saveread rekey rekey "$REK" "$W/base-chain" "$BASE_DIGEST" --config-pin "$CONFIG_PIN" --inspect "$W/rek-inspect.json" || rs=$?
 # 12430 (f): the local base pull, saved: its layers = the registry's by digest; its tree = the registry tree, exactly
 lb=0; saveread localbase base "$BASE_REF" "$W/base-chain" "$BASE_DIGEST" --config-pin "$CONFIG_PIN" --same-layers-as-chain --inspect "$W/base-inspect.json" || lb=$?
@@ -241,6 +242,7 @@ const lines = {
   service_keyring_probe: '$probe_v' || 'FAIL',
   service_entrypoint_first_line_is_the_keyring_probe: '$ep_v' || 'FAIL',
   service_saved_layers: P($ss === 0 && svs && svs.ok),
+  service_base_pinned: (svs && svs.chain_pins && svs.chain_pins.verdict) || 'FAIL',
   rekey_image_check: P(rek && rek.ok),
   rekey_saved_layers: P($rs === 0 && rks && rks.ok),
   local_base_saved_layers_are_the_registry_layers: P($lb === 0 && lbs && lbs.ok),
@@ -277,7 +279,7 @@ console.log(JSON.stringify({ rekey_base_diff: bdiff && { ok: bdiff.ok, checks: b
 // Security 12430 (f): the local pull's saved tree against the registry-built tree, zero exceptions
 console.log(JSON.stringify({ rekey_base_cross_check: bdiff && { checks: bdiff.checks && { local_base_equals_registry_tree: bdiff.checks.local_base_equals_registry_tree, cross_check_bites: bdiff.checks.cross_check_bites }, only_local: bdiff.cross_check.only_local, only_registry: bdiff.cross_check.only_registry, differ: bdiff.cross_check.differ, entries: { rekey: bdiff.rek_entries, local_base: bdiff.local_base_entries, registry: bdiff.registry_entries } } }));
 // Security 12430 (b)-(e), (g): each save read, per layer (counts per kind), the added-layer reds, the plants
-const sv = (v) => v && { ok: v.ok, checks: v.checks, image: v.image, attestations: (v.attestations_in_save || []).length, base_chain: v.base_chain, per_layer: v.per_layer, counts: v.counts, added_layer_red: v.added_layer_red, apply_red: v.apply_red, whiteouts_seen: v.added_layer_whiteouts_seen, inspect_differ: v.inspect_vs_saved_config_differ, save_bad: v.save_bad };
+const sv = (v) => v && { ok: v.ok, checks: v.checks, chain_pins: v.chain_pins, image: v.image, attestations: (v.attestations_in_save || []).length, base_chain: v.base_chain, per_layer: v.per_layer, counts: v.counts, added_layer_red: v.added_layer_red, apply_red: v.apply_red, whiteouts_seen: v.added_layer_whiteouts_seen, inspect_differ: v.inspect_vs_saved_config_differ, save_bad: v.save_bad };
 console.log(JSON.stringify({ service_save: sv(svs) }));
 console.log(JSON.stringify({ rekey_save: sv(rks) }));
 console.log(JSON.stringify({ local_base_save: sv(lbs) }));
@@ -287,5 +289,6 @@ console.log(JSON.stringify({ rekey_added_read: bdiff && bdiff.added_read }));
 // (for the L8 pins), inspect's Id as evidence only, and the base half beside the verdict
 const crec = rd(odir + '/rekey-config-record.json');
 console.log(JSON.stringify({ rekey_config_record: crec && { ok: crec.ok, checks: crec.checks, base_manifest_digest_read: crec.base_manifest_digest_read, base_config_digest_read: crec.base_config_digest_read, base_inspect_id: crec.base_inspect_id, base_platform: crec.base_platform, base_half: crec.base_half, details: crec.details } }));
-process.exit(Object.values(lines).some((v) => v === 'FAIL') ? 1 : 0);
+// a STOP line (a pin Security has not written yet) never passes the step
+process.exit(Object.values(lines).some((v) => v === 'FAIL' || v === 'STOP') ? 1 : 0);
 EOF

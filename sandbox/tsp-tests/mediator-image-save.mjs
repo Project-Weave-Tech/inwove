@@ -25,8 +25,8 @@
 // Printed: per-layer verdicts and counts per kind, red kinds and paths; never a file's bytes.
 //
 //   mediator-image-save.mjs --name <rekey|service|base|plant> --layout <dir> --work <dir> --base-chain <dir>
-//     --from-digest <sha256:…> [--config-pin <sha256:…>] [--same-layers-as-chain] [--inspect <inspect.json>]
-//     --out-tree <tree.json> --out-config <config.json> --out <verdict.json>
+//     --from-digest <sha256:…> [--config-pin <sha256:…>] [--chain-pins <pins.json>] [--same-layers-as-chain]
+//     [--inspect <inspect.json>] --out-tree <tree.json> --out-config <config.json> --out <verdict.json>
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -120,6 +120,26 @@ export function chainBase(chain, fromDigest, configPin = null) {
   const checks = { base_chain_is_the_from_digest: P(indexOk && manifestOk && configOk && config?.os === 'linux' && config?.architecture === 'amd64') };
   if (configPin !== null) checks.base_chain_config_is_the_l8_pin = P(configOk && cd === configPin);
   return { checks, config, manifest, manifest_digest_read: desc?.digest ?? null, config_digest_read: configOk ? cd : null };
+}
+
+// Security 12480 (2): a base chain pinned as a triple, the way the rekey base is: index (= the Dockerfile's FROM
+// digest), its one linux/amd64 manifest, and that manifest's config. pins: {index_digest, manifest_digest,
+// config_digest} from a hand-pinned file changed only by a Security block (service-base.json). Each line is PASS when
+// the pin equals what the chain read (chainBase has already checked every hash), FAIL when it differs or nothing was
+// read, and STOP while the pin is "VERIFY" (neither PASS nor FAIL; the images step treats STOP as not passing, so the
+// job stays red until Security pins it). The index line also ties the pin file to the Dockerfile: a moved FROM with an
+// unmoved pin is FAIL, so a new base can only come in through a Security block. verdict: PASS | STOP | FAIL (FAIL wins).
+export function chainPinVerdict(pins, fromDigest, base) {
+  const pin = (want, read) => (want === 'VERIFY' ? 'STOP' : P(typeof want === 'string' && /^sha256:[0-9a-f]{64}$/.test(want) && read != null && want === read));
+  const p = pins ?? {};
+  const checks = {
+    index_is_the_pin: pin(p.index_digest, base?.checks?.base_chain_is_the_from_digest === 'PASS' ? fromDigest : null),
+    manifest_is_the_pin: pin(p.manifest_digest, base?.manifest_digest_read ?? null),
+    config_is_the_pin: pin(p.config_digest, base?.config_digest_read ?? null),
+  };
+  const vs = Object.values(checks);
+  const verdict = vs.includes('FAIL') ? 'FAIL' : vs.includes('STOP') ? 'STOP' : 'PASS';
+  return { verdict, checks, read: { index_digest: fromDigest ?? null, manifest_digest: base?.manifest_digest_read ?? null, config_digest: base?.config_digest_read ?? null } };
 }
 
 // The whole read of one saved image. Async (layers are decompressed to the work dir). Returns the verdict, the tree
@@ -221,7 +241,7 @@ async function main(argv) {
   const from = arg(argv, '--from-digest'), pin = arg(argv, '--config-pin') ?? null, insp = arg(argv, '--inspect');
   const outTree = arg(argv, '--out-tree'), outConfig = arg(argv, '--out-config'), out = arg(argv, '--out');
   if (!name || !layout || !work || !chainDir || !from || !outTree || !outConfig || !out || !(name in ADDED_LAYER_DELETES)) {
-    console.error('usage: mediator-image-save.mjs --name <rekey|service|base|plant> --layout <dir> --work <dir> --base-chain <dir> --from-digest <sha256:…> [--config-pin <sha256:…>] [--same-layers-as-chain] [--inspect <f>] --out-tree <f> --out-config <f> --out <f>');
+    console.error('usage: mediator-image-save.mjs --name <rekey|service|base|plant> --layout <dir> --work <dir> --base-chain <dir> --from-digest <sha256:…> [--config-pin <sha256:…>] [--chain-pins <f>] [--same-layers-as-chain] [--inspect <f>] --out-tree <f> --out-config <f> --out <f>');
     return 2;
   }
   const raw = (n) => { try { return fs.readFileSync(path.join(chainDir, n)); } catch { return null; } };
@@ -229,6 +249,12 @@ async function main(argv) {
   let inspect = null;
   if (insp) inspect = JSON.parse(fs.readFileSync(insp, 'utf8'));
   const r = await readSave({ layout, work, base, name, sameLayersAsChain: argv.includes('--same-layers-as-chain'), inspect });
+  // 12480 (2): the chain pinned as a triple; its own line (base_chain_pinned in the images summary), not folded into ok
+  const pinsFile = arg(argv, '--chain-pins');
+  if (pinsFile) {
+    let pins = null; try { pins = JSON.parse(fs.readFileSync(pinsFile, 'utf8')); } catch { pins = null; }
+    r.verdict.chain_pins = chainPinVerdict(pins, from, base);
+  }
   // The tree is written whenever the layers themselves check and apply (so every other line can still be judged and
   // printed); the save line itself is red on any added-layer rule. Without a clean apply, no tree: the lines that read
   // it go red.
@@ -237,7 +263,7 @@ async function main(argv) {
   if (r.config) fs.writeFileSync(outConfig, J([{ from: 'the saved config blob (Security 12430 (b))', Architecture: r.config.architecture, Os: r.config.os, Config: r.config.config ?? {}, RootFS: { Type: 'layers', Layers: r.config.rootfs?.diff_ids ?? [] } }]));
   fs.writeFileSync(out, `${J(r.verdict, null, 2)}\n`);
   const v = r.verdict;
-  console.log(J({ name, ok: v.ok, checks: v.checks, image: v.image, attestations: v.attestations_in_save.length, per_layer: v.per_layer, added_layer_red: v.added_layer_red, apply_red: v.apply_red.slice(0, 10), whiteouts_seen: v.added_layer_whiteouts_seen, inspect_differ: v.inspect_vs_saved_config_differ, save_bad: v.save_bad }));
+  console.log(J({ name, ok: v.ok, checks: v.checks, image: v.image, attestations: v.attestations_in_save.length, per_layer: v.per_layer, added_layer_red: v.added_layer_red, apply_red: v.apply_red.slice(0, 10), whiteouts_seen: v.added_layer_whiteouts_seen, inspect_differ: v.inspect_vs_saved_config_differ, save_bad: v.save_bad, chain_pins: v.chain_pins ?? null }));
   return v.ok ? 0 : 1;
 }
 

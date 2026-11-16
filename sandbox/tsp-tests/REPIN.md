@@ -82,3 +82,11 @@ the host only when every step below holds on the new pin, in one job run, and Se
     agree. At a base re-pin, or when a Dockerfile adds or removes a delete, the job prints `rekey_save` /
     `service_save` (`whiteouts_seen`, `added_layer_red`); a new delete comes to SECURITY and is listed only by a
     Security block, never in place. The plants (`save_read_plants`) must stay red first.
+16. **The service image's base is pinned as a triple** (Security 12480 (2)): `service-base.json` holds the index
+    (= `mediator-service.Dockerfile`'s FROM digest), its one linux/amd64 manifest and that manifest's config, read
+    against the registry chain by `chainPinVerdict` (`--chain-pins`). The images step's `service_base_pinned` line is
+    PASS only when all three equal the chain; a moved FROM with an unmoved pin is FAIL; a `VERIFY` value is STOP, and
+    a STOP line fails the step. A new service base comes to SECURITY with the chain's digests (printed as
+    `service_save.chain_pins.read`) and is pinned only by a Security block, never in the Dockerfile edit itself. The
+    same added-layer rules as item 15 hold, including **one path written twice in one added layer** (Security 12480):
+    red as `written_twice_in_one_layer`.

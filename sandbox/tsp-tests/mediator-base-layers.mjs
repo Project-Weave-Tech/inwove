@@ -105,6 +105,9 @@ export function layerVerdict({ manifestRaw, configRaw, pins, blobs, decompressed
 //   - a whiteout in an added layer may delete only a BASE path (one the base prefix laid down; a base directory an
 //     added layer merely re-states stays one), and only one named in opts.whiteouts (exact; a listed one that never comes is red too, so a stale list
 //     never passes quietly); an opaque dir only a base dir named in opts.opaque, the same way;
+//   - the same path written twice in ONE added layer (Security 12480, the one change before any rekey run) = red, `written_twice_in_one_layer`: the
+//     applied tree keeps only the second, so the first entry's bytes ship unseen at tree level (the content searches
+//     still read both, from addedLayerFiles). Any entry kind, a directory too; implicit parents don't count;
 // opts.keepSource: each file entry keeps {layer, offset} (where its bytes sit in that layer's tar) so the image checks
 // can read the applied tree straight from the layers, never through a container.
 export function applyLayers(tars, opts = {}) {
@@ -133,6 +136,8 @@ export function applyLayers(tars, opts = {}) {
   };
   tars.forEach((file, li) => {
     const thisLayer = new Set();
+    // the paths this layer's own entries named (never the implicit parents), for the written-twice rule
+    const written = new Set();
     const added = li >= addedFrom;
     if (li === addedFrom) basePaths = new Set([...tree].filter(([, e]) => !e.implicit).map(([k]) => k));
     const pl = { layer: li, added, files: 0, dirs: 0, links: 0, hardlinks: 0, other: 0, whiteouts: 0, opaque: 0 };
@@ -204,6 +209,8 @@ export function applyLayers(tars, opts = {}) {
         if (opts.keepSource && t.src) entry.src = t.src;
       }
       pl[{ file: 'files', dir: 'dirs', link: 'links', hardlink: 'hardlinks' }[e.type] || 'other'] += 1;
+      if (added && written.has(p)) layerRed.push({ kind: 'written_twice_in_one_layer', ...at });
+      written.add(p);
       if (added) {
         const w = addedBy.get(p);
         if (w && w.layer < li) {

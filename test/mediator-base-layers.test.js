@@ -9,7 +9,8 @@ import crypto from 'node:crypto';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { layerVerdict, applyLayers, checkLayers, addedLayerFiles } from '../sandbox/tsp-tests/mediator-base-layers.mjs';
 import { tarWalk, tarList, crossCheck, crossCheckBites, baseDiff, redPaths } from '../sandbox/tsp-tests/mediator-base-diff.mjs';
-import { selectImage, treeView, layerView } from '../sandbox/tsp-tests/mediator-image-save.mjs';
+import { selectImage, treeView, layerView, chainBase, chainPinVerdict } from '../sandbox/tsp-tests/mediator-image-save.mjs';
+import { readFileSync } from 'node:fs';
 
 const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
 const dirs = [];
@@ -322,4 +323,91 @@ test('added-layer search (12430 e): the removed words and an archive in a file a
   const f = join(tmp(), 'gz.tar'); writeFileSync(f, Buffer.concat([tarBytes([{ name: 'opt/', type: '5' }], { end: false }), header('opt/blob', '0', 0o644, gz.length), pad(gz), Buffer.alloc(1024)]));
   const lt2 = [BASE_L(), f];
   assert.deepEqual(archives(layerView(addedLayerFiles(lt2, 1), lt2)).map((h) => [h.path, h.layer, h.kinds]), [['/opt/blob', 1, ['gzip']]]);
+});
+
+// Security 12480: the same path written twice in one added layer ships the first entry's bytes unseen at tree level
+test('added layers (12480): one path written twice in one added layer is red, any kind; across two layers it stays added_then_overwritten; the base layers are not judged', () => {
+  const kinds = (a) => a.layer_red.map((r) => r.kind);
+  const twice = tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/x', body: 'fourteen bytes' }, { name: 'opt/x', body: 'five!' }]);
+  const r = applyLayers([BASE_L(), WH_APT(), twice], ADD());
+  assert.deepEqual(kinds(r), ['written_twice_in_one_layer']);
+  assert.equal(r.layer_red[0].path, 'opt/x');
+  // the tree keeps the second; addedLayerFiles still lists both, so the content searches read the hidden bytes
+  assert.equal(r.tree.get('opt/x').size, 5);
+  assert.equal(addedLayerFiles([BASE_L(), WH_APT(), twice], 1).filter((f) => f.rel === 'opt/x').length, 2);
+  // the same bytes twice are red too (one entry is enough to hide; the rule is about the entry, not the bytes)
+  const sameTwice = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/x', body: 'a' }, { name: 'opt/x', body: 'a' }])], ADD());
+  assert.deepEqual(kinds(sameTwice), ['written_twice_in_one_layer']);
+  // a directory, a symlink over a file, and a hard link over a file, each in one layer
+  const dirTwice = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/d/', type: '5' }, { name: 'opt/d/', type: '5', mode: 0o700 }])], ADD());
+  assert.ok(kinds(dirTwice).includes('written_twice_in_one_layer'));
+  const linkOver = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/x', body: 'secret' }, { name: 'opt/x', type: '2', linkname: '/etc/os-release' }])], ADD());
+  assert.ok(kinds(linkOver).includes('written_twice_in_one_layer'));
+  const hardOver = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/y', body: 'y' }, { name: 'opt/x', body: 'secret' }, { name: 'opt/x', type: '1', linkname: 'opt/y' }])], ADD());
+  assert.ok(kinds(hardOver).includes('written_twice_in_one_layer'));
+  // a base dir re-stated once per added layer (every COPY layer does) is not red; an implicit parent then its own entry is not either
+  const restate = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'opt/a', body: 'a' }, { name: 'opt/', type: '5' }]), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/b', body: 'b' }])], ADD());
+  assert.deepEqual(restate.layer_red, []);
+  // across two layers: the existing rule, not this one
+  const across = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/x', body: 'a' }]), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/x', body: 'b' }])], ADD());
+  assert.deepEqual(kinds(across), ['added_then_overwritten']);
+  // the base layers (before addedFrom) are not judged this way
+  const inBase = applyLayers([tarFile([{ name: 'usr/', type: '5' }, { name: 'usr/x', body: '1' }, { name: 'usr/x', body: '2' }]), WH_APT()], { addedFrom: 1, whiteouts: [] });
+  assert.ok(!kinds(inBase).includes('written_twice_in_one_layer'));
+});
+
+// Security 12480 (3): a BASE dir an added layer re-states with another mode, owner or xattr carries no bytes and is
+// not tracked by applyLayers; the base diff judges it on the applied tree, and must go red
+test('base diff (12480 (3)): a base dir re-stated in an added layer with another mode, owner or xattr is red in the base diff; re-stated the same is not', () => {
+  const baseTar = () => tarFile([{ name: 'opt/', type: '5', mode: 0o755 }, { name: 'usr/', type: '5' }, { name: 'usr/x', body: 'x' }]);
+  const base = applyLayers([baseTar()]).tree;
+  const added = new Map([['opt/rekey/t.mjs', sha('tool')]]);
+  const tool = (opt) => tarFile([opt, { name: 'opt/rekey/', type: '5' }, { name: 'opt/rekey/t.mjs', body: 'tool', mode: 0o444 }]);
+  const same = applyLayers([baseTar(), tool({ name: 'opt/', type: '5', mode: 0o755 })], { addedFrom: 1 });
+  assert.deepEqual(same.layer_red, []);
+  assert.equal(baseDiff(same.tree, base, added).ok, true);
+  for (const [why, opt] of [
+    ['mode', { name: 'opt/', type: '5', mode: 0o700 }],
+    ['owner', { name: 'opt/', type: '5', mode: 0o755, uid: 1000 }],
+    ['xattr', { name: 'opt/', type: '5', mode: 0o755, pax: { 'SCHILY.xattr.user.x': '1' } }],
+  ]) {
+    const a = applyLayers([baseTar(), tool(opt)], { addedFrom: 1 });
+    assert.deepEqual(a.layer_red, [], `${why}: applyLayers alone passes it (Security's probe)`);
+    const v = baseDiff(a.tree, base, added);
+    assert.equal(v.ok, false, why);
+    assert.ok(redPaths(v).includes('/opt'), `${why}: /opt named`);
+  }
+});
+
+// Security 12480 (2): the service base pinned as a triple, STOP while VERIFY, FAIL on any difference or a moved FROM
+test('service base pin (12480 (2)): the triple passes only when all three equal the chain; VERIFY is STOP; a moved FROM, a wrong manifest or config, or an unread chain is FAIL', () => {
+  const plat = { architecture: 'amd64', os: 'linux' };
+  const configRaw = Buffer.from(JSON.stringify({ ...plat, rootfs: { type: 'layers', diff_ids: ['sha256:' + '1'.repeat(64)] } }));
+  const manifestRaw = Buffer.from(JSON.stringify({ schemaVersion: 2, mediaType: OCI, config: { digest: `sha256:${sha(configRaw)}`, size: configRaw.length }, layers: [] }));
+  const indexRaw = Buffer.from(JSON.stringify({ schemaVersion: 2, mediaType: 'application/vnd.oci.image.index.v1+json', manifests: [{ mediaType: OCI, digest: `sha256:${sha(manifestRaw)}`, size: manifestRaw.length, platform: plat }] }));
+  const from = `sha256:${sha(indexRaw)}`;
+  const base = chainBase({ index: indexRaw, manifest: manifestRaw, config: configRaw }, from);
+  assert.equal(base.checks.base_chain_is_the_from_digest, 'PASS');
+  const good = { index_digest: from, manifest_digest: `sha256:${sha(manifestRaw)}`, config_digest: `sha256:${sha(configRaw)}` };
+  assert.equal(chainPinVerdict(good, from, base).verdict, 'PASS');
+  const stop = chainPinVerdict({ ...good, manifest_digest: 'VERIFY', config_digest: 'VERIFY' }, from, base);
+  assert.equal(stop.verdict, 'STOP'); assert.equal(stop.checks.index_is_the_pin, 'PASS');
+  assert.deepEqual(stop.read, good, 'the read digests are printed so they can be pinned');
+  const other = 'sha256:' + 'a'.repeat(64);
+  assert.equal(chainPinVerdict({ ...good, manifest_digest: other }, from, base).verdict, 'FAIL');
+  assert.equal(chainPinVerdict({ ...good, config_digest: other }, from, base).verdict, 'FAIL');
+  // FAIL wins over STOP
+  assert.equal(chainPinVerdict({ ...good, manifest_digest: 'VERIFY', config_digest: other }, from, base).verdict, 'FAIL');
+  // a moved FROM: the chain is read for the new digest, the pin file still names the old index
+  const moved = chainBase({ index: indexRaw, manifest: manifestRaw, config: configRaw }, other);
+  assert.equal(chainPinVerdict(good, other, moved).verdict, 'FAIL');
+  // nothing read (the fetch failed), a missing or malformed pin file: FAIL, never a pass
+  assert.equal(chainPinVerdict(good, from, chainBase({}, from)).verdict, 'FAIL');
+  assert.equal(chainPinVerdict(null, from, base).verdict, 'FAIL');
+  assert.equal(chainPinVerdict({ ...good, config_digest: 'sha256:short' }, from, base).verdict, 'FAIL');
+  // the committed pin file names the service Dockerfile's FROM digest and is STOP until Security pins it
+  const pinFile = JSON.parse(readFileSync(new URL('../sandbox/tsp-tests/service-base.json', import.meta.url), 'utf8'));
+  const df = readFileSync(new URL('../sandbox/tsp-tests/mediator-service.Dockerfile', import.meta.url), 'utf8');
+  assert.equal(pinFile.index_digest, /^FROM [^@\s]+@(sha256:[0-9a-f]{64})/m.exec(df)[1]);
+  for (const k of ['manifest_digest', 'config_digest']) assert.ok(pinFile[k] === 'VERIFY' || /^sha256:[0-9a-f]{64}$/.test(pinFile[k]), k);
 });

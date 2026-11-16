@@ -1,0 +1,6 @@
+{
+  "what": "the service image's base (mediator-service.Dockerfile's FROM), pinned as a triple the way the rekey base is (Security 12480 (2)): index = the FROM digest, its one linux/amd64 manifest, that manifest's config. Changed only by a Security block. While a value is VERIFY the images step's service_base_pinned line reads STOP and the step is red. Read by WPI-BUILD at w-1116-1725 from Docker Hub, every hash checked: manifest sha256:77eb101c607d6e3d4f5ad0c8a02c2136c689b98aba1f359e6502ba517e5c57ec, config sha256:7da97f743f397971f35dd21cd2d19a7da070a150e0cfa3eda559e71891ec7533 (for Security to re-hash and pin; not pinned by this line)",
+  "index_digest": "sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8",
+  "manifest_digest": "VERIFY",
+  "config_digest": "VERIFY"
+}
