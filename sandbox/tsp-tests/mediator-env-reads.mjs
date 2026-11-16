@@ -25,6 +25,9 @@ import { join, relative } from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 
+// Security 12144.4, at the next re-pin (not before: the record at 44c7d92 is compared to this exact sentence): add a
+// clause that `build.rs` (trust_tasks_build, run at build time on the runner) is covered by neither env -i nor this grep;
+// today the lean `cargo tree` sha256 and a clean job cover it.
 export const DOES_NOT_COVER = '16.2(b) reads the four mediator crates the binary links, and nothing else. The crates they depend on read the environment too (logging, TLS roots, proxies, the Redis and AWS clients). Those reads are closed by the entrypoint\'s `env -i` with the allow list, and proven by the 16.2(c) /proc/<pid>/environ test, not by this grep. A green 16.2(b) means only: every name these four crates read was read by Security at this pin.';
 
 export function stripTestModules(src) {

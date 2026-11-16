@@ -233,6 +233,13 @@ jobs:
         id: aclclosed
         continue-on-error: true
         run: node "$WPI_DIR/mediator-acl.mjs" "$RUNNER_TEMP/med/target/release/mediator" "$RUNNER_TEMP/med/docker/test/conf" "$WPI_DIR/redis-docker.sh" "$OUT/acl-closed.json" --closed-default
+      - name: the mediator through its entrypoint (16.2(c) /proc environ = the allow list; 15(iv) marker passphrase; a refuse case)
+        # Security 11984 §2(iii)-(iv) + 12144: started the way the host will start it (mediator-entrypoint.sh, env -i,
+        # the record's deny file checked against the sha256 baked beside the script), from a platform-shaped host with a
+        # planted extra. Run D: if it won't start bare, once more with --with-path-home, and the JSON says which.
+        id: entrypoint
+        continue-on-error: true
+        run: bash "$WPI_DIR/mediator-entrypoint-run.sh" "$RUNNER_TEMP/med/target/release/mediator" "$RUNNER_TEMP/med/docker/test/conf" "$WPI_DIR/redis-docker.sh" "$WPI_DIR/mediator-env-lists.json" "$OUT/entrypoint-run.json"
       - name: summary (statuses and problem codes only)
         if: always()
         run: |
@@ -244,8 +251,8 @@ jobs:
           path: results/mediator-early
           retention-days: 30
       - name: fail if any step failed
-        if: always() && (steps.feats.outcome == 'failure' || steps.envreads.outcome == 'failure' || steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.aclclosed.outcome == 'failure')
-        run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed ${{ steps.aclclosed.outcome }}" && exit 1
+        if: always() && (steps.feats.outcome == 'failure' || steps.envreads.outcome == 'failure' || steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.aclclosed.outcome == 'failure' || steps.entrypoint.outcome == 'failure')
+        run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed ${{ steps.aclclosed.outcome }}, entrypoint ${{ steps.entrypoint.outcome }}" && exit 1
 
   report:
     name: report (one markdown report; fails while a line is missing)
