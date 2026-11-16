@@ -1,0 +1,12 @@
+{
+  "what": "The expected reds of tsp-library-tests (Security 11910.5, Emrys 11900). Each STOP line names one unbuilt or gating line. The run passes with these red, fails on any red not listed here, and fails if a listed STOP line is missing from the report. A STOP line is never cleared by deleting it: it clears only when the line it names goes green on a run Security has read, in a commit that names that run.",
+  "stops": [
+    {
+      "stop": "mediator-full-line",
+      "key": "missing:mediator",
+      "line": "(b) works through a real Affinidi mediator, REST pickup only; (f) direct-URL endpoint answer recorded",
+      "why": "the full mediator line (steps 3-8, the endpoint-DID half of C, netwatch's mediator half) is not built yet; the mediator early-wiring job runs on its own and fails the run on its own reds",
+      "clears_when": "a job writes results as job 'mediator' and it passes, on a run Security has read"
+    }
+  ]
+}

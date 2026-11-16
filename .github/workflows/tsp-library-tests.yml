@@ -12,6 +12,10 @@ on:
   push:
     branches:
       - 'claude/wpi-build-tsp-**'
+# Emrys 11900 (his "a million emails"): a newer push to the same branch cancels the run still going.
+concurrency:
+  group: tsp-library-tests-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 env:
@@ -335,7 +339,7 @@ jobs:
         run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed over tsp (red by design) ${{ steps.aclclosed.outcome }}, admin over TSP refused (expected) ${{ steps.expectred.outcome }}, didcomm selftest ${{ steps.dcself.outcome }}, acl closed over didcomm ${{ steps.aclclosedd.outcome }}, entrypoint ${{ steps.entrypoint.outcome }}, setup build ${{ steps.setupbuild.outcome }}, setup features ${{ steps.setupfeats.outcome }}, keyring paths ${{ steps.keyringpaths.outcome }}, admin keys units ${{ steps.adminkeys.outcome }}, setup run ${{ steps.setuprun.outcome }}, images ${{ steps.images.outcome }}" && exit 1
 
   report:
-    name: report (one markdown report; fails while a line is missing)
+    name: report (one markdown report; fails on a red not listed as a STOP line, Security 11910.5)
     needs: [audit, vectors, roundtrip]
     if: always()
     runs-on: ubuntu-latest
