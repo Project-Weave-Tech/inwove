@@ -110,7 +110,19 @@ MARKS="$SHM/admin-markers"
 # Every private key of the admin DID in every encoding, and the profile's own values (12582.2(b)); then a planted
 # copy of each must be hit, so a scan that can't hit isn't evidence.
 PLANT="$SHM/planted"
-keys_summary=$( (umask 077; node "$HERE/admin-key-markers.mjs" markers "$ADMIN_OUT" "$MARKS" "$PLANT" "$VOL/admin-monitor.json") 2>/dev/null || echo '{"ok":false}')
+( umask 077; node -e '
+// 12247.2 as before: the private key value (AdminCredential.private_key_multibase, well_known.rs:111 at 34bbdea4), it
+// without its multibase prefix, and the credential JSON itself. Not the DID: that is public and may be logged.
+const fs = require("fs"); const out = [];
+let raw = ""; try { raw = fs.readFileSync(process.argv[1], "utf8"); } catch {}
+try { const k = String(JSON.parse(raw).private_key_multibase || ""); if (k.length >= 16) out.push(k, k.slice(1)); } catch {}
+const line = raw.trim(); if (line.length >= 16 && !line.includes("\n")) out.push(line);
+fs.writeFileSync(process.argv[2], [...new Set(out)].join("\n") + (out.length ? "\n" : ""));
+' "$ADMIN_OUT" "$MARKS" )
+# 12582.2: every private key of the admin DID, added to the same marker file.
+keys_summary=$( (umask 077; node "$HERE/admin-key-markers.mjs" markers "$ADMIN_OUT" "$MARKS.keys" "$PLANT" "$VOL/admin-monitor.json") 2>/dev/null || true)
+[ -n "$keys_summary" ] || keys_summary='{"ok":false,"error":"no-output"}'
+[ -s "$MARKS.keys" ] && { cat "$MARKS.keys" >> "$MARKS"; rm -f -- "$MARKS.keys"; }
 planted_n=$(find "$PLANT" -type f 2>/dev/null | grep -c . || true)
 planted_hit=$( [ -s "$MARKS" ] && { grep -l -F -f "$MARKS" "$PLANT"/* 2>/dev/null | grep -c . || true; } || echo 0)
 vol_files_hit_before=$( [ -s "$MARKS" ] && { grep -r -l -F -f "$MARKS" "$VOL" 2>/dev/null | grep -c . || true; } || echo 0)
@@ -188,14 +200,14 @@ const v = {
   rotation_v_new_starts: neu && neu.started && neu.environ_is_allow_list ? "PASS" : "FAIL",
   marker_15_iv: leaks === "0" ? "PASS" : `FAIL (${leaks} lines)`,
   marker_admin_credential_12247_2: ao === "0" && Number(marks) > 0 && Number(selfHits) > 0 && aLeaks === "0" ? "PASS" : `FAIL (admin-out ${ao}, ${marks} markers, self ${selfHits}, ${aLeaks} lines)`,
-  admin_keys_every_private_key_12582: ks.ok && ks.every_document_key_held && ["ed25519", "x25519"].every((k) => (ks.kinds || []).includes(k)) && Number(plN) > 0 && plHit === plN && volAfter === "0" && aLeaks === "0" && profEnd === "absent" ? "PASS" : `FAIL (keys ok ${!!ks.ok}, all held ${!!ks.every_document_key_held}, kinds ${(ks.kinds || []).join("+") || "none"}, planted ${plHit}/${plN}, volume files hit at end ${volAfter}, profile at end ${profEnd})`,
+  admin_keys_every_private_key_12582: ks.ok && ks.every_document_key_held && ["ed25519", "x25519"].every((k) => (ks.kinds || []).includes(k)) && Number(plN) > 0 && plHit === plN && volAfter === "0" && aLeaks === "0" && profEnd === "absent" ? "PASS" : `FAIL (keys ok ${!!ks.ok}${ks.ok ? "" : ` error ${ks.error || "none"} ${JSON.stringify(ks.shape || {})}`}, did ${ks.did_method || "?"}, all held ${!!ks.every_document_key_held}, kinds ${(ks.kinds || []).join("+") || "none"}, planted ${plHit}/${plN}, volume files hit at end ${volAfter}, profile at end ${profEnd})`,
   admin_out_custody_12247_3: aoRes === "5" && removed === "true" && atEnd === "absent" && resNamed === "0" ? "PASS" : `FAIL (results path ${aoRes}, removed ${removed}, at end ${atEnd}, ${resNamed} named in results)`,
 };
 const res = {
   what: "setup job, backend half: mediator-setup → ?encrypt=1, 16.3(b) refuse, surgical delete, green on the encrypted store, (v) rotation (Security 11984)",
   conf_backend_line: backend, entries_before: before.entries || null, entries_after: after.entries || null,
   admin_out: rd("admin-out.json"), admin_credential_markers: Number(marks),
-  admin_keys: { did_method: ks.did_method || null, keys: (ks.keys || []).map((k) => ({ kind: k.kind, held_by_credential: k.held_by_credential, derived: k.derived })), every_document_key_held: !!ks.every_document_key_held, markers: ks.markers || 0, planted: Number(plN), planted_hit: Number(plHit), profile_values: ks.profile_values || 0, volume_files_hit_before_delete: Number(volBefore), volume_files_hit_at_end: Number(volAfter), admin_monitor_after_setup: profSetup, admin_monitor_at_end: profEnd, volume_names_after_setup: JSON.parse(volNames || "[]") },
+  admin_keys: { ok: !!ks.ok, error: ks.ok ? null : (ks.error || null), error_shape: ks.ok ? null : (ks.shape || null), did_method: ks.did_method || null, keys: (ks.keys || []).map((k) => ({ kind: k.kind, held_by_credential: k.held_by_credential, derived: k.derived })), every_document_key_held: !!ks.every_document_key_held, markers: ks.markers || 0, planted: Number(plN), planted_hit: Number(plHit), profile_values: ks.profile_values || 0, volume_files_hit_before_delete: Number(volBefore), volume_files_hit_at_end: Number(volAfter), admin_monitor_after_setup: profSetup, admin_monitor_at_end: profEnd, volume_names_after_setup: JSON.parse(volNames || "[]") },
   surgical_delete: del, rekey: rk, runs: [cred, green, old, neu].filter(Boolean), verdicts: v,
   not_covered: ["the pinned production conf (16.1 hash + four values)", "DIDComm admin calls + read-back-is-truth"],
 };

@@ -28,15 +28,23 @@ const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i])
 
 // The Ed25519 seed out of a private_key_multibase: z + base58btc, with or without the ed25519-priv prefix,
 // 32 bytes (seed) or 64 (seed ‖ public).
+// Errors carry a fixed code and shape facts only (never a value: a JSON.parse message quotes the text it read).
+export class KeyError extends Error { constructor(code, shape = {}) { super(code); this.code = code; this.shape = shape } }
 export function seedOf(mb) {
-  if (typeof mb !== 'string' || !mb.startsWith('z')) throw new Error('private key is not base58btc multibase')
-  let raw = dc.multibase.base58btcDecode(mb.slice(1))
-  if (raw[0] === ED_PRIV[0] && raw[1] === ED_PRIV[1]) raw = raw.slice(2)
-  if (raw.length !== 32 && raw.length !== 64) throw new Error(`private key is ${raw.length} bytes, not 32 or 64`)
+  if (typeof mb !== 'string') throw new KeyError('key-not-a-string', { type: typeof mb })
+  if (!mb.startsWith('z')) throw new KeyError('key-not-base58btc-multibase', { first_char_class: /[A-Za-z]/.test(mb[0] ?? '') ? 'letter' : 'other', length: mb.length })
+  let raw
+  try { raw = dc.multibase.base58btcDecode(mb.slice(1)) } catch { throw new KeyError('key-not-base58', { length: mb.length }) }
+  const prefixed = raw[0] === ED_PRIV[0] && raw[1] === ED_PRIV[1]
+  if (prefixed) raw = raw.slice(2)
+  if (raw.length !== 32 && raw.length !== 64) throw new KeyError('key-wrong-length', { decoded_bytes: raw.length, ed25519_priv_prefix: prefixed, first_two_bytes_are_varint: (raw[1] & 0x80) === 0 && ((raw[0] ?? 0) & 0x80) !== 0 })
   return raw.slice(0, 32)
 }
 
-const docOf = (did) => (did.startsWith('did:peer:') ? dc.didPeer.resolve(did) : dc.didKey.resolve(did)).didDocument
+const docOf = (did) => {
+  try { return (did.startsWith('did:peer:') ? dc.didPeer.resolve(did) : dc.didKey.resolve(did)).didDocument }
+  catch { throw new KeyError('did-unresolvable', { did_method: did.split(':').slice(0, 2).join(':') }) }
+}
 const pubOf = (vm) => {
   const raw = dc.multibase.base58btcDecode(String(vm.publicKeyMultibase ?? '').slice(1))
   return raw.slice(2) // drop the 2-byte multicodec (0xed01 Ed25519, 0xec01 X25519)
@@ -108,7 +116,12 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   if (cmd !== 'markers' || !credPath || !marksOut || !plantDir) { console.error('usage: admin-key-markers.mjs markers <credential.json> <markers out> <planted dir> [admin-monitor.json]'); process.exit(2) }
   let summary
   try {
-    const cred = JSON.parse(readFileSync(credPath, 'utf8'))
+    let text, cred
+    try { text = readFileSync(credPath, 'utf8') } catch { throw new KeyError('credential-unreadable') }
+    try { cred = JSON.parse(text) } catch { throw new KeyError('credential-not-json', { bytes: text.length }) }
+    if (!cred || typeof cred !== 'object') throw new KeyError('credential-not-an-object')
+    const fields = Object.keys(cred).sort()
+    if (typeof cred.did !== 'string' || !('private_key_multibase' in cred)) throw new KeyError('credential-shape', { fields })
     let profile = null
     if (profilePath) { try { profile = JSON.parse(readFileSync(profilePath, 'utf8')) } catch {} }
     const m = markers(cred, profile)
@@ -117,7 +130,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     m.planted.forEach((p, i) => writeFileSync(join(plantDir, `planted-${i}-${p.kind}-${p.encoding.replace(/\W+/g, '_')}.txt`), `noise before ${p.value} noise after\n`, { mode: 0o600 }))
     summary = { ok: true, did_method: m.did_method, keys: m.keys, every_document_key_held: m.every_document_key_held, kinds: m.kinds, markers: m.markers.length, planted: m.planted.length, profile_values: m.profile_values }
   } catch (e) {
-    summary = { ok: false, error: String(e.message).slice(0, 120) }
+    summary = e instanceof KeyError ? { ok: false, error: e.code, shape: e.shape } : { ok: false, error: 'internal', where: String(e?.name ?? 'Error') }
   }
   console.log(JSON.stringify(summary))
   process.exit(summary.ok ? 0 : 1)
