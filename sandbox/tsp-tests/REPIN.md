@@ -56,3 +56,9 @@ the host only when every step below holds on the new pin, in one job run, and Se
     an array element line reading `[security]` fools the awk tracker today, and is safe only because TOML refuses the
     bare word, so the mediator won't start). Re-read upstream's `conf/mediator.toml` for braces here too: today it
     rests on the grep plus the green entrypoint step on run `43840858890`.
+12. **The rekey image's allowed archives** (Security 11869.3, Railroad 11857): `ARCHIVES_ALLOWED` in
+    `mediator-image-check.mjs` holds one triple, `/var/lib/dpkg/alternatives/builtins.7.gz` at its sha256 and size in
+    the pinned `node:22-bookworm-slim` (kinds exactly `['by-name']`), and the rekey Dockerfile removes `/var/log/apt`.
+    At a base re-pin, read the new base's file at that path (the images step prints `rekey_archives_allowed_read`) and
+    any new archive hit, and bring both to SECURITY: the set is re-pinned or widened only by a Security block, never in
+    place. A new base where the file is gone keeps the line red-safe (an absent allowed path allows nothing).

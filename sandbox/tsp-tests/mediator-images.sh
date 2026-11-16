@@ -146,6 +146,6 @@ fs.writeFileSync(out, JSON.stringify(rec, null, 2) + '\n');
 console.log(JSON.stringify(lines));
 console.log(JSON.stringify(rec.rekey_calls));
 // Security 13081.1: the shipped tool's sha256 in the log too, so it can be read against the L8 pin without the artifact
-console.log(JSON.stringify({ shipped_tool_sha256: rec.shipped_tool_sha256, ship_strip_sha256: rec.ship_strip_sha256, rekey_archive_hits: rek && rek.archive_hits }));
+console.log(JSON.stringify({ shipped_tool_sha256: rec.shipped_tool_sha256, ship_strip_sha256: rec.ship_strip_sha256, rekey_archive_hits: rek && rek.archive_hits, rekey_archives_allowed_read: rek && rek.archives_allowed_read }));
 process.exit(Object.values(lines).some((v) => v === 'FAIL') ? 1 : 0);
 EOF

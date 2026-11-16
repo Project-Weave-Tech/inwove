@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync, deflateSync } from 'node:zlib';
 import { strip, shippedVerdict, subcommands } from '../sandbox/tsp-tests/mediator-store-ship.mjs';
-import { serviceVerdict, rekeyVerdict, archives, walk, SERVICE_ENTRYPOINT } from '../sandbox/tsp-tests/mediator-image-check.mjs';
+import { serviceVerdict, rekeyVerdict, archives, walk, SERVICE_ENTRYPOINT, ARCHIVES_ALLOWED, allowedArchive } from '../sandbox/tsp-tests/mediator-image-check.mjs';
 
 const DIR = new URL('../sandbox/tsp-tests/', import.meta.url).pathname;
 const SRC = readFileSync(join(DIR, 'mediator-store.mjs'), 'utf8');
@@ -206,5 +206,54 @@ test('rekey image check 13081.2: an archive outside the shipped path is red by i
       put(t, 'a.js', 'x = 1;\n'); put(t, 'b.txt', 'PK is just two letters here'); put(t, 'empty', '');
       assert.deepEqual(archives(t, walk(t)), []);
     } finally { rmSync(t, { recursive: true, force: true }); }
+  } finally { rmSync(p, { recursive: true, force: true }); }
+});
+
+test('rekey image check 11869.3: the one allowed archive passes only as its pinned triple; gzip bytes, one byte changed, another size or path are red', () => {
+  const REK = { User: '1000:1000', Entrypoint: ['node', '/opt/rekey/mediator-store.mjs'] };
+  const SHIP = '/opt/rekey/mediator-store.mjs';
+  const ALT = 'var/lib/dpkg/alternatives/builtins.7.gz';
+  assert.equal(ARCHIVES_ALLOWED.length, 1);
+  assert.deepEqual(ARCHIVES_ALLOWED[0].kinds, ['by-name']);
+  assert.throws(() => { ARCHIVES_ALLOWED.push({ path: '/x.gz' }); });
+  // a stand-in triple with bytes the test owns (the real one is the base's own 83-byte dpkg record)
+  const body = Buffer.from('manual\n/usr/share/man/man7/builtins.7.gz\n\n/usr/share/man/man7/bash-builtins.7.gz\n10\n\n');
+  const crypto = { sha: (b) => spawnSync('sha256sum', { input: b }).stdout.toString().split(' ')[0] };
+  const allowed = [{ path: `/${ALT}`, sha256: crypto.sha(body), size: body.length, kinds: ['by-name'] }];
+  const mk = (rel, b) => { const r = tmp(); put(r, 'opt/rekey/mediator-store.mjs', strip(SRC)); put(r, rel, b); return r; };
+  const flip = Buffer.from(body); flip[3] ^= 1;
+  for (const [name, rel, b, ok] of [
+    ['the pinned bytes', ALT, body, true],
+    ['the same name with gzip bytes', ALT, gzipSync(body), false],
+    ['the same name with one byte changed', ALT, flip, false],
+    ['another size', ALT, Buffer.concat([body, Buffer.from('\n')]), false],
+    ['the pinned bytes at another path', 'var/lib/dpkg/alternatives/other.7.gz', body, false],
+  ]) {
+    const r = mk(rel, b);
+    try {
+      const hit = archives(r, walk(r)).find((a) => a.path === `/${rel}`);
+      assert.ok(hit, name);
+      assert.equal(!!allowedArchive(r, hit, allowed), ok, name);
+    } finally { rmSync(r, { recursive: true, force: true }); }
+  }
+  // the shipped list itself: its own pinned path with other bytes is red in rekeyVerdict
+  const p = planted();
+  try {
+    for (const b of [gzipSync(body), body]) {
+      const r = mk(ALT, b);
+      try {
+        const v = rekeyVerdict(r, REK, SHIP, p);
+        assert.equal(v.checks.no_archive_outside_the_shipped_path, 'FAIL');
+        assert.ok(v.archive_hits.some((a) => a.path === `/${ALT}`));
+        assert.equal(v.archives_allowed_read[0].path, `/${ALT}`);
+      } finally { rmSync(r, { recursive: true, force: true }); }
+    }
+    // absent: nothing allowed, nothing red, and the read says absent
+    const r = mk('usr/local/bin/node', 'ELF');
+    try {
+      const v = rekeyVerdict(r, REK, SHIP, p);
+      assert.equal(v.checks.no_archive_outside_the_shipped_path, 'PASS');
+      assert.deepEqual(v.archives_allowed_read, [{ path: `/${ALT}`, absent: true }]);
+    } finally { rmSync(r, { recursive: true, force: true }); }
   } finally { rmSync(p, { recursive: true, force: true }); }
 });

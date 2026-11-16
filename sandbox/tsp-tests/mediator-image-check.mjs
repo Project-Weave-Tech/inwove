@@ -32,8 +32,10 @@ export const REKEY_IMAGE_WORDS = ['delete-admin', 'admin-out', 'seal-test', 'enc
 const DBUS_BINS = ['dbus-daemon', 'dbus-broker', 'dbus-launch'];
 // Security 13081.2: a byte search can't see inside a compressed file, so the rekey image also lists every
 // archive-shaped file outside the shipped path, by its first bytes (a renamed archive is still found) and, for brotli,
-// which has no magic, by name. Red outside ARCHIVES_ALLOWED (expected: none in the node base). Plain tar is not listed:
-// its members' bytes are stored as they are, so the content search already reads them.
+// which has no magic, by name. Red outside ARCHIVES_ALLOWED. Plain tar is not listed: its members' bytes are stored as
+// they are, so the content search already reads them.
+// The zlib magic 78 5e is the text `x^`, so a plain text file that starts `x^` goes red too. That is fine on the rekey
+// image (red is the safe side, Security 11869.5): don't loosen it.
 export const ARCHIVE_MAGIC = [
   ['gzip', [0x1f, 0x8b]], ['zip', [0x50, 0x4b, 0x03, 0x04]], ['zip', [0x50, 0x4b, 0x05, 0x06]], ['zip', [0x50, 0x4b, 0x07, 0x08]],
   ['bzip2', [0x42, 0x5a, 0x68]], ['xz', [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]], ['zstd', [0x28, 0xb5, 0x2f, 0xfd]],
@@ -41,7 +43,31 @@ export const ARCHIVE_MAGIC = [
   ['zlib', [0x78, 0x01]], ['zlib', [0x78, 0x5e]], ['zlib', [0x78, 0x9c]], ['zlib', [0x78, 0xda]],
 ];
 export const ARCHIVE_NAME = /\.(gz|tgz|zip|br|bz2|tbz2?|xz|txz|zst|tzst|7z|lz4|lzma|lz|z|jar|whl)$/i;
-export const ARCHIVES_ALLOWED = [];
+// Security 11869.3 (b)-(d): ONE triple, read from the pinned base node:22-bookworm-slim@sha256:e9f565d3…21ee (manifest
+// amd64 47725aca…99fc, layer dd051e1b…63e3; dpkg's alternatives record for builtins.7.gz, a text file by name only).
+// Allowed only when path, sha256, size AND kinds (exactly ['by-name']) all match: other bytes, another size, any magic
+// kind, or any other path stays red. Widened only by a Security block at a base re-pin (REPIN.md item 12), never in place.
+export const ARCHIVES_ALLOWED = Object.freeze([
+  Object.freeze({ path: '/var/lib/dpkg/alternatives/builtins.7.gz', sha256: '6cd368606c13e12657f237f25e3ddfd89c6ebc34b52b8391561ff89d0c052f62', size: 83, kinds: Object.freeze(['by-name']) }),
+]);
+// The allowed entry this hit is, or null. Reads the file's bytes only for a path the list names.
+export function allowedArchive(root, hit, allowed = ARCHIVES_ALLOWED) {
+  const a = allowed.find((x) => x.path === hit.path);
+  if (!a || JSON.stringify(hit.kinds) !== JSON.stringify(a.kinds)) return null;
+  let buf;
+  try { buf = fs.readFileSync(path.join(root, hit.path.replace(/^\/+/, ''))); } catch { return null; }
+  return buf.length === a.size && sha256(buf) === a.sha256 ? a : null;
+}
+// What the job prints: each allowed path as read in the image (sha256, size, kinds), or absent.
+export function allowedRead(root, entries, allowed = ARCHIVES_ALLOWED) {
+  const hits = archives(root, entries);
+  return allowed.map((a) => {
+    let buf = null;
+    try { if (fs.lstatSync(path.join(root, a.path.slice(1))).isFile()) buf = fs.readFileSync(path.join(root, a.path.slice(1))); } catch { /* absent */ }
+    return buf === null ? { path: a.path, absent: true }
+      : { path: a.path, sha256: sha256(buf), size: buf.length, kinds: hits.find((h) => h.path === a.path)?.kinds ?? [] };
+  });
+}
 // Every archive-shaped regular file under root: {path, kinds}. Reads only each file's first bytes.
 export function archives(root, entries) {
   const out = [];
@@ -154,7 +180,8 @@ export function rekeyVerdict(root, config, shipped, planted) {
   const contentHits = s.store_words.filter((h) => h.path !== `/${rel}`);
   // 13081.2: the archive list must first find the planted gzip of the full tool (named so only its bytes give it away)
   const plantedArchive = !!planted && archives(planted, walk(planted)).some((a) => a.kinds.includes('gzip') && !a.kinds.includes('by-name'));
-  const archiveHits = archives(root, entries).filter((a) => a.path !== `/${rel}` && !ARCHIVES_ALLOWED.includes(a.path));
+  const archiveHits = archives(root, entries).filter((a) => a.path !== `/${rel}` && !allowedArchive(root, a));
+  const archivesAllowedRead = allowedRead(root, entries);
   let text = null;
   try { text = fs.readFileSync(path.join(root, rel), 'utf8'); } catch { /* checked below */ }
   const v = text === null ? null : shippedVerdict(text);
@@ -178,7 +205,7 @@ export function rekeyVerdict(root, config, shipped, planted) {
   return { checks, shipped: shipped, shipped_sha256: text === null ? null : sha256(Buffer.from(text)), subcommands: v?.subcommands ?? null,
     forbidden_words: v?.forbidden_words ?? null, mediator_bins: mediatorBins, other_copies: otherCopies,
     removed_word_hits: contentHits, planted_renamed_copy_found: plantedRenamedHit,
-    archive_hits: archiveHits, archives_allowed: ARCHIVES_ALLOWED, planted_archive_found: plantedArchive, exposed_ports: ports, user: config.User || '' };
+    archive_hits: archiveHits, archives_allowed: ARCHIVES_ALLOWED, archives_allowed_read: archivesAllowedRead, planted_archive_found: plantedArchive, exposed_ports: ports, user: config.User || '' };
 }
 
 if (process.argv[1]?.endsWith('mediator-image-check.mjs')) {
