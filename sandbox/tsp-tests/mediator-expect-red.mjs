@@ -10,7 +10,10 @@
 //     got no answer, the read-back over DIDComm does not show the mediator's hash on the admin's list (answered without
 //     it, or the mediator's reply to the admin refused 403/73 by that same list), and none of the three adds is
 //     confirmed by an answer; every non-admin check in that run still passes;
-//   - the DIDComm run says pass with S2 admin-list and S2 adds passing;
+//   - the DIDComm run says pass with S2 admin-list, S2 adds and E1 (Security 12672.2: an unsigned admin write is refused
+//     proof_required and does not land, an unsigned read answers) passing;
+//   - the known-gap line tsp_account_add_lands_despite_refusal (Security 12672.1) reads 3/3, AMBER; any other count is
+//     a STOP (red, a re-pin note), never silently accepted;
 //   - both record block_remote_admin_msgs: true and their admin_transport (tsp / didcomm).
 // "Can't tell" is never a pass: a missing or unparseable file, an `error` (crash, the admin couldn't sign in), a
 // run that didn't reach its end, a 5xx or any other code is red. If the TSP update (or an add) is ever accepted, it is
@@ -30,6 +33,20 @@ export function readResults(path) {
   try { return { json: JSON.parse(text) } } catch { return { unparseable: true } }
 }
 
+// Security 12672.1, the known-gap line beside the expect-red (report 2, the silent account/add): how many of the TSP
+// run's three adds answered a refusal and then landed, proved by a real sign-in (setup fact 1), never by the answer.
+// At the pin that is 3 of 3, shown AMBER, never green. Any other count, or a count that can't be read, is a STOP: the
+// setup job's own add path would behave differently, so it comes back as a re-pin note.
+export const EXPECTED_LANDED = 3
+export function addsLandDespiteRefusal(tsp) {
+  const s = tsp?.json?.setup ?? null, signs = s?.account_signs_in ?? null
+  const note = 'report 2 (upstream): a refused account/add over TSP still lands; custody covers it, the expect-red does not gate on it'
+  if (!s || !signs) return { count: 'unknown', expected: `${EXPECTED_LANDED}/${ADDS.length}`, state: 'STOP', note }
+  let n = 0
+  for (const k of ADDS) { const a = s['account_add_' + k]; if (a && !a.confirmed && !a.answerType && a.status >= 400 && signs[k] === true) n++ }
+  return { count: `${n}/${ADDS.length}`, expected: `${EXPECTED_LANDED}/${ADDS.length}`, state: n === EXPECTED_LANDED ? 'amber' : 'STOP', note }
+}
+
 // tsp, didcomm: parsed JSON objects, or { missing } / { unparseable } markers from readResults.
 export function evaluate(tsp, didcomm) {
   const reasons = [], findings = []
@@ -46,6 +63,7 @@ export function evaluate(tsp, didcomm) {
     if (d.pass !== true) red('didcomm: run did not pass')
     if (d.checks?.S2_admin_allow_list_is_mediator_only?.pass !== true) red('didcomm: S2 admin list not mediator-only')
     if (d.checks?.S2_adds_confirmed_under_closed_default?.pass !== true) red('didcomm: S2 adds not confirmed')
+    if (d.checks?.E1_enforce_unsigned_admin_write_refused?.pass !== true) red('didcomm: E1 an unsigned admin write was not refused proof_required (enforce), or it landed')
   }
 
   // ---- the TSP run: refused exactly as known, and nothing landed by that call ----
@@ -83,7 +101,9 @@ export function evaluate(tsp, didcomm) {
     if (t.log_lines_with_redis_password !== 0) red('tsp: redis password count is not 0')
   }
 
-  return { line: 'admin over TSP is refused with the guard on (expected)', pass: reasons.length === 0, reasons, findings, finding_for_security: findings.length > 0 }
+  const known_gaps = { tsp_account_add_lands_despite_refusal: addsLandDespiteRefusal(tsp) }
+  if (known_gaps.tsp_account_add_lands_despite_refusal.state !== 'amber') red(`STOP: tsp_account_add_lands_despite_refusal is ${known_gaps.tsp_account_add_lands_despite_refusal.count}, not the known ${EXPECTED_LANDED}/${ADDS.length} (a re-pin note to SECURITY + RAILROAD: the setup job's add path now behaves differently)`)
+  return { line: 'admin over TSP is refused with the guard on (expected)', pass: reasons.length === 0, reasons, findings, finding_for_security: findings.length > 0, known_gaps }
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
@@ -94,6 +114,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   v.tsp_statuses = t ? { update: t.setup?.admin_list?.update_status ?? null, update_problem: typeof t.setup?.admin_list?.update_problem === 'number' ? t.setup.admin_list.update_problem : null, readback: t.setup?.admin_list_readback_didcomm ? { answered: t.setup.admin_list_readback_didcomm.answered, status: t.setup.admin_list_readback_didcomm.status, problem: typeof t.setup.admin_list_readback_didcomm.problem === 'number' ? t.setup.admin_list_readback_didcomm.problem : null } : null, adds: ADDS.map((n) => t.setup?.['account_add_' + n]?.status ?? null) } : null
   writeFileSync(outPath, JSON.stringify(v, null, 2) + '\n')
   console.log(`${v.line}: ${v.pass ? 'PASS' : 'FAIL'}`)
+  for (const [k, g] of Object.entries(v.known_gaps)) console.log(`  known gap ${k}: ${g.count} (${g.state === 'amber' ? 'AMBER, expected' : 'STOP'})`)
   for (const r of v.reasons) console.log('  - ' + r)
   if (v.finding_for_security) console.log('FINDING for SECURITY: ' + v.findings.join('; '))
   process.exit(v.pass ? 0 : 1)

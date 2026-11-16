@@ -14,9 +14,23 @@ the host only when every step below holds on the new pin, in one job run, and Se
    (Security 12552; Railroad 12567.1; Security 12582.1). **A re-pin whose expect-red doesn't pass stops here, whatever
    else is green, and comes to SECURITY as a finding.** If the TSP update or an add is ever accepted, that is a
    finding, never a test to update.
+   Beside it, the known-gap line `tsp_account_add_lands_despite_refusal` (Security 12672.1, upstream report 2): how
+   many of the three TSP adds answered a refusal and still landed (by sign-in). At 0.50.0 it is 3/3, **amber, never
+   green**. Any other count is a STOP: it comes to SECURITY + RAILROAD as a re-pin note, because the setup job's own
+   add path would behave differently. When a re-pin carries upstream's fix, this line is rewritten as a gating
+   requirement in the same change.
 6. **Every private key of the admin DID, as one admin key** (Security 12582.2): the setup run lists the admin DID
    document's keys, the credential must yield each one, the scan self-hits on each kind in each encoding, and at the
    end no volume file or log line carries any of them and `admin-monitor.json` is gone.
-7. **`trust_task_verification = "enforce"`** in the conf the job runs. At 0.50.0 the upstream default and the shipped
-   `conf/mediator.toml` are `warn`, under which a write task with no proof is accepted on the authcrypt key alone.
-8. **The rest of the mediator job green**, and the units (`npm test`; `node --test admin-key-markers.test.mjs` here).
+7. **`trust_task_verification = "enforce"`** in the conf the job runs, and the entrypoint refuses any other (Security
+   12672.2: the typed literal, exactly once, under `[security]`). At 0.50.0 the upstream default and the shipped
+   `conf/mediator.toml` are `warn`, under which every acceptance failure is logged and let through
+   (`trust_task_verify.rs:176-187`): a write with no proof on the authcrypt key alone, and a stale or replayed one. The
+   behaviour proof is E1 in the DIDComm closed run: an unsigned admin write is refused `proof_required` and doesn't land
+   (read back), an unsigned read answers. Re-read the `warn`/`enforce` branch and setup's `config_writer.rs` line at
+   each re-pin.
+8. **Setup's output stays off every log** (Security 12672.3): setup's stdout+stderr to one tmpfs file, the scan hits
+   the key echo there first, then 0 marker lines in the step's own log, every start, and every artifact file; the file
+   is gone at the end. If a re-pin drops the echo (upstream report 4), the "must first hit" line turns red: re-read it
+   with Security, never loosen it in place.
+9. **The rest of the mediator job green**, and the units (`npm test`; `node --test admin-key-markers.test.mjs` here).

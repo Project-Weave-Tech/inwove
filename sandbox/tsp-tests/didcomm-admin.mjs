@@ -57,25 +57,32 @@ export async function signIn(post, who, med) {
 export function envelopeFor(who, med, doc) {
   return plain(ENVELOPE, who.id, med.id, doc)
 }
-export function trustTaskDoc(who, med, typeUri, payload) {
-  return attachProof({ id: 'urn:uuid:' + crypto.randomUUID(), type: typeUri, issuer: who.id, recipient: med.id, issuedAt: new Date().toISOString(), payload }, who)
+// { unsigned: true } leaves the proof off (Security 12672.2's behaviour proof: under `enforce` a write with no proof is
+// refused message.trust_task.proof_required, trust_task_verify.rs:79/:230-232; a read needs none).
+export function trustTaskDoc(who, med, typeUri, payload, { unsigned = false } = {}) {
+  const doc = { id: 'urn:uuid:' + crypto.randomUUID(), type: typeUri, issuer: who.id, recipient: med.id, issuedAt: new Date().toISOString(), payload }
+  return unsigned ? doc : attachProof(doc, who)
 }
+// The mediator's Trust Task refusal names its reason as a fixed code (trust_task_verify.rs:75-86); only that name is
+// kept, never the detail text around it.
+export const ttCodeOf = (s) => (String(s ?? '').match(/message\.trust_task\.[a-z_]+/) || [null])[0]
 
 // One Trust Task over DIDComm. Same return shape as the TSP path's task(): { status, answerType, answer, problem? }.
-export async function task(post, who, token, med, typeUri, payload) {
+export async function task(post, who, token, med, typeUri, payload, opts = {}) {
   const p = parties(who, med)
-  const doc = trustTaskDoc(who, med, typeUri, payload)
+  const doc = trustTaskDoc(who, med, typeUri, payload, opts)
   const msg = envelopeFor(who, med, doc)
   const jwe = await dc.pack({ message: msg, sender: p.me, recipient: p.medRecipient })
   const sent = await post('/inbound', jwe, token)
-  if (sent.status >= 300) return { status: sent.status, problem: problemOf(sent), via: 'didcomm' }
+  if (sent.status >= 300) return { status: sent.status, problem: problemOf(sent), tt_code: ttCodeOf(sent.text), via: 'didcomm' }
   const replies = await collect(post, who, token, med)
   const r = replies.find((m) => m.thid === msg.id) ?? null
   const body = r?.body ?? null
   // The answer is a Trust Task response document in an envelope (body.type …#response, body.payload), or a
   // DIDComm problem report (type …/report-problem/2.0/problem-report, body.code).
   const answerType = body?.type ?? (r ? r.type : null)
-  return { status: sent.status, answerType, answer: body?.payload ?? null, problem: r && !body?.type ? (body?.code ?? r.type) : undefined, via: 'didcomm', replies: replies.length }
+  const problem = r && !body?.type ? (body?.code ?? r.type) : undefined
+  return { status: sent.status, answerType, answer: body?.payload ?? null, problem, tt_code: problem === undefined ? null : ttCodeOf(JSON.stringify(body ?? r?.type ?? '')), via: 'didcomm', replies: replies.length }
 }
 
 export async function collect(post, who, token, med, del = true) {

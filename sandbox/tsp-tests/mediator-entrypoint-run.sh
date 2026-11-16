@@ -39,6 +39,9 @@ sed -i -e "s#^backend = \"file://.*#backend = \"file://$VOL/secrets.json?encrypt
        -e "s#^listen_address = .*#listen_address = \"127.0.0.1:${MPORT}\"#" \
        -e "s#^log_json = .*#log_json = \"true\"#" \
        -e "s#^log_level = .*#log_level = \"info\"#" "$VOL/mediator.toml"
+# Security 12672.2: the entrypoint starts only a conf whose [security] holds trust_task_verification = "enforce" as a
+# typed literal; upstream's TEST-ONLY conf names none (the mediator's default is warn), so the one line goes in here.
+sed -i -e '/trust_task_verification/Id' -e 's/^\[security\]$/[security]\ntrust_task_verification = "enforce"/' "$VOL/mediator.toml"
 # 12247.4: the entrypoint starts only the ?encrypt=1 backend, so upstream's TEST-ONLY plain store is re-sealed in place
 # under the marker passphrase (same names and values), the shape the host will run.
 ( umask 077; printf '%s' "$PASS_MARK" > "$SHM/test-pass" )

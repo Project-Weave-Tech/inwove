@@ -28,7 +28,7 @@ function rig() {
   const workdir = join(disk, 'work'); mkdirSync(workdir);
   const deny = join(disk, 'deny.txt'); writeFileSync(deny, denyFileText(RECORD));
   const conf = join(disk, 'mediator.toml');
-  writeFileSync(conf, `[secrets]\nbackend = "file://${volume}/secrets.json?encrypt=1"\n[storage]\nbackend = "redis"\n`);
+  writeFileSync(conf, `[security]\ntrust_task_verification = "enforce"\n[secrets]\nbackend = "file://${volume}/secrets.json?encrypt=1"\n[storage]\nbackend = "redis"\n`);
   return { disk, shm, med, volume, workdir, deny, conf, done: () => { rmSync(disk, { recursive: true, force: true }); rmSync(shm, { recursive: true, force: true }); } };
 }
 const baseEnv = { PATH: '/usr/bin:/bin', DATABASE_URL: 'redis://test-only', ENKARA_MEDIATOR_BACKEND_PASSPHRASE: 'test-only-marker' };
@@ -91,7 +91,7 @@ test('entrypoint: refuses a non-tmpfs dir, one on the volume\'s filesystem, a sy
     const plain = join(r.disk, 'plain'); mkdirSync(plain);
     refused(run(r, { tmpfs: plain }), 'not tmpfs');
     const vol2 = join(r.shm, 'vol'); mkdirSync(vol2); writeFileSync(join(vol2, 'secrets.json'), JSON.stringify({ entries: {} }));
-    const conf2 = join(r.disk, 'vol2.toml'); writeFileSync(conf2, `backend = "file://${vol2}/secrets.json?encrypt=1"\n`);
+    const conf2 = join(r.disk, 'vol2.toml'); writeFileSync(conf2, `[security]\ntrust_task_verification = "enforce"\n[secrets]\nbackend = "file://${vol2}/secrets.json?encrypt=1"\n`);
     refused(run(r, { volume: vol2, medArgs: ['-c', conf2] }), "on the volume's filesystem");
     const link = join(r.disk, 'link'); symlinkSync(r.shm, link);
     refused(run(r, { tmpfs: link }), 'tmpfs dir is a symlink');
@@ -317,4 +317,29 @@ test('entrypoint 12346.1: set -f follows PATH, and no name list goes through an 
   assert.equal(code[0], 'PATH=/usr/bin:/bin; export PATH');
   assert.equal(code[1], 'set -f');
   assert.ok(!code.some((l) => /\$\(echo \$/.test(l)), 'no $(echo $list)');
+});
+
+test('entrypoint 12672.2: the conf must hold trust_task_verification = "enforce" as a typed literal, once, in [security]', { skip: !haveTmpfs && 'no tmpfs' }, () => {
+  const r = rig();
+  try {
+    const other = join(r.disk, 'ttv.toml');
+    const be = `[secrets]\nbackend = "file://${r.volume}/secrets.json?encrypt=1"\n`;
+    const conf = (sec) => { writeFileSync(other, sec + be); return run(r, { medArgs: ['-c', other] }); };
+    refused(conf('[security]\ntrust_task_verification = "warn"\n'), 'is not the literal');
+    refused(conf('[security]\n'), 'exactly one line');
+    refused(conf('[security]\ntrust_task_verification = "enforce"\ntrust_task_verification = "enforce"\n'), 'exactly one line');
+    refused(conf('[security]\n"trust_task_verification" = "enforce"\n'), 'is not the literal');
+    refused(conf("[security]\ntrust_task_verification = 'enforce'\n"), 'is not the literal');
+    refused(conf('[security]\ntrust_task_verification = "${TRUST_TASK_VERIFICATION:enforce}"\n'), 'is not the literal');
+    refused(conf('[security]\ntrust_task_verification = "enforce" # on\n'), 'is not the literal');
+    refused(conf('[security]\nTrust_Task_Verification = "warn"\ntrust_task_verification = "enforce"\n'), 'exactly one line');
+    refused(conf('security.trust_task_verification = "enforce"\n'), 'is not the literal');
+    refused(conf('security = { trust_task_verification = "enforce" }\n'), 'is not the literal');
+    refused(conf('[other]\ntrust_task_verification = "enforce"\n'), 'is not under \\[security\\]');
+    refused(conf('[security.sub]\ntrust_task_verification = "enforce"\n'), 'is not under \\[security\\]');
+    // a host TRUST_TASK_VERIFICATION refuses by the deny list, whatever the conf says
+    refused(conf('[security]\ntrust_task_verification = "enforce"\n') && run(r, { env: { TRUST_TASK_VERIFICATION: 'warn' }, medArgs: ['-c', other] }), 'TRUST_TASK_VERIFICATION is set on the host');
+    // green: the literal under [security], with spacing and other keys around it
+    assert.equal(conf('[security]\nssl = "none"\n  trust_task_verification   =   "enforce"  \n').code, 0);
+  } finally { r.done(); }
 });

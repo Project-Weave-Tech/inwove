@@ -202,7 +202,36 @@ for (const [name, v, acl] of [['A', A, aclA], ['B', B], ['D', D]]) {
 }
 const sa = await signIn(A), sb = await signIn(B), sd = await signIn(D)
 log('A, B, D sign in', { A: sa.ok || sa, B: sb.ok || sb, D: sd.ok || sd })
+// Security 12672.1: whether each add landed, by a real sign-in (never the add's answer), for the expect-red's known-gap line.
+results.setup.account_signs_in = { A: sa.ok, B: sb.ok, D: sd.ok }
 if (!sa.ok || !sb.ok || !sd.ok) { results.error = 'a registered DID could not sign in'; writeFileSync(outFile, JSON.stringify(results, null, 2) + '\n'); process.exit(1) }
+
+// ---- E1 (Security 12672.2): `enforce` is what the binary does, not only what the conf says ----
+// Over DIDComm (the admin path that passes check_admin_signature with the guard on), the admin sends one WRITE with no
+// proof: access-list/update adding U's hash to B's list. Under `enforce` it must be refused
+// message.trust_task.proof_required (trust_task_verify.rs:79, :169-175); under `warn` it would be logged and let
+// through (:176-187). The answer is never the proof: B's list is read back (signed) and U must not be on it. A READ with
+// no proof (access-list/list, IS_PROOF_REQUIRED false) must still answer. Control: the same update signed lands and the
+// read-back shows U, so the read-back can see a landed write; then B's list is cleared back to empty.
+if (ADMIN_DIDCOMM) {
+  const bHash = await sha256hex(B.id), uHash = await sha256hex(U.id)
+  const listed = async () => { const l = await adminTask(LIST_LIST, { did: bHash, entries: [uHash] }); return { answered: !!l.answerType, listed: (l.answer?.entries ?? []).map(String).includes(uHash), status: l.status, problem: l.problem ?? null } }
+  const w = await didcommAdmin.task(post, ADMIN, sAdm.token, MED, LIST_UPDATE, { did: bHash, add: [uHash] }, { unsigned: true })
+  const afterUnsigned = await listed()
+  const r = await didcommAdmin.task(post, ADMIN, sAdm.token, MED, LIST_LIST, { did: bHash, entries: [uHash] }, { unsigned: true })
+  const ctl = await adminTask(LIST_UPDATE, { did: bHash, add: [uHash] })
+  const afterSigned = await listed()
+  await adminTask(LIST_UPDATE, { did: bHash, clear: true })
+  const e1 = {
+    unsigned_write: { status: w.status, answered: !!w.answerType, problem: typeof w.problem === 'number' ? w.problem : (w.problem ? 'other' : null), tt_code: w.tt_code ?? null },
+    unsigned_write_landed: afterUnsigned.listed, readback_after_unsigned_answered: afterUnsigned.answered,
+    unsigned_read: { status: r.status, answered: !!r.answerType, tt_code: r.tt_code ?? null },
+    control_signed_write: { status: ctl.status, answered: !!ctl.answerType }, control_landed: afterSigned.listed,
+  }
+  e1.pass = !e1.unsigned_write.answered && e1.unsigned_write.tt_code === 'message.trust_task.proof_required' && afterUnsigned.answered && !afterUnsigned.listed && e1.unsigned_read.answered && afterSigned.listed
+  results.checks.E1_enforce_unsigned_admin_write_refused = e1
+  log('E1 unsigned admin write (enforce)', e1)
+}
 
 // ---- step 0 (Railroad 11606): account/add over TSP skips check_permissions; prove it is still admin-only ----
 // Source (0.50.0 @ 34bbdea4): trust_tasks.rs consume_account_add refuses a non-admin session in explicit_allow mode

@@ -39,6 +39,8 @@
 #   - the mediator's own conf (its `-c`/`--config` argument) is missing, a symlink, or has any `backend = "file://…"`
 #     line other than exactly `file://<volume>/secrets.json?encrypt=1`, or not exactly one (Security 12247.4: the
 #     check above must read the same file the mediator opens)
+#   - the conf's `[security]` doesn't hold `trust_task_verification = "enforce"` as a typed literal, exactly once
+#     (Security 12672.2; under `warn` an unsigned or replayed admin write is let through)
 #   - the store file is missing, a symlink or not a regular file: the encrypted backend CREATES an empty store when
 #     its file is absent (file_encrypted.rs open → init_new), so a lost volume must stop the start, never be replaced
 # Host names on no list (the platform's own, e.g. its PORT) are not refused: `env -i` drops them, and one start line
@@ -157,6 +159,18 @@ want_backend="file://$store?encrypt=1"
 file_backends="$(grep -E '^[[:space:]]*backend[[:space:]]*=[[:space:]]*"file://' "$conf" | sed -E 's/^[[:space:]]*backend[[:space:]]*=[[:space:]]*"([^"]*)".*$/\1/' || true)"
 [ "$(printf '%s' "$file_backends" | grep -c . || true)" = 1 ] || refuse "the mediator conf does not have exactly one file:// backend line"
 [ "$file_backends" = "$want_backend" ] || refuse "the mediator conf's backend is not file://<volume>/secrets.json?encrypt=1"
+# Security 12672.2: trust_task_verification = "enforce" as a typed literal, exactly once, in [security]. Under `warn`
+# (upstream's default, security.rs:450, and the shipped conf) every acceptance failure is logged and let through
+# (trust_task_verify.rs:176-187): a write with no proof, so the admin's X25519 key alone could write as the admin, and a
+# stale or replayed one. Fail closed: the name (any case) on exactly one line of the whole file, that line exactly
+# `trust_task_verification = "enforce"` (bare key, basic string, nothing after it), under a `[security]` header. A
+# quoted or dotted key, an inline table, a `${VAR:…}` expansion, `warn`, a duplicate or a missing line all refuse.
+# TRUST_TASK_VERIFICATION on the host refuses by the deny list above (the record's deny side), and the mediator never
+# gets one: env -i passes the allow list only. This is the cheap tripwire; the behaviour proof is E1 in the job.
+[ "$(grep -ci 'trust_task_verification' "$conf" || true)" = 1 ] || refuse "the mediator conf does not name trust_task_verification on exactly one line"
+grep -qE '^[[:space:]]*trust_task_verification[[:space:]]*=[[:space:]]*"enforce"[[:space:]]*$' "$conf" || refuse "the mediator conf's trust_task_verification is not the literal \"enforce\""
+ttv_section="$(awk '/^[[:space:]]*\[/ { s = $0; gsub(/[[:space:]]/, "", s) } /trust_task_verification/ { print s; exit }' "$conf")"
+[ "$ttv_section" = "[security]" ] || refuse "the mediator conf's trust_task_verification is not under [security]"
 # required values
 [ -n "${DATABASE_URL:-}" ] || refuse "DATABASE_URL is missing"
 [ -n "${!PASSPHRASE_SOURCE:-}" ] || refuse "$PASSPHRASE_SOURCE is missing"
