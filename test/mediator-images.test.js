@@ -60,7 +60,9 @@ test('ship: the shipped tool still runs: rekey refuses while the admin credentia
     writeFileSync(join(d, 'ship/mediator-store.mjs'), strip(SRC));
     writeFileSync(join(d, 'old'), 'made-up-old'); writeFileSync(join(d, 'new'), 'made-up-new');
     const full = (...a) => spawnSync(process.execPath, [join(DIR, 'mediator-store.mjs'), ...a], { encoding: 'utf8' });
-    const ship = (...a) => spawnSync(process.execPath, [join(d, 'ship/mediator-store.mjs'), ...a], { encoding: 'utf8' });
+    // Security 12024.1: the shipped tool's rekey runs only under exactly the allow list (the entrypoint's env -i)
+    const ship = (...a) => spawnSync(process.execPath, [join(d, 'ship/mediator-store.mjs'), ...a], { encoding: 'utf8',
+      env: a[0] === 'rekey' ? { REKEY_STORE: a[1], REKEY_OLD_PASSPHRASE_FILE: a[2], REKEY_NEW_PASSPHRASE_FILE: a[3], PATH: '/usr/local/bin:/usr/bin:/bin', HOME: d } : process.env });
     const s = join(d, 'secrets.json');
     assert.equal(full('seal-test', s, join(d, 'old'), JSON.stringify({ mediator_admin_credential: 'made-up', mediator_jwt_secret: 'made-up' })).status, 0);
     const r1 = ship('rekey', s, join(d, 'old'), join(d, 'new'));

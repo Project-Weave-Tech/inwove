@@ -36,6 +36,7 @@ docker build -q --label "org.opencontainers.image.revision=$COMMIT" -f "$HERE/me
 # --- the rekey image's context: the shipped tool (stripped here, then judged on the image's own copy) + its one dependency
 R="$W/rek"; mkdir -p "$R/node_modules/@noble"
 node "$HERE/mediator-store-ship.mjs" "$HERE/mediator-store.mjs" "$R/mediator-store.mjs" > "$W/ship.json" || fail "ship strip"
+cp "$HERE/mediator-rekey-entrypoint.sh" "$R/rekey-entrypoint.sh" || fail "no rekey entrypoint"
 cp -r "$HERE/node_modules/@noble/hashes" "$R/node_modules/@noble/" || fail "no @noble/hashes (npm ci first)"
 docker build -q --label "org.opencontainers.image.revision=$COMMIT" -f "$HERE/mediator-rekey.Dockerfile" -t "$REK" "$R" > "$W/rek.id" || fail "rekey image build"
 
@@ -58,6 +59,9 @@ tarof() { local img="$1" out="$2" cid; cid="$(docker create "$img")" || return 1
 tarof "$REK" "$W/rek.tar" || fail "rekey export (tar)"
 tarof "$BASE_REF" "$W/base.tar" || fail "base export (tar)"
 docker image inspect "$SVC" > "$W/svc-inspect.json" && docker image inspect "$REK" > "$W/rek-inspect.json" || fail "inspect"
+# Security 11935 (a): the base half of the rekey config record is read from the pinned base itself, pulled by digest
+# for linux/amd64, never typed by hand (mediator-image-config.mjs; hand half rekey-config.json).
+docker pull -q --platform linux/amd64 "$BASE_REF" > /dev/null && docker image inspect "$BASE_REF" > "$W/base-inspect.json" || fail "base inspect"
 
 # --- the planted tree: every search must hit each of these first
 PL="$W/planted"; mkdir -p "$PL/usr/lib/node" "$PL/usr/local/bin" "$PL/usr/bin" "$PL/run/dbus" "$PL/run/user/10001" "$PL/opt"
@@ -70,6 +74,7 @@ gzip -9nc "$HERE/mediator-store.mjs" > "$PL/usr/lib/node/renamed-tool.bin"
 svc=0; node "$HERE/mediator-image-check.mjs" service "$W/svc-root" "$W/svc-inspect.json" "$PL" "$ODIR/service-image.json" || svc=$?
 bd=0; node "$HERE/mediator-base-diff.mjs" "$W/rek.tar" "$W/base.tar" "$HERE/rekey-added.json" "$PL" "$HERE/mediator-store.mjs" "$ODIR/rekey-base-diff.json" || bd=$?
 rm -f "$W/rek.tar" "$W/base.tar"
+cfg=0; node "$HERE/mediator-image-config.mjs" "$W/rek-inspect.json" "$W/base-inspect.json" "$HERE/rekey-config.json" "$HERE/mediator-rekey.Dockerfile" "$ODIR/rekey-config-record.json" || cfg=$?
 rek=0; node "$HERE/mediator-image-check.mjs" rekey "$W/rek-root" "$W/rek-inspect.json" /opt/rekey/mediator-store.mjs "$ODIR/rekey-image.json" "$PL" || rek=$?
 
 # --- the service binary in its image: libraries resolve, it runs
@@ -109,17 +114,31 @@ ep_v="$(printf '%s' "$ep_first" | node -e '
 D="$W/rekey-data"; PP="$(mktemp -d /dev/shm/rekeypp.XXXXXX)"; mkdir -p "$D"; chmod 0700 "$D" "$PP"
 head -c 24 /dev/urandom | base64 > "$PP/old"; head -c 24 /dev/urandom | base64 > "$PP/new"; chmod 0444 "$PP/old" "$PP/new"
 node "$HERE/mediator-store.mjs" seal-test "$D/secrets.json" "$PP/old" '{"mediator_secrets":"made-up","mediator_jwt_secret":"made-up","mediator_admin_credential":"{\"did\":\"did:key:zMadeUp\"}"}' > /dev/null || fail "made-up store"
-rrun() { docker run --rm --network none --read-only --user "$(id -u):$(id -g)" -v "$D:/data" -v "$PP:/run/pp:ro" "$REK" "$@"; }
+# The tool's own subcommands are called past the entrypoint (by node, by path); `rekey` itself only through the image's
+# entrypoint (Security 12024.1), with the two passphrases as service variables and planted service markers beside them.
+rrun() { docker run --rm --network none --read-only --user "$(id -u):$(id -g)" -v "$D:/data" -v "$PP:/run/pp:ro" --entrypoint /usr/local/bin/node "$REK" /opt/rekey/mediator-store.mjs "$@"; }
+MK_DB="marker-db-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"; MK_RD="marker-redis-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+erun() { docker run --rm --network none --read-only --user "$(id -u):$(id -g)" -v "$D:/data" \
+  -e DATABASE_URL="postgres://u:$MK_DB@h/db" -e REDIS_PASSWORD="$MK_RD" \
+  -e ENKARA_MEDIATOR_BACKEND_PASSPHRASE="$(cat "$PP/old")" -e ENKARA_MEDIATOR_BACKEND_PASSPHRASE_NEW="$(cat "$PP/new")" \
+  "$REK" --volume /data --tmpfs /dev/shm; }
 # Each call's exit and the first line it wrote to stderr (the tool prints names and verdicts only; a docker or node
 # failure shows here instead of as a bare FAIL). Cut to 160 characters, JSON-escaped by node.
 CALLS="$W/rekey-calls.jsonl"; : > "$CALLS"
 note() { node -e 'const [c, x, e] = process.argv.slice(1); console.log(JSON.stringify({ call: c, exit: Number(x), stderr: (e.split("\n").find(Boolean) || "").slice(0, 160) }))' "$1" "$2" "$3" >> "$CALLS"; }
-r1=0; r1_err="$(rrun rekey /data/secrets.json /run/pp/old /run/pp/new 2>&1 > /dev/null)" || r1=$?
-note rekey-with-credential "$r1" "$r1_err"
+r1=0; r1_err="$(erun 2>&1 > /dev/null)" || r1=$?
+note rekey-with-credential "$r1" "$(printf '%s\n' "$r1_err" | grep -v '^rekey-entrypoint:')"
 r1_names_cred=$([[ "$r1_err" == *mediator_admin_credential* ]] && echo true || echo false)
 removed=(); for s in admin-out delete-admin seal-test encrypt-test; do c=0; e="$(rrun "$s" /data/secrets.json /run/pp/old 2>&1 > /dev/null)" || c=$?; note "$s" "$c" "$e"; removed+=("\"$s\":$c"); done
 node "$HERE/mediator-store.mjs" delete-admin "$D/secrets.json" "$PP/old" > /dev/null || fail "made-up store delete"
-r2=0; r2_out="$(rrun rekey /data/secrets.json /run/pp/old /run/pp/new 2>"$W/r2.err")" || r2=$?; note rekey-after-delete "$r2" "$(cat "$W/r2.err")"
+r2=0; r2_out="$(erun 2>"$W/r2.err")" || r2=$?; note rekey-after-delete "$r2" "$(grep -v '^rekey-entrypoint: env -i dropped' "$W/r2.err")"
+# Security 12024.1: no marker value on either stream of either run; the tool past `env -i` refuses any other name, so
+# its exit 0 is the proof the markers never reached it. 12024.2 (a): a second run refuses and leaves the store as it was.
+markers=0; for v in "$MK_DB" "$MK_RD" "$(cat "$PP/old")" "$(cat "$PP/new")"; do
+  [[ "$r1_err$r2_out$(cat "$W/r2.err")" == *"$v"* ]] && markers=$((markers + 1)); done
+dropped_db=$(grep -c '^rekey-entrypoint: env -i dropped .*DATABASE_URL' "$W/r2.err" || true)
+pre3="$(sha256sum < "$D/secrets.json")"; r3=0; e="$(erun 2>&1 > /dev/null)" || r3=$?; note rekey-second-run "$r3" "$(printf '%s\n' "$e" | grep -v '^rekey-entrypoint:')"
+same3=$([ "$(sha256sum < "$D/secrets.json")" = "$pre3" ] && echo true || echo false)
 o_old=0; e="$(rrun opens /data/secrets.json /run/pp/old 2>&1 > /dev/null)" || o_old=$?; note opens-old "$o_old" "$e"
 o_new=0; e="$(rrun opens /data/secrets.json /run/pp/new 2>&1 > /dev/null)" || o_new=$?; note opens-new "$o_new" "$e"
 rm -rf "$PP"; [ -e "$PP" ] && fail "passphrase dir still there"
@@ -141,6 +160,9 @@ const lines = {
   rekey_base_diff: P($bd === 0 && bdiff && bdiff.ok),
   rekey_refuses_while_admin_credential_present: P($r1 !== 0 && $r1_names_cred),
   rekey_removed_subcommands_answer_usage: P(Object.values(removed).length === 4 && Object.values(removed).every((c) => c === 2)),
+  rekey_config_record: P($cfg === 0),
+  rekey_env_i_no_marker_reaches_tool_or_output: P($r2 === 0 && $markers === 0 && $dropped_db === 1),
+  rekey_second_run_refuses_store_unchanged: P($r3 === 1 && $same3),
   rekey_reseals_once_credential_gone: P($r2 === 0 && r2 && r2.values_unchanged && r2.salt_changed && !r2.old_opens && r2.new_opens && $o_old === 4 && $o_new === 0),
 };
 const rec = {
@@ -161,5 +183,8 @@ console.log(JSON.stringify({ shipped_tool_sha256: rec.shipped_tool_sha256, ship_
 // Security 11869.4: the base diff's verdict, and what the image added (path, sha256, mode, owner), once, for the pin
 console.log(JSON.stringify({ rekey_base_diff: bdiff && { ok: bdiff.ok, checks: bdiff.checks, instrument: bdiff.instrument, changed: bdiff.changed, added_file_not_in_set: bdiff.added_file_not_in_set, added_dir_outside: bdiff.added_dir_outside, added_not_a_file: bdiff.added_not_a_file, added_setuid: bdiff.added_setuid, added_set_missing: bdiff.added_set_missing, deleted_base_entries: bdiff.deleted_base_entries } }));
 console.log(JSON.stringify({ rekey_added_read: bdiff && bdiff.added_read }));
+// Security 11935 (a), (e): the base config digest read (for the L8 pin) and the base half beside the verdict
+const crec = rd(odir + '/rekey-config-record.json');
+console.log(JSON.stringify({ rekey_config_record: crec && { ok: crec.ok, checks: crec.checks, base_config_digest_read: crec.base_config_digest_read, base_platform: crec.base_platform, base_half: crec.base_half, details: crec.details } }));
 process.exit(Object.values(lines).some((v) => v === 'FAIL') ? 1 : 0);
 EOF

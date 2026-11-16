@@ -9,7 +9,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const TOOL = new URL('../sandbox/tsp-tests/mediator-store.mjs', import.meta.url).pathname;
-const run = (...a) => { const r = spawnSync(process.execPath, [TOOL, ...a], { encoding: 'utf8' }); return { code: r.status, out: r.stdout, err: r.stderr, j: r.stdout ? JSON.parse(r.stdout.trim().split('\n').pop()) : null }; };
+// Security 12024.1: `rekey` runs only under exactly its allow list, so the unit hands it that and nothing more.
+const envFor = (a) => (a[0] === 'rekey' ? { REKEY_STORE: a[1], REKEY_OLD_PASSPHRASE_FILE: a[2], REKEY_NEW_PASSPHRASE_FILE: a[3], PATH: '/usr/local/bin:/usr/bin:/bin', HOME: tmpdir() } : process.env);
+const run = (...a) => { const r = spawnSync(process.execPath, [TOOL, ...a], { encoding: 'utf8', env: envFor(a) }); return { code: r.status, out: r.stdout, err: r.stderr, j: r.stdout ? JSON.parse(r.stdout.trim().split('\n').pop()) : null }; };
 function rig() {
   const d = mkdtempSync(join(tmpdir(), 'store-'));
   writeFileSync(join(d, 'p1'), 'test-pass-one\n'); writeFileSync(join(d, 'p2'), 'test-pass-two');
@@ -97,7 +99,7 @@ test('store: rekey (v) re-seals every entry under the new passphrase in place; t
     assert.equal(run('delete-admin', s, join(r.d, 'p1')).code, 0);
     const x = run('rekey', s, join(r.d, 'p1'), join(r.d, 'p2'));
     assert.equal(x.code, 0, x.err);
-    assert.deepEqual(x.j, { entries: ['mediator_jwt_secret', 'mediator_operating_secrets'], values_unchanged: true, salt_changed: true, old_opens: false, new_opens: true, mode: '600' });
+    assert.deepEqual(x.j, { entries: ['mediator_jwt_secret', 'mediator_operating_secrets'], values_unchanged: true, salt_changed: true, old_opens: false, new_opens: true, mode: '600', stale_temps_removed: 0 });
     assert.equal(run('opens', s, join(r.d, 'p1')).code, 4);
     assert.notEqual(run('rekey', s, join(r.d, 'p1'), join(r.d, 'p2')).code, 0, 'the old passphrase can no longer rekey');
   } finally { r.done(); }

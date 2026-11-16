@@ -10,6 +10,10 @@
 //   - a base entry whose bytes, mode, owner, type or link target changed is red (a setuid bit added counts);
 //   - an added directory is allowed only at /opt/rekey or under it; an added link, hard link or device is red;
 //   - an added-set file that is missing, or an added file with a setuid/setgid bit, is red;
+//   - extended attributes (the pax `SCHILY.xattr.<name>` records, e.g. security.capability, which can give a binary
+//     privileges without a setuid bit): any xattr added, removed or changed on any path, base entry or added entry,
+//     /opt/rekey included, is red. Only each value's sha256 is kept; a value is never printed;
+//   - a base directory whose mode or owner changed is red (directories are compared like files, bar bytes);
 //   - deleted base entries are fine, and listed.
 // The line must first go red on the planted tree plus a base64 copy of the full tool (instrument bites), or it can't
 // pass. Names, paths, shas and verdicts only; no file's bytes are printed.
@@ -24,6 +28,7 @@ const sha = () => crypto.createHash('sha256');
 const norm = (p) => p.replace(/^(\.\/)+/, '').replace(/^\/+/, '').replace(/\/+$/, '');
 const octal = (b) => { const s = b.toString('latin1').replace(/\0.*$/s, '').trim(); return s ? parseInt(s, 8) : 0; };
 const str = (b) => b.toString('utf8').replace(/\0.*$/s, '');
+const XATTR_PREFIX = 'SCHILY.xattr.';
 const TYPES = { '0': 'file', '\0': 'file', '7': 'file', '1': 'hardlink', '2': 'link', '5': 'dir', '3': 'other', '4': 'other', '6': 'other' };
 
 // Every entry of a tar file: Map path → {type, mode, uid, gid, size, sha256 (files), linkname (links)}. Reads ustar,
@@ -32,7 +37,7 @@ export function tarList(file) {
   const fd = fs.openSync(file, 'r');
   const out = new Map();
   const hdr = Buffer.alloc(512);
-  let pos = 0, pax = {}, longName = null, longLink = null;
+  let pos = 0, pax = {}, xattrs = {}, longName = null, longLink = null;
   const readExact = (buf, len, at) => { let n = 0; while (n < len) { const r = fs.readSync(fd, buf, n, len - n, at + n); if (!r) throw new Error('tar: short read'); n += r; } };
   const readBody = (size, onChunk) => {
     const chunk = Buffer.alloc(1 << 20);
@@ -57,8 +62,12 @@ export function tarList(file) {
           while (i < body.length) {
             const sp = body.indexOf(0x20, i); const len = parseInt(body.subarray(i, sp).toString(), 10);
             if (!(len > 0)) break;
-            const rec = body.subarray(sp + 1, i + len - 1).toString('utf8'); const eq = rec.indexOf('=');
-            pax[rec.slice(0, eq)] = rec.slice(eq + 1); i += len;
+            const rec = body.subarray(sp + 1, i + len - 1); const eq = rec.indexOf(0x3d);
+            const key = rec.subarray(0, eq).toString('utf8'), val = rec.subarray(eq + 1);
+            // xattr values are binary: hash the bytes, keep only the digest
+            if (key.startsWith(XATTR_PREFIX)) xattrs[key.slice(XATTR_PREFIX.length)] = sha().update(val).digest('hex');
+            else pax[key] = val.toString('utf8');
+            i += len;
           }
         }
         continue;
@@ -73,11 +82,12 @@ export function tarList(file) {
         uid: pax.uid !== undefined ? Number(pax.uid) : octal(hdr.subarray(108, 116)),
         gid: pax.gid !== undefined ? Number(pax.gid) : octal(hdr.subarray(116, 124)),
       };
+      if (Object.keys(xattrs).length) e.xattrs = xattrs;
       if (e.type === 'file') { const h = sha(); readBody(size, (c) => h.update(c)); e.size = size; e.sha256 = h.digest('hex'); }
       else { if (size) readBody(size, () => {}); if (e.type === 'link' || e.type === 'hardlink') e.linkname = linkname; }
       name = norm(name);
       if (name) out.set(name, e);
-      pax = {}; longName = null; longLink = null;
+      pax = {}; xattrs = {}; longName = null; longLink = null;
     }
   } finally { fs.closeSync(fd); }
   return out;
@@ -101,18 +111,27 @@ export const ADDED_DIR_ROOT = 'opt/rekey';
 const underAddedRoot = (p) => p === ADDED_DIR_ROOT || p.startsWith(`${ADDED_DIR_ROOT}/`);
 const SUID = 0o6000;
 
-// The added set as a Map path → sha256, from rekey-added.json's {tool: {path, sha256}, noble: [{path, sha256}]}.
+// The added set as a Map path → sha256, from rekey-added.json's {tool: {path, sha256}, entrypoint?: {path, sha256}, noble: [{path, sha256}]}.
 export function addedSet(j) {
   const m = new Map();
-  for (const f of [j.tool, ...(j.noble || [])]) m.set(norm(f.path), f.sha256);
+  // Security 12024.1: the rekey entrypoint is one more added file, beside the tool, once a Security block pins it.
+  for (const f of [j.tool, ...(j.entrypoint ? [j.entrypoint] : []), ...(j.noble || [])]) m.set(norm(f.path), f.sha256);
   return m;
 }
 
+// The xattr names that differ between two entries (added, removed or changed value); b may be undefined (an added entry).
+const xattrDiff = (e, b) => {
+  const x = e.xattrs || {}, y = b?.xattrs || {};
+  return [...new Set([...Object.keys(x), ...Object.keys(y)])].filter((n) => x[n] !== y[n]).sort();
+};
+
 // rek, base: Maps from tarList. added: Map path → sha256. Returns the hits by kind, and ok.
 export function baseDiff(rek, base, added) {
-  const changed = [], addedFile = [], addedDir = [], addedOther = [], suid = [], missing = [], deleted = [];
+  const xattr = [], changed = [], addedFile = [], addedDir = [], addedOther = [], suid = [], missing = [], deleted = [];
   for (const [p, e] of rek) {
     const b = base.get(p);
+    const xn = xattrDiff(e, b);
+    if (xn.length) xattr.push({ path: `/${p}`, names: xn });
     if (b) {
       const why = [];
       if (b.type !== e.type) why.push('type');
@@ -130,9 +149,9 @@ export function baseDiff(rek, base, added) {
   }
   for (const p of added.keys()) { const e = rek.get(p); if (!e || e.type !== 'file') missing.push(`/${p}`); }
   for (const p of base.keys()) if (!rek.has(p)) deleted.push(`/${p}`);
-  const ok = !changed.length && !addedFile.length && !addedDir.length && !addedOther.length && !suid.length && !missing.length;
+  const ok = !changed.length && !addedFile.length && !addedDir.length && !addedOther.length && !suid.length && !missing.length && !xattr.length;
   return { ok, changed, added_file_not_in_set: addedFile, added_dir_outside: addedDir, added_not_a_file: addedOther,
-    added_setuid: suid, added_set_missing: missing, deleted_base_entries: deleted.sort() };
+    xattr_changed: xattr, added_setuid: suid, added_set_missing: missing, deleted_base_entries: deleted.sort() };
 }
 
 // The instrument: the rekey listing plus the planted tree and a base64 copy of the full tool at usr/share/<name>.
@@ -165,7 +184,7 @@ if (process.argv[1]?.endsWith('mediator-base-diff.mjs')) {
     const checks = { instrument_bites: ins.bites ? 'PASS' : 'FAIL', rekey_matches_base_plus_added_set: v.ok ? 'PASS' : 'FAIL' };
     const ok = Object.values(checks).every((x) => x === 'PASS');
     fs.writeFileSync(out, `${JSON.stringify({ what: 'rekey image base diff (Security 11869.4)', ok, checks, instrument: ins, ...v, added_read, rek_entries: rek.size, base_entries: base.size }, null, 2)}\n`);
-    console.log(JSON.stringify({ ok, checks, changed: v.changed.length, added_file_not_in_set: v.added_file_not_in_set, added_dir_outside: v.added_dir_outside, added_not_a_file: v.added_not_a_file, added_setuid: v.added_setuid, added_set_missing: v.added_set_missing, deleted: v.deleted_base_entries.length }));
+    console.log(JSON.stringify({ ok, checks, changed: v.changed.length, added_file_not_in_set: v.added_file_not_in_set, added_dir_outside: v.added_dir_outside, added_not_a_file: v.added_not_a_file, added_setuid: v.added_setuid, xattr_changed: v.xattr_changed, added_set_missing: v.added_set_missing, deleted: v.deleted_base_entries.length }));
     process.exit(ok ? 0 : 1);
   } catch (e) { console.error(`mediator-base-diff: ${e.message}`); process.exit(1); }
 }

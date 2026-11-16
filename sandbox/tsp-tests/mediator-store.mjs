@@ -28,7 +28,12 @@
 //                                          (v) rotation in place: every entry opened with the old passphrase and
 //                                          re-sealed under the new one with a fresh salt; same entry names, same
 //                                          values (so the mediator keeps its DID); proves old no longer opens.
-//                                          Refuses while mediator_admin_credential is in the store (12247 i(a))
+//                                          Refuses while mediator_admin_credential is in the store (12247 i(a)).
+//                                          Security 12024: refuses (exit 6) unless its own /proc/self/environ holds
+//                                          exactly REKEY_STORE, REKEY_OLD_PASSPHRASE_FILE, REKEY_NEW_PASSPHRASE_FILE
+//                                          (each equal to its argument), PATH and HOME, nothing else (the rekey
+//                                          entrypoint's `env -i`); temp + fsync + rename + directory fsync, and
+//                                          refuses if the store changed between the read and the rename
 //   seal-test <store> <passphrase file> <json of {key: utf8 value}>
 //                                          TEST ONLY: writes an encrypted store in the mediator's format (unit tests)
 //   encrypt-test <plain store> <passphrase file>
@@ -118,13 +123,45 @@ export function getEntry(j, shape, passphrase, name) {
 }
 // ship:drop-end
 
-function writeAtomic(file, obj) {
+// Security 12024.2 (b): the new store is written to a temp file in the SAME directory (so the same volume), fsynced,
+// renamed over the store, then the directory is fsynced so the rename itself is durable. A run killed at any point
+// leaves exactly one whole store: the old one up to the rename, the new one from it. `guard`, when given, runs just
+// before the rename; if it throws, the temp file is removed and the store is left as it was.
+const TEMP_NAME = (base) => new RegExp(`^\\.${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.[0-9]+\\.[0-9a-f]{8}$`);
+function writeAtomic(file, obj, guard = null) {
   const dir = path.dirname(file);
   const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(4).toString('hex')}`);
   const fd = fs.openSync(tmp, 'wx', 0o600);
   try { fs.writeSync(fd, JSON.stringify(obj, null, 2)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  fs.chmodSync(tmp, 0o600);
+  try {
+    fs.chmodSync(tmp, 0o600);
+    if (guard) guard();
+  } catch (e) { fs.rmSync(tmp, { force: true }); throw e; }
   fs.renameSync(tmp, file);
+  const dfd = fs.openSync(dir, 'r');
+  try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); }
+}
+
+// What identifies the store's bytes on disk between the read and the rename (Security 12024.2 (c)): a second writer
+// changes at least one of these. Railway's one-deployment-per-volume lock is the real guard; this is the tripwire.
+const storeStamp = (file) => { const st = fs.statSync(file, { bigint: true }); return `${st.dev}:${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`; };
+
+// Security 12024.1: the rekey run's environment, exact. The entrypoint `exec env -i`s the tool with only these; the
+// tool reads the kernel's copy of its own environment (never process.env, which node can be told to shape) and
+// refuses on any other name, a missing one, or a path that isn't the argument it was given. Names only, never values.
+export const REKEY_ENV = ['HOME', 'PATH', 'REKEY_NEW_PASSPHRASE_FILE', 'REKEY_OLD_PASSPHRASE_FILE', 'REKEY_STORE'];
+export function rekeyEnvironVerdict(environ, args) {
+  const pairs = environ.split('\0').filter(Boolean).map((kv) => { const i = kv.indexOf('='); return i < 0 ? [kv, ''] : [kv.slice(0, i), kv.slice(i + 1)]; });
+  const names = pairs.map(([k]) => k);
+  const plain = (n) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(n);
+  const extra = names.filter((n) => !REKEY_ENV.includes(n));
+  const missing = REKEY_ENV.filter((n) => !names.includes(n));
+  const dup = names.filter((n, i) => names.indexOf(n) !== i);
+  const val = Object.fromEntries(pairs);
+  const mismatch = [['REKEY_STORE', args.store], ['REKEY_OLD_PASSPHRASE_FILE', args.old], ['REKEY_NEW_PASSPHRASE_FILE', args.new]]
+    .filter(([k, v]) => names.includes(k) && val[k] !== v).map(([k]) => k);
+  return { ok: !extra.length && !missing.length && !dup.length && !mismatch.length,
+    extra: extra.filter(plain).sort(), extra_not_plain: extra.filter((n) => !plain(n)).length, missing, duplicated: [...new Set(dup)], not_the_argument: mismatch };
 }
 
 // ship:drop-begin
@@ -157,6 +194,17 @@ export function deleteAdmin(file, passphrase) {
 
 // ship:drop-end
 export function rekey(file, oldPass, newPass) {
+  // A temp left by a run killed before its rename is ours (same directory, our exact name shape) and holds the store
+  // re-sealed under a passphrase that never went live: remove it before anything else, and say how many.
+  const re = TEMP_NAME(path.basename(file));
+  let staleTemps = 0;
+  for (const n of fs.readdirSync(path.dirname(file))) {
+    if (!re.test(n)) continue;
+    const p = path.join(path.dirname(file), n);
+    if (!fs.lstatSync(p).isFile()) throw new Error('a non-file with the temp name sits beside the store');
+    fs.rmSync(p); staleTemps += 1;
+  }
+  const stamp = storeStamp(file);
   const { j, shape } = readStore(file);
   if (shape !== 'encrypted') throw new Error('not an encrypted store');
   // Security 12247 (i)(a): a rotation must never re-seal the one entry we delete.
@@ -165,17 +213,19 @@ export function rekey(file, oldPass, newPass) {
   const oldKey = deriveKey(oldPass, j.kdf);
   const values = {};
   for (const [k, e] of Object.entries(j.entries)) values[k] = openAead(oldKey, b64u(e.nonce_b64), b64u(e.ciphertext_b64), entryAad(k));
-  sealStore(file, newPass, values, j.kdf);
+  sealStore(file, newPass, values, j.kdf, () => {
+    if (storeStamp(file) !== stamp) throw new Error('the store changed between the read and the rename (a second writer?); nothing written');
+  });
   const after = readStore(file).j;
   const newKey = deriveKey(newPass, after.kdf);
   const same = Object.keys(values).length === Object.keys(after.entries).length && Object.entries(values).every(([k, v]) => {
     const e = after.entries[k]; return e && openAead(newKey, b64u(e.nonce_b64), b64u(e.ciphertext_b64), entryAad(k)).equals(v);
   });
   return { entries: Object.keys(after.entries).sort(), values_unchanged: same, salt_changed: after.kdf.salt_b64 !== j.kdf.salt_b64,
-    old_opens: opens(after, oldPass), new_opens: opens(after, newPass), mode: (fs.statSync(file).mode & 0o777).toString(8) };
+    old_opens: opens(after, oldPass), new_opens: opens(after, newPass), mode: (fs.statSync(file).mode & 0o777).toString(8), stale_temps_removed: staleTemps };
 }
 
-function sealStore(file, passphrase, values, like = null) {
+function sealStore(file, passphrase, values, like = null, guard = null) {
   const salt = crypto.randomBytes(16);
   const kdf = { algo: 'argon2id', salt_b64: salt.toString('base64url'), memory_kib: like?.memory_kib ?? KDF_CAP.memory_kib,
     iterations: like?.iterations ?? KDF_CAP.iterations, parallelism: like?.parallelism ?? KDF_CAP.parallelism };
@@ -183,7 +233,7 @@ function sealStore(file, passphrase, values, like = null) {
   const v = seal(key, Buffer.alloc(32), VERIFIER_AAD);
   const entries = {};
   for (const [k, val] of Object.entries(values)) entries[k] = seal(key, Buffer.isBuffer(val) ? val : Buffer.from(val), entryAad(k));
-  writeAtomic(file, { version: 1, kdf, verifier_nonce_b64: v.nonce_b64, verifier_b64: v.ciphertext_b64, entries });
+  writeAtomic(file, { version: 1, kdf, verifier_nonce_b64: v.nonce_b64, verifier_b64: v.ciphertext_b64, entries }, guard);
 }
 
 // ship:drop-begin
@@ -240,6 +290,10 @@ async function main(argv) {
     }
       // ship:drop-end
     case 'rekey': {
+      let environ;
+      try { environ = fs.readFileSync('/proc/self/environ', 'latin1'); } catch { say({ refused: 'cannot read /proc/self/environ' }); return 6; }
+      const ev = rekeyEnvironVerdict(environ, { store, old: a, new: b });
+      if (!ev.ok) { say({ refused: 'the rekey environment is not exactly the allow list', ...ev }); return 6; }
       const r = rekey(store, readPassphrase(a), readPassphrase(b));
       say(r);
       return r.values_unchanged && r.salt_changed && !r.old_opens && r.new_opens ? 0 : 1;
