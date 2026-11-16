@@ -41,7 +41,8 @@
 #     check above must read the same file the mediator opens)
 #   - the conf's `[security]` doesn't hold `trust_task_verification = "enforce"` as a typed literal, exactly once
 #     (Security 12672.2; under `warn` an unsigned or replayed admin write is let through), or holds a TOML
-#     multi-line string anywhere (Security 12795.2: one can hide a line that reads as the key)
+#     multi-line string anywhere (Security 12795.2: one can hide a line that reads as the key), or a brace on any
+#     non-comment line (Security 12892.3: a TOML 1.1 multi-line inline table can hide it too)
 #   - the store file is missing, a symlink or not a regular file: the encrypted backend CREATES an empty store when
 #     its file is absent (file_encrypted.rs open → init_new), so a lost volume must stop the start, never be replaced
 # Host names on no list (the platform's own, e.g. its PORT) are not refused: `env -i` drops them, and one start line
@@ -180,6 +181,17 @@ grep -qF "'''" "$conf" && refuse "the mediator conf holds a TOML multi-line stri
 grep -qE '^[[:space:]]*trust_task_verification[[:space:]]*=[[:space:]]*"enforce"[[:space:]]*$' "$conf" || refuse "the mediator conf's trust_task_verification is not the literal \"enforce\""
 ttv_section="$(awk '/^[[:space:]]*#/ { next } /^[[:space:]]*\[/ { s = $0; gsub(/[[:space:]]/, "", s) } /trust_task_verification/ { print s; exit }' "$conf")"
 [ "$ttv_section" = "[security]" ] || refuse "the mediator conf's trust_task_verification is not under [security]"
+# Security 12892.3: TOML 1.1 (the pin parses with toml 1.1.8+spec-1.1.0) lets an inline table span lines, so
+#   [security]
+#   x = {
+#   trust_task_verification = "enforce"
+#   }
+# passes every line check above, yet the mediator reads security.x.trust_task_verification, an unknown field it
+# ignores (SecurityConfigRaw has no deny_unknown_fields), and runs its default `warn`. Neither upstream's template nor
+# setup's writer puts a brace outside a comment at the pin, so any non-comment line holding `{` or `}` refuses (a
+# trailing comment on a value line counts: a line-based check can't tell where a comment starts inside a string).
+# Placed after the key checks so their own refusals still name themselves. 16.1's conf hash pin closes it for good.
+grep -vE '^[[:space:]]*#' "$conf" | grep -q '[{}]' && refuse "the mediator conf holds a brace outside a comment (a TOML inline table can hide the key)"
 # required values
 [ -n "${DATABASE_URL:-}" ] || refuse "DATABASE_URL is missing"
 [ -n "${!PASSPHRASE_SOURCE:-}" ] || refuse "$PASSPHRASE_SOURCE is missing"

@@ -41,3 +41,9 @@ the host only when every step below holds on the new pin, in one job run, and Se
     names no `DBUS_*`/`XDG_RUNTIME_DIR`. The rekey image's shipped tool has only `rekey`/`opens`/`names`/`absent`;
     its sha256 goes in L8. A hit in a file we didn't put there is a finding for SECURITY, never a word to drop. Both
     base images are pinned by digest; a re-pin re-reads them.
+11. **The conf shapes the entrypoint refuses still match the parser** (Security 12795.2, 12892.3): at each re-pin
+    read the mediator's `toml` version in its `Cargo.lock` and `SecurityConfigRaw` (`affinidi-messaging-mediator-config/src/security.rs`).
+    The entrypoint refuses `"""`/`'''` anywhere and a `{`/`}` on any non-comment line, because a multi-line string or a
+    TOML 1.1 multi-line inline table can hide `trust_task_verification` while the mediator runs `warn`. If the new
+    template or setup's writer uses either shape, re-read it with Security; never loosen the refusal in place. If
+    upstream adds `deny_unknown_fields` (report 5, ask 4), the brace check stays: it is the tripwire, not the proof.

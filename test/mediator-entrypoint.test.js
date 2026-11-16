@@ -348,6 +348,24 @@ test('entrypoint 12672.2: the conf must hold trust_task_verification = "enforce"
   } finally { r.done(); }
 });
 
+test('entrypoint 12892.3: a brace outside a comment refuses (a TOML 1.1 multi-line inline table can hide the key)', { skip: !haveTmpfs && 'no tmpfs' }, () => {
+  const r = rig();
+  try {
+    const other = join(r.disk, 'brace.toml');
+    const be = `[secrets]\nbackend = "file://${r.volume}/secrets.json?encrypt=1"\n`;
+    const conf = (sec) => { writeFileSync(other, sec + be); return run(r, { medArgs: ['-c', other] }); };
+    // Security's probe: the mediator reads security.x.trust_task_verification (unknown, ignored) and runs `warn`
+    refused(conf('[security]\nx = {\ntrust_task_verification = "enforce"\n}\n'), 'brace outside a comment');
+    // the real key present, an inline table elsewhere: still refused (fails closed)
+    refused(conf('[security]\ntrust_task_verification = "enforce"\nextra = { a = 1 }\n'), 'brace outside a comment');
+    refused(conf('[security]\ntrust_task_verification = "enforce"\n[other]\nt = {\n}\n'), 'brace outside a comment');
+    // a brace in a trailing comment on a value line counts too
+    refused(conf('[security]\ntrust_task_verification = "enforce"\nssl = "none" # {x}\n'), 'brace outside a comment');
+    // green: braces in whole-line comments change nothing
+    assert.equal(conf('[security]\n### e.g. ${TRUST_TASK_VERIFICATION:warn} or { a = 1 }\ntrust_task_verification = "enforce"\n').code, 0);
+  } finally { r.done(); }
+});
+
 test('entrypoint 12795.2: a TOML multi-line string anywhere in the conf refuses (it can hide a line that reads as the key)', { skip: !haveTmpfs && 'no tmpfs' }, () => {
   const r = rig();
   try {

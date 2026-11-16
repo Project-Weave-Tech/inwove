@@ -263,7 +263,7 @@ if (ADMIN_DIDCOMM) {
   e1r.landed_under_enforce = afterAgain.listed || afterBytes.listed
   e1r.inside_window_pass = e1r.first.answered && e1r.first_landed && e1r.cleared_readback_empty
     && !e1r.replay_same_doc.answered && e1r.replay_same_doc.tt_code === 'message.trust_task.duplicate' && afterAgain.answered && !afterAgain.listed
-    && !e1r.replay_same_bytes.answered && afterBytes.answered && !afterBytes.listed
+    && !e1r.replay_same_bytes.answered && e1r.replay_same_bytes.tt_code === 'message.trust_task.duplicate' && afterBytes.answered && !afterBytes.listed
   e1r.pass = false // set at the end, once the after-window replay has run
   results.checks.E1r_enforce_signed_replay_refused = e1r
   log('E1r replay inside the window', e1r)
