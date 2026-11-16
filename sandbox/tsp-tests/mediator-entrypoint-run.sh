@@ -34,11 +34,15 @@ RPORT=$((20000 + RANDOM % 20000)); MPORT=$((40000 + RANDOM % 20000))
 for _ in $(seq 150); do (exec 3<>/dev/tcp/127.0.0.1/$RPORT) 2>/dev/null && break; sleep 0.1; done
 
 VOL="$WORK/vol"; mkdir -p "$VOL"; cp "$CONF_SRC"/* "$VOL/"
-sed -i -e "s#^backend = \"file://.*#backend = \"file://$VOL/secrets.json\"#" \
+sed -i -e "s#^backend = \"file://.*#backend = \"file://$VOL/secrets.json?encrypt=1\"#" \
        -e "s#^functions_file = .*#functions_file = \"$VOL/atm-functions.lua\"#" \
        -e "s#^listen_address = .*#listen_address = \"127.0.0.1:${MPORT}\"#" \
        -e "s#^log_json = .*#log_json = \"true\"#" \
        -e "s#^log_level = .*#log_level = \"info\"#" "$VOL/mediator.toml"
+# 12247.4: the entrypoint starts only the ?encrypt=1 backend, so upstream's TEST-ONLY plain store is re-sealed in place
+# under the marker passphrase (same names and values), the shape the host will run.
+( umask 077; printf '%s' "$PASS_MARK" > "$SHM/test-pass" )
+node "$HERE/mediator-store.mjs" encrypt-test "$VOL/secrets.json" "$SHM/test-pass" > "$WORK/encrypt-test.json"
 DENY="$WORK/deny.txt"; node "$HERE/mediator-deny-file.mjs" "$RECORD" "$DENY" > /dev/null
 
 # The host: the platform's own names, one planted extra, the two required inputs. Nothing from the runner.
@@ -83,7 +87,7 @@ start() {
 # 16.3(b) on the real store: upstream's TEST-ONLY secrets.json carries mediator_admin_credential, so the entrypoint
 # must refuse it as it comes; then the surgical delete (mediator-store.mjs), and only then the starts below.
 start refuse-admin-credential
-node "$HERE/mediator-store.mjs" delete-admin "$VOL/secrets.json" > "$WORK/delete-admin.json"
+node "$HERE/mediator-store.mjs" delete-admin "$VOL/secrets.json" "$SHM/test-pass" > "$WORK/delete-admin.json"
 start bare
 if ! grep -q '"started":true' "$WORK/bare.json"; then start with-path-home --with-path-home; fi
 # 12180: a fake `env` first on the host's PATH. The entrypoint must not reach it (PATH set first, /usr/bin/env -i).

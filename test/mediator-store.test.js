@@ -134,3 +134,21 @@ test('store 12247 nit: KDF parameters above what upstream writes refuse before A
     assert.equal(run('opens', s, join(r.d, 'p1')).code, 0, 'upstream values themselves still open');
   } finally { r.done(); }
 });
+
+test('store: encrypt-test (TEST ONLY) re-seals a plain store in the ?encrypt=1 shape with the same names and values', () => {
+  const r = rig();
+  try {
+    const s = join(r.d, 'plain.json');
+    writeFileSync(s, JSON.stringify({ entries: { mediator_admin_credential: Buffer.from('{"did":"did:key:zT"}').toString('base64url'), mediator_jwt_secret: Buffer.from('jwt').toString('base64url') } }));
+    const x = run('encrypt-test', s, join(r.d, 'p1'));
+    assert.equal(x.code, 0, x.err);
+    assert.deepEqual(x.j, { shape: 'encrypted', entries: ['mediator_admin_credential', 'mediator_jwt_secret'], opens: true });
+    assert.equal(run('opens', s, join(r.d, 'p2')).code, 4);
+    const shm = mkdtempSync('/dev/shm/store-');
+    try {
+      assert.equal(run('admin-out', s, join(r.d, 'p1'), join(shm, 'a.json')).code, 0);
+      assert.equal(JSON.parse(readFileSync(join(shm, 'a.json'), 'utf8')).did, 'did:key:zT');
+    } finally { rmSync(shm, { recursive: true, force: true }); }
+    assert.notEqual(run('encrypt-test', s, join(r.d, 'p1')).code, 0, 'an encrypted store is not re-sealed');
+  } finally { r.done(); }
+});

@@ -30,6 +30,9 @@
 //                                          Refuses while mediator_admin_credential is in the store (12247 i(a))
 //   seal-test <store> <passphrase file> <json of {key: utf8 value}>
 //                                          TEST ONLY: writes an encrypted store in the mediator's format (unit tests)
+//   encrypt-test <plain store> <passphrase file>
+//                                          TEST ONLY: re-seals a plain store in place in the ?encrypt=1 shape, same
+//                                          entry names and values (upstream's test store, for the entrypoint run)
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -227,6 +230,15 @@ async function main(argv) {
       const r = rekey(store, readPassphrase(a), readPassphrase(b));
       say(r);
       return r.values_unchanged && r.salt_changed && !r.old_opens && r.new_opens ? 0 : 1;
+    }
+    case 'encrypt-test': {
+      const { j, shape } = readStore(store);
+      if (shape !== 'plain') { say({ refused: 'not a plain store' }); return 1; }
+      const values = Object.fromEntries(Object.entries(j.entries).map(([k, v]) => [k, b64u(String(v))]));
+      sealTest(store, readPassphrase(a), values);
+      const after = readStore(store);
+      say({ shape: after.shape, entries: Object.keys(after.j.entries).sort(), opens: opens(after.j, readPassphrase(a)) });
+      return after.shape === 'encrypted' && opens(after.j, readPassphrase(a)) ? 0 : 1;
     }
     case 'seal-test': {
       sealTest(store, readPassphrase(a), JSON.parse(b));
