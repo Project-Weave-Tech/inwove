@@ -81,13 +81,18 @@ D="$W/rekey-data"; PP="$(mktemp -d /dev/shm/rekeypp.XXXXXX)"; mkdir -p "$D"; chm
 head -c 24 /dev/urandom | base64 > "$PP/old"; head -c 24 /dev/urandom | base64 > "$PP/new"; chmod 0444 "$PP/old" "$PP/new"
 node "$HERE/mediator-store.mjs" seal-test "$D/secrets.json" "$PP/old" '{"mediator_secrets":"made-up","mediator_jwt_secret":"made-up","mediator_admin_credential":"{\"did\":\"did:key:zMadeUp\"}"}' > /dev/null || fail "made-up store"
 rrun() { docker run --rm --network none --read-only --user "$(id -u):$(id -g)" -v "$D:/data" -v "$PP:/run/pp:ro" "$REK" "$@"; }
+# Each call's exit and the first line it wrote to stderr (the tool prints names and verdicts only; a docker or node
+# failure shows here instead of as a bare FAIL). Cut to 160 characters, JSON-escaped by node.
+CALLS="$W/rekey-calls.jsonl"; : > "$CALLS"
+note() { node -e 'const [c, x, e] = process.argv.slice(1); console.log(JSON.stringify({ call: c, exit: Number(x), stderr: (e.split("\n").find(Boolean) || "").slice(0, 160) }))' "$1" "$2" "$3" >> "$CALLS"; }
 r1=0; r1_err="$(rrun rekey /data/secrets.json /run/pp/old /run/pp/new 2>&1 > /dev/null)" || r1=$?
+note rekey-with-credential "$r1" "$r1_err"
 r1_names_cred=$([[ "$r1_err" == *mediator_admin_credential* ]] && echo true || echo false)
-removed=(); for s in admin-out delete-admin seal-test encrypt-test; do c=0; rrun "$s" /data/secrets.json /run/pp/old > /dev/null 2>&1 || c=$?; removed+=("\"$s\":$c"); done
+removed=(); for s in admin-out delete-admin seal-test encrypt-test; do c=0; e="$(rrun "$s" /data/secrets.json /run/pp/old 2>&1 > /dev/null)" || c=$?; note "$s" "$c" "$e"; removed+=("\"$s\":$c"); done
 node "$HERE/mediator-store.mjs" delete-admin "$D/secrets.json" "$PP/old" > /dev/null || fail "made-up store delete"
-r2=0; r2_out="$(rrun rekey /data/secrets.json /run/pp/old /run/pp/new 2>/dev/null)" || r2=$?
-o_old=0; rrun opens /data/secrets.json /run/pp/old > /dev/null 2>&1 || o_old=$?
-o_new=0; rrun opens /data/secrets.json /run/pp/new > /dev/null 2>&1 || o_new=$?
+r2=0; r2_out="$(rrun rekey /data/secrets.json /run/pp/old /run/pp/new 2>"$W/r2.err")" || r2=$?; note rekey-after-delete "$r2" "$(cat "$W/r2.err")"
+o_old=0; e="$(rrun opens /data/secrets.json /run/pp/old 2>&1 > /dev/null)" || o_old=$?; note opens-old "$o_old" "$e"
+o_new=0; e="$(rrun opens /data/secrets.json /run/pp/new 2>&1 > /dev/null)" || o_new=$?; note opens-new "$o_new" "$e"
 rm -rf "$PP"; [ -e "$PP" ] && fail "passphrase dir still there"
 
 node - "$OUT" "$ODIR" "$W" <<EOF
@@ -114,8 +119,10 @@ const rec = {
   shipped_tool_sha256: rek && rek.shipped_sha256, ship_strip_sha256: ship && ship.sha256,
   keyring_probe: (() => { try { return JSON.parse(\`$probe\`); } catch { return null; } })(), keyring_probe_host: 'GitHub ubuntu-latest runner, Docker default seccomp',
   removed_subcommand_exits: removed,
+  rekey_calls: fs.readFileSync(w + '/rekey-calls.jsonl', 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)),
 };
 fs.writeFileSync(out, JSON.stringify(rec, null, 2) + '\n');
 console.log(JSON.stringify(lines));
+console.log(JSON.stringify(rec.rekey_calls));
 process.exit(Object.values(lines).some((v) => v === 'FAIL') ? 1 : 0);
 EOF
