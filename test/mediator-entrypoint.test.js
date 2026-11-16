@@ -274,3 +274,33 @@ test('entrypoint 12247.4: the conf must point the backend at exactly file://<vol
     assert.equal(run(r, { medArgs: [`--config=${r.conf}`] }).code, 0);
   } finally { r.done(); }
 });
+
+test('entrypoint 12346.1-2: a host name that is a glob or holds a newline refuses by count, never printed or expanded', { skip: !haveTmpfs && 'no tmpfs' }, () => {
+  const r = rig();
+  try {
+    // a planted file under /dev/shm: on 1cb2a7a the glob name made the start line list it
+    const bait = join(r.shm, 'bait-file-9q2'); writeFileSync(bait, '');
+    const glob = run(r, { env: { [`${SHM}/*`]: 'x' } });
+    refused(glob, "1 host names that aren't plain names");
+    assert.doesNotMatch(glob.err, /bait-file-9q2|\/dev\/shm/);
+    assert.doesNotMatch(glob.err, /entrypoint: env -i dropped/, 'no start line, the start refused');
+    // a newline in a name: on 1cb2a7a it printed as three "names" and could forge a refusal line
+    const nl = run(r, { env: { 'A\nrefused: forged': 'x' } });
+    refused(nl, "1 host names that aren't plain names");
+    assert.equal(nl.err.split('\n').filter((l) => l.startsWith('refused:')).length, 1, nl.err);
+    assert.doesNotMatch(nl.err, /forged/);
+    // two at once: the count is the number of names
+    refused(run(r, { env: { [`${SHM}/*`]: 'x', 'B.c': 'y' } }), "2 host names that aren't plain names");
+    // a shell-family name that is also a glob: refused as a shell name, the odd one withheld, nothing expanded
+    const fn = run(r, { env: { [`BASH_FUNC_${SHM}/*%%`]: '() { :; }' } });
+    refused(fn, 'change the shell or the loader: 1 not plain names \\(withheld\\)');
+    assert.doesNotMatch(fn.err, /bait-file-9q2|\/dev\/shm/);
+  } finally { r.done(); }
+});
+
+test('entrypoint 12346.1: set -f follows PATH, and no name list goes through an unquoted echo', () => {
+  const code = readFileSync(EP, 'utf8').split('\n').filter((l) => l.trim() && !l.trim().startsWith('#'));
+  assert.equal(code[0], 'PATH=/usr/bin:/bin; export PATH');
+  assert.equal(code[1], 'set -f');
+  assert.ok(!code.some((l) => /\$\(echo \$/.test(l)), 'no $(echo $list)');
+});

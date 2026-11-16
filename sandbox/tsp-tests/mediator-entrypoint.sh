@@ -43,7 +43,11 @@
 #     its file is absent (file_encrypted.rs open → init_new), so a lost volume must stop the start, never be replaced
 # Host names on no list (the platform's own, e.g. its PORT) are not refused: `env -i` drops them, and one start line
 # on stderr says which, by NAME only and never a value (12144.3c, charter §9: drift shows in the log, not nowhere).
+# Security 12346: a host name is never a glob and never printed unless it is a plain name. `set -f` right after PATH,
+# every name list is printed from an array, quoted, and a host name that isn't `^[A-Za-z_][A-Za-z0-9_]*$` refuses the
+# start by COUNT only (a `/dev/shm/*` name would list tmpfs file names; a newline name would forge a line).
 PATH=/usr/bin:/bin; export PATH
+set -f
 set -uo pipefail
 refuse() { echo "refused: $1" >&2; exit 78; }
 # 12180 (iv): every name the host passed, from the kernel's copy, builtins only (no tool has run yet).
@@ -52,16 +56,35 @@ mapfile -d '' -t _host_env < "/proc/$$/environ" || refuse "cannot read the host 
 for _kv in "${_host_env[@]}"; do HOST_NAMES+=("${_kv%%=*}"); done
 unset _host_env _kv
 host_has() { local n; for n in "${HOST_NAMES[@]}"; do [ "$n" = "$1" ] && return 0; done; return 1; }
-host_matching() { local n; for n in "${HOST_NAMES[@]}"; do [[ "$n" =~ $1 ]] && printf '%s\n' "$n"; done; return 0; }
+PLAIN_NAME='^[A-Za-z_][A-Za-z0-9_]*$'
+# host_matching <regex>: the host names matching it, into the array MATCH (never through a word-split string).
+host_matching() { local n; MATCH=(); for n in "${HOST_NAMES[@]}"; do [[ "$n" =~ $1 ]] && MATCH+=("$n"); done; return 0; }
+# say_names <names…>: one line, the names quoted from the array; any name not safe to print is counted, never shown.
+# Safe = a plain name, or BASH_FUNC_<plain>%% (the shape bash itself exports, so 12180's refusal can still name it).
+say_names() {
+  local n out=() withheld=0
+  for n in "$@"; do
+    if [[ "$n" =~ $PLAIN_NAME || "$n" =~ ^BASH_FUNC_[A-Za-z0-9_]+%%$ ]]; then out+=("$n"); else withheld=$((withheld + 1)); fi
+  done
+  [ "${#out[@]}" -gt 0 ] && printf '%s' "${out[0]}" && [ "${#out[@]}" -gt 1 ] && printf ' %s' "${out[@]:1}"
+  [ "$withheld" -gt 0 ] && printf '%s%d not plain names (withheld)' "$([ "${#out[@]}" -gt 0 ] && printf ' + ')" "$withheld"
+  return 0
+}
 # 12180 (iii): the names that change what a shell or the loader does, refused by name before any tool runs. Under
 # -p bash ignores the shell ones already; the loader reads LD_* before this line, so the refusal is the tripwire
 # and a read-only image is the guard. A platform that sets one on its own is a finding about the image (Security
 # 12204.2c), never a reason to shorten this list.
-_shell="$(host_matching '^(BASH_ENV|ENV|SHELLOPTS|BASHOPTS)$|^BASH_FUNC_|^LD_')"
-[ -z "$_shell" ] || refuse "host names that change the shell or the loader: $(echo $_shell)"
+host_matching '^(BASH_ENV|ENV|SHELLOPTS|BASHOPTS)$|^BASH_FUNC_|^LD_'
+[ "${#MATCH[@]}" -eq 0 ] || refuse "host names that change the shell or the loader: $(say_names "${MATCH[@]}")"
+# 12346.2: every other host name must be a plain name; the rest refuse by count, never printed. These are also the
+# names `export -n` below can't take, so without this they would still reach grep/sha256sum/stat. A platform that
+# sets one is an image/platform finding (12204.2c), never a loosening.
+_odd=0; for _n in "${HOST_NAMES[@]}"; do [[ "$_n" =~ $PLAIN_NAME ]] || _odd=$((_odd + 1)); done
+[ "$_odd" -eq 0 ] || refuse "$_odd host names that aren't plain names"
+unset _odd
 # The host's exported names stay shell variables here but are no longer handed to the tools this script runs.
-for _n in "${HOST_NAMES[@]}"; do [[ "$_n" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && [ "$_n" != PATH ] && export -n "$_n"; done
-unset _n _shell
+for _n in "${HOST_NAMES[@]}"; do [ "$_n" != PATH ] && export -n "$_n"; done
+unset _n
 export LC_ALL=C
 PASSPHRASE_SOURCE=ENKARA_MEDIATOR_BACKEND_PASSPHRASE
 PINNED_RUST_LOG='info,affinidi_messaging_mediator::common::config=warn'   # condition 15's pinned filter (line D)
@@ -95,16 +118,20 @@ for d in /usr/local/bin /usr/bin /bin "$(dirname "$bin")"; do [ -e "$d/mediator-
 # 2(i)
 ! host_has MEDIATOR_FILE_BACKEND_PASSPHRASE || refuse "MEDIATOR_FILE_BACKEND_PASSPHRASE is set on the host (use the _FILE road only)"
 # 12079.2
-tags="$(host_matching '^MEDIATOR_TAG_')"
-[ -z "$tags" ] || refuse "MEDIATOR_TAG_* present on the host: $(echo $tags)"
+host_matching '^MEDIATOR_TAG_'
+[ "${#MATCH[@]}" -eq 0 ] || refuse "MEDIATOR_TAG_* present on the host: $(say_names "${MATCH[@]}")"
 # 3: the deny side of the record
 while IFS= read -r n; do
   [ -n "$n" ] || continue
   ! host_has "$n" || refuse "$n is set on the host (deny list)"
 done < "$denyfile"
 # 12144.2: the families the mediator and its clients read, beyond the allow list
-fam="$(host_matching '^(MEDIATOR_|VAULT_|AWS_)' | grep -vxF -f <(printf '%s\n' "${ALLOW[@]}") || true)"
-[ -z "$fam" ] || refuse "host names in the MEDIATOR_/VAULT_/AWS_ families not on the allow list: $(echo $fam)"
+host_matching '^(MEDIATOR_|VAULT_|AWS_)'
+fam=(); for n in "${MATCH[@]}"; do
+  listed=0; for a in "${ALLOW[@]}"; do [ "$n" = "$a" ] && listed=1; done
+  [ "$listed" = 1 ] || fam+=("$n")
+done; unset listed
+[ "${#fam[@]}" -eq 0 ] || refuse "host names in the MEDIATOR_/VAULT_/AWS_ families not on the allow list: $(say_names "${fam[@]}")"
 # 16.3(b): the admin credential is absent from the backend's own storage; the store is there and is ours
 store="$volume/secrets.json"
 [ -L "$store" ] && refuse "the secret store is a symlink"
@@ -151,6 +178,8 @@ keep=(DATABASE_URL="$DATABASE_URL" MEDIATOR_FILE_BACKEND_PASSPHRASE_FILE="$pf" R
 [ "$pathhome" = 1 ] && keep+=(PATH=/usr/local/bin:/usr/bin:/bin HOME="$workdir")
 # 12144.3c: what `env -i` drops, names only. From /proc (12180 iv) it is every name the host passed but DATABASE_URL,
 # the one passed on, so the line is the complete host-name list binding 3(d)'s daily compare reads.
-dropped="$(printf '%s\n' "${HOST_NAMES[@]}" | grep -vx 'DATABASE_URL' | sort -u || true)"
-echo "entrypoint: env -i dropped $(printf '%s' "$dropped" | grep -c . || true) host names: $(echo $dropped)" >&2
+# (Every name here is plain, 12346.2, so one per line through sort is exact; the count is the array's own length.)
+dropped=()
+[ "${#HOST_NAMES[@]}" -gt 0 ] && mapfile -t dropped < <(printf '%s\n' "${HOST_NAMES[@]}" | grep -vx 'DATABASE_URL' | sort -u || true)
+printf 'entrypoint: env -i dropped %d host names: %s\n' "${#dropped[@]}" "$(say_names "${dropped[@]}")" >&2
 exec /usr/bin/env -i "${keep[@]}" "$bin" "$@"
