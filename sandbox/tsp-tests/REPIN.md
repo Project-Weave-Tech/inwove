@@ -62,3 +62,8 @@ the host only when every step below holds on the new pin, in one job run, and Se
     At a base re-pin, read the new base's file at that path (the images step prints `rekey_archives_allowed_read`) and
     any new archive hit, and bring both to SECURITY: the set is re-pinned or widened only by a Security block, never in
     place. A new base where the file is gone keeps the line red-safe (an absent allowed path allows nothing).
+13. **The rekey image's base diff** (Security 11869.4): `mediator-base-diff.mjs` walks the rekey image and the pinned
+    base (both `docker export` streams); every regular file is byte-identical to the base's, same mode and owner, or in
+    `rekey-added.json` (the shipped tool at the L8 pin, each `@noble/hashes` file at its sha); added directories only
+    under `/opt/rekey`. At a base re-pin, or when `@noble/hashes` or the shipped tool moves, the job prints
+    `rekey_added_read`; the new shas come to SECURITY and are re-pinned only by a Security block, never in place.

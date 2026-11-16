@@ -10,7 +10,8 @@
 #            `mediator --help` runs in it, and the keyring probe as the service user: refused both = PASS,
 #            landed = AMBER (the host's syscall filter, never red), anything else FAIL; and (Security 12940) the
 #            image's own entrypoint, started bare, writes that probe as its first stderr line and still refuses (78).
-#   rekey:   the image check (mediator-image-check.mjs rekey) on the shipped tool; in the image, with no network and
+#   rekey:   the image check (mediator-image-check.mjs rekey) on the shipped tool; (Security 11869.4) the base diff
+#            against the pinned base (mediator-base-diff.mjs, added set rekey-added.json); in the image, with no network and
 #            a read-only root: `rekey` refuses while mediator_admin_credential is in the store, the removed
 #            subcommands answer "usage" (exit 2), and after the credential is gone `rekey` re-seals (old no longer
 #            opens, new does, same entries).
@@ -49,6 +50,13 @@ rootfs() {
 }
 rootfs "$SVC" "$W/svc-root" || fail "service export"
 rootfs "$REK" "$W/rek-root" || fail "rekey export"
+# --- Security 11869.4: the base-diff line. Both the rekey image and the base it is built FROM, as export streams (tar
+# headers keep the image's own mode and owner), judged file by file against the added set (rekey-added.json).
+BASE_REF="$(sed -n 's/^FROM \([^ ]*\).*/\1/p' "$HERE/mediator-rekey.Dockerfile" | head -1)"
+[[ "$BASE_REF" == *@sha256:* ]] || fail "the rekey Dockerfile's base is not pinned by digest"
+tarof() { local img="$1" out="$2" cid; cid="$(docker create "$img")" || return 1; docker export "$cid" > "$out"; local rc=$?; docker rm -f "$cid" > /dev/null; return $rc; }
+tarof "$REK" "$W/rek.tar" || fail "rekey export (tar)"
+tarof "$BASE_REF" "$W/base.tar" || fail "base export (tar)"
 docker image inspect "$SVC" > "$W/svc-inspect.json" && docker image inspect "$REK" > "$W/rek-inspect.json" || fail "inspect"
 
 # --- the planted tree: every search must hit each of these first
@@ -60,6 +68,8 @@ gzip -9nc "$HERE/mediator-store.mjs" > "$PL/usr/lib/node/renamed-tool.bin"
 : > "$PL/usr/local/bin/mediator-setup"; : > "$PL/usr/bin/dbus-daemon"; : > "$PL/run/dbus/system_bus_socket"; : > "$PL/run/user/10001/bus"
 
 svc=0; node "$HERE/mediator-image-check.mjs" service "$W/svc-root" "$W/svc-inspect.json" "$PL" "$ODIR/service-image.json" || svc=$?
+bd=0; node "$HERE/mediator-base-diff.mjs" "$W/rek.tar" "$W/base.tar" "$HERE/rekey-added.json" "$PL" "$HERE/mediator-store.mjs" "$ODIR/rekey-base-diff.json" || bd=$?
+rm -f "$W/rek.tar" "$W/base.tar"
 rek=0; node "$HERE/mediator-image-check.mjs" rekey "$W/rek-root" "$W/rek-inspect.json" /opt/rekey/mediator-store.mjs "$ODIR/rekey-image.json" "$PL" || rek=$?
 
 # --- the service binary in its image: libraries resolve, it runs
@@ -117,7 +127,7 @@ rm -rf "$PP"; [ -e "$PP" ] && fail "passphrase dir still there"
 node - "$OUT" "$ODIR" "$W" <<EOF
 const fs = require('fs'); const [out, odir, w] = process.argv.slice(2);
 const rd = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
-const svc = rd(odir + '/service-image.json'), rek = rd(odir + '/rekey-image.json'), ship = rd(w + '/ship.json');
+const svc = rd(odir + '/service-image.json'), rek = rd(odir + '/rekey-image.json'), ship = rd(w + '/ship.json'), bdiff = rd(odir + '/rekey-base-diff.json');
 const removed = JSON.parse('{${removed[*]}}'.replace(/ /g, ','));
 let r2 = null; try { r2 = JSON.parse(\`$r2_out\`); } catch {}
 const P = (b) => (b ? 'PASS' : 'FAIL');
@@ -128,6 +138,7 @@ const lines = {
   service_keyring_probe: '$probe_v' || 'FAIL',
   service_entrypoint_first_line_is_the_keyring_probe: '$ep_v' || 'FAIL',
   rekey_image_check: P(rek && rek.ok),
+  rekey_base_diff: P($bd === 0 && bdiff && bdiff.ok),
   rekey_refuses_while_admin_credential_present: P($r1 !== 0 && $r1_names_cred),
   rekey_removed_subcommands_answer_usage: P(Object.values(removed).length === 4 && Object.values(removed).every((c) => c === 2)),
   rekey_reseals_once_credential_gone: P($r2 === 0 && r2 && r2.values_unchanged && r2.salt_changed && !r2.old_opens && r2.new_opens && $o_old === 4 && $o_new === 0),
@@ -147,5 +158,8 @@ console.log(JSON.stringify(lines));
 console.log(JSON.stringify(rec.rekey_calls));
 // Security 13081.1: the shipped tool's sha256 in the log too, so it can be read against the L8 pin without the artifact
 console.log(JSON.stringify({ shipped_tool_sha256: rec.shipped_tool_sha256, ship_strip_sha256: rec.ship_strip_sha256, rekey_archive_hits: rek && rek.archive_hits, rekey_archives_allowed_read: rek && rek.archives_allowed_read }));
+// Security 11869.4: the base diff's verdict, and what the image added (path, sha256, mode, owner), once, for the pin
+console.log(JSON.stringify({ rekey_base_diff: bdiff && { ok: bdiff.ok, checks: bdiff.checks, instrument: bdiff.instrument, changed: bdiff.changed, added_file_not_in_set: bdiff.added_file_not_in_set, added_dir_outside: bdiff.added_dir_outside, added_not_a_file: bdiff.added_not_a_file, added_setuid: bdiff.added_setuid, added_set_missing: bdiff.added_set_missing, deleted_base_entries: bdiff.deleted_base_entries } }));
+console.log(JSON.stringify({ rekey_added_read: bdiff && bdiff.added_read }));
 process.exit(Object.values(lines).some((v) => v === 'FAIL') ? 1 : 0);
 EOF
