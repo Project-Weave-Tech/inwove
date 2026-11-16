@@ -348,6 +348,11 @@ jobs:
         with:
           path: results
           pattern: results-*
+      # report.mjs reads results through lib.mjs, which imports @noble/curves: without this the job crashed before it
+      # wrote report.md (runs 43827161744, 43831112703: ERR_MODULE_NOT_FOUND, "No files were found"), so it was red
+      # for the wrong reason and no report was kept.
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: sandbox/tsp-tests
       - run: node "$WPI_DIR/report.mjs" results report.md > /dev/null; s=$?; cat report.md >> "$GITHUB_STEP_SUMMARY"; exit $s
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
