@@ -213,10 +213,12 @@ rm -f -- "$VOL/admin-monitor.json" "$SETUP_OUT"   # the second and third places 
 start green-encrypted "$SHM/p1"
 # 6. (v) rotation in place, then old refused by the mediator, new starts
 # Security 12024.1: rekey runs only under exactly its allow list (what the rekey entrypoint's `env -i` hands it).
-RK_HOME="$(mktemp -d)"; chmod 0555 "$RK_HOME"
+# Security 12197 change A: HOME must be exactly <the tool's dir>/home, as in the image, so the tool runs from its own
+# dir here: a copy beside the repo's node_modules and an empty read-only home, removed after.
+RK="$(mktemp -d)"; cp "$STORE" "$RK/mediator-store.mjs"; ln -s "$HERE/node_modules" "$RK/node_modules"; mkdir -m 0555 "$RK/home"
 /usr/bin/env -i REKEY_STORE="$VOL/secrets.json" REKEY_OLD_PASSPHRASE_FILE="$SHM/p1" REKEY_NEW_PASSPHRASE_FILE="$SHM/p2" \
-  PATH=/usr/local/bin:/usr/bin:/bin HOME="$RK_HOME" "$(command -v node)" "$STORE" rekey "$VOL/secrets.json" "$SHM/p1" "$SHM/p2" > "$WORK/rekey.json" 2>"$WORK/rekey.err" || true
-rmdir "$RK_HOME" 2> /dev/null || true
+  PATH=/usr/local/bin:/usr/bin:/bin HOME="$RK/home" "$(command -v node)" "$RK/mediator-store.mjs" rekey "$VOL/secrets.json" "$SHM/p1" "$SHM/p2" > "$WORK/rekey.json" 2>"$WORK/rekey.err" || true
+rm -rf -- "$RK"
 start rotated-old-passphrase "$SHM/p1"
 start rotated-new-passphrase "$SHM/p2"
 names_after=$(node "$STORE" names "$VOL/secrets.json" 2>/dev/null || echo '{}')

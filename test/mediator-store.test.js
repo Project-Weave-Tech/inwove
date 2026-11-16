@@ -10,7 +10,7 @@ import { join } from 'node:path';
 
 const TOOL = new URL('../sandbox/tsp-tests/mediator-store.mjs', import.meta.url).pathname;
 // Security 12024.1: `rekey` runs only under exactly its allow list, so the unit hands it that and nothing more.
-const envFor = (a) => (a[0] === 'rekey' ? { REKEY_STORE: a[1], REKEY_OLD_PASSPHRASE_FILE: a[2], REKEY_NEW_PASSPHRASE_FILE: a[3], PATH: '/usr/local/bin:/usr/bin:/bin', HOME: tmpdir() } : process.env);
+const envFor = (a) => (a[0] === 'rekey' ? { REKEY_STORE: a[1], REKEY_OLD_PASSPHRASE_FILE: a[2], REKEY_NEW_PASSPHRASE_FILE: a[3], PATH: '/usr/local/bin:/usr/bin:/bin', HOME: join(TOOL, '..', 'home') } : process.env);
 const run = (...a) => { const r = spawnSync(process.execPath, [TOOL, ...a], { encoding: 'utf8', env: envFor(a) }); return { code: r.status, out: r.stdout, err: r.stderr, j: r.stdout ? JSON.parse(r.stdout.trim().split('\n').pop()) : null }; };
 function rig() {
   const d = mkdtempSync(join(tmpdir(), 'store-'));

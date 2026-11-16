@@ -44,6 +44,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { argon2id } from '@noble/hashes/argon2.js';
 
 export const ADMIN_CREDENTIAL = 'mediator_admin_credential';
@@ -137,7 +138,12 @@ function writeAtomic(file, obj, guard = null) {
     fs.chmodSync(tmp, 0o600);
     if (guard) guard();
   } catch (e) { fs.rmSync(tmp, { force: true }); throw e; }
-  fs.renameSync(tmp, file);
+  // Security 12197 change B: a second run removes a stale temp before it reads, so it can remove ours in flight. The
+  // store is then still the old one, whole; say so in words rather than a raw ENOENT.
+  try { fs.renameSync(tmp, file); } catch (e) {
+    if (e?.code === 'ENOENT' && !fs.existsSync(tmp)) throw new Error('the temp was removed under us (a second run?); nothing written');
+    throw e;
+  }
   const dfd = fs.openSync(dir, 'r');
   try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); }
 }
@@ -149,7 +155,11 @@ const storeStamp = (file) => { const st = fs.statSync(file, { bigint: true }); r
 // Security 12024.1: the rekey run's environment, exact. The entrypoint `exec env -i`s the tool with only these; the
 // tool reads the kernel's copy of its own environment (never process.env, which node can be told to shape) and
 // refuses on any other name, a missing one, or a path that isn't the argument it was given. Names only, never values.
+// Security 12197 change A: "exactly" covers the two fixed values too: PATH is the entrypoint's own, HOME is the image's
+// empty <the tool's dir>/home (args.home); any other value refuses (named in value_not_allowed, never printed).
 export const REKEY_ENV = ['HOME', 'PATH', 'REKEY_NEW_PASSPHRASE_FILE', 'REKEY_OLD_PASSPHRASE_FILE', 'REKEY_STORE'];
+export const REKEY_PATH = '/usr/local/bin:/usr/bin:/bin';
+export const rekeyHome = () => path.join(path.dirname(fs.realpathSync(fileURLToPath(import.meta.url))), 'home');
 export function rekeyEnvironVerdict(environ, args) {
   const pairs = environ.split('\0').filter(Boolean).map((kv) => { const i = kv.indexOf('='); return i < 0 ? [kv, ''] : [kv.slice(0, i), kv.slice(i + 1)]; });
   const names = pairs.map(([k]) => k);
@@ -160,8 +170,9 @@ export function rekeyEnvironVerdict(environ, args) {
   const val = Object.fromEntries(pairs);
   const mismatch = [['REKEY_STORE', args.store], ['REKEY_OLD_PASSPHRASE_FILE', args.old], ['REKEY_NEW_PASSPHRASE_FILE', args.new]]
     .filter(([k, v]) => names.includes(k) && val[k] !== v).map(([k]) => k);
-  return { ok: !extra.length && !missing.length && !dup.length && !mismatch.length,
-    extra: extra.filter(plain).sort(), extra_not_plain: extra.filter((n) => !plain(n)).length, missing, duplicated: [...new Set(dup)], not_the_argument: mismatch };
+  const fixed = [['HOME', args.home], ['PATH', REKEY_PATH]].filter(([k, v]) => names.includes(k) && (typeof v !== 'string' || val[k] !== v)).map(([k]) => k);
+  return { ok: !extra.length && !missing.length && !dup.length && !mismatch.length && !fixed.length,
+    extra: extra.filter(plain).sort(), extra_not_plain: extra.filter((n) => !plain(n)).length, missing, duplicated: [...new Set(dup)], not_the_argument: mismatch, value_not_allowed: fixed };
 }
 
 // ship:drop-begin
@@ -292,7 +303,7 @@ async function main(argv) {
     case 'rekey': {
       let environ;
       try { environ = fs.readFileSync('/proc/self/environ', 'latin1'); } catch { say({ refused: 'cannot read /proc/self/environ' }); return 6; }
-      const ev = rekeyEnvironVerdict(environ, { store, old: a, new: b });
+      const ev = rekeyEnvironVerdict(environ, { store, old: a, new: b, home: rekeyHome() });
       if (!ev.ok) { say({ refused: 'the rekey environment is not exactly the allow list', ...ev }); return 6; }
       const r = rekey(store, readPassphrase(a), readPassphrase(b));
       say(r);

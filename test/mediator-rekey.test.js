@@ -28,6 +28,8 @@ function rig() {
   const pp = mkdtempSync('/dev/shm/rekey-test-');
   writeFileSync(join(pp, 'old'), OLD); writeFileSync(join(pp, 'new'), NEW);
   const tool = (args, env = process.env, pre = []) => spawnSync(NODE, [...pre, SRC, ...args], { encoding: 'utf8', env });
+  // `rekey` itself runs on the SHIPPED copy, whose HOME is <its dir>/home (Security 12197 change A).
+  const rtool = (args, env, pre = []) => spawnSync(NODE, [...pre, join(img, 'mediator-store.mjs'), ...args], { encoding: 'utf8', env });
   assert.equal(tool(['seal-test', store, join(pp, 'old'), JSON.stringify({ mediator_jwt_secret: 'made-up-jwt', mediator_secrets: 'made-up-ops' })]).status, 0);
   const opensWith = (f) => tool(['opens', store, f]).status === 0;
   const exactEnv = { REKEY_STORE: store, REKEY_OLD_PASSPHRASE_FILE: join(pp, 'old'), REKEY_NEW_PASSPHRASE_FILE: join(pp, 'new'), PATH: '/usr/local/bin:/usr/bin:/bin', HOME: join(img, 'home') };
@@ -37,7 +39,7 @@ function rig() {
     rmSync(d, { recursive: true, force: true }); rmSync(pp, { recursive: true, force: true });
     for (const n of readdirSync('/dev/shm')) if (n.startsWith('rekey.')) { try { rmSync(join('/dev/shm', n), { recursive: true, force: true }); } catch { /* not ours */ } }
   };
-  return { d, img, vol, store, pp, tool, opensWith, exactEnv, entry, done };
+  return { d, img, vol, store, pp, tool, rtool, opensWith, exactEnv, entry, done };
 }
 const last = (out) => { try { return JSON.parse(out.trim().split('\n').pop()); } catch { return null; } };
 const temps = (vol) => readdirSync(vol).filter((n) => n.startsWith('.secrets.json.'));
@@ -62,13 +64,13 @@ test('rekey 12024.1: the tool refuses (6) on any name beyond the allow list, a m
     const args = ['rekey', r.store, join(r.pp, 'old'), join(r.pp, 'new')];
     for (const env of [{ ...r.exactEnv, DATABASE_URL: MARKERS.DATABASE_URL }, { ...r.exactEnv, NODE_OPTIONS: '' }, (({ HOME, ...e }) => e)(r.exactEnv),
       { ...r.exactEnv, REKEY_NEW_PASSPHRASE_FILE: join(r.pp, 'old') }]) {
-      const x = r.tool(args, env);
+      const x = r.rtool(args, env);
       assert.equal(x.status, 6, JSON.stringify(Object.keys(env)));
       assert.ok(!x.stdout.includes(MARKERS.DATABASE_URL), 'names only');
       assert.deepEqual(readFileSync(r.store), before);
     }
-    assert.deepEqual(last(r.tool(args, { ...r.exactEnv, DATABASE_URL: 'x' }).stdout).extra, ['DATABASE_URL']);
-    assert.equal(r.tool(args, r.exactEnv).status, 0, 'exactly the allow list runs');
+    assert.deepEqual(last(r.rtool(args, { ...r.exactEnv, DATABASE_URL: 'x' }).stdout).extra, ['DATABASE_URL']);
+    assert.equal(r.rtool(args, r.exactEnv).status, 0, 'exactly the allow list runs');
   } finally { r.done(); }
 });
 
@@ -95,13 +97,13 @@ for (const [where, patch] of Object.entries(KILL)) {
     const r = rig();
     try {
       const pre = join(r.d, 'kill.mjs'); writeFileSync(pre, `import fs from 'node:fs';\n${patch}\n`);
-      const x = r.tool(['rekey', r.store, join(r.pp, 'old'), join(r.pp, 'new')], r.exactEnv, ['--import', pre]);
+      const x = r.rtool(['rekey', r.store, join(r.pp, 'old'), join(r.pp, 'new')], r.exactEnv, ['--import', pre]);
       assert.equal(x.signal, 'SIGKILL', x.stderr);
       const o = r.opensWith(join(r.pp, 'old')), n = r.opensWith(join(r.pp, 'new'));
       assert.ok(o !== n, `exactly one opens (old ${o}, new ${n})`);
       assert.equal(n, where.startsWith('after the rename'));
       // A killed run's temp is removed by the next run, which then completes (or refuses if it already went through).
-      const y = r.tool(['rekey', r.store, join(r.pp, o ? 'old' : 'new'), join(r.pp, o ? 'new' : 'old')], o ? r.exactEnv
+      const y = r.rtool(['rekey', r.store, join(r.pp, o ? 'old' : 'new'), join(r.pp, o ? 'new' : 'old')], o ? r.exactEnv
         : { ...r.exactEnv, REKEY_OLD_PASSPHRASE_FILE: join(r.pp, 'new'), REKEY_NEW_PASSPHRASE_FILE: join(r.pp, 'old') });
       assert.equal(y.status, 0, y.stderr); assert.deepEqual(temps(r.vol), []);
       assert.equal(last(y.stdout).stale_temps_removed, where === 'after the rename, before the directory fsync' ? 0 : 1);
@@ -116,7 +118,7 @@ test('rekey 12024.2 (c): a second writer between the read and the rename refuses
     // the "other writer": touches the store's mtime when the tool chmods its temp file (just before the guard)
     writeFileSync(pre, `import fs from 'node:fs';\nconst c = fs.chmodSync; fs.chmodSync = (p, m) => { c(p, m); const t = new Date(Date.now() + 5000); fs.utimesSync(${JSON.stringify(r.store)}, t, t); };\n`);
     const before = readFileSync(r.store);
-    const x = r.tool(['rekey', r.store, join(r.pp, 'old'), join(r.pp, 'new')], r.exactEnv, ['--import', pre]);
+    const x = r.rtool(['rekey', r.store, join(r.pp, 'old'), join(r.pp, 'new')], r.exactEnv, ['--import', pre]);
     assert.equal(x.status, 1); assert.match(x.stderr, /second writer/);
     assert.deepEqual(readFileSync(r.store), before); assert.deepEqual(temps(r.vol), []);
     assert.ok(r.opensWith(join(r.pp, 'old')));
@@ -143,5 +145,39 @@ test('rekey entrypoint: refuses by name, before any tool runs', () => {
       assert.ok(!x.stderr.includes(OLD) && !x.stderr.includes(NEW));
     }
     assert.deepEqual(readFileSync(r.store), before);
+  } finally { r.done(); }
+});
+
+test('rekey 12197 change A: PATH and HOME must have exactly their values, not only their names (refuses 6, names only)', () => {
+  const r = rig();
+  try {
+    const before = readFileSync(r.store);
+    const args = ['rekey', r.store, join(r.pp, 'old'), join(r.pp, 'new')];
+    for (const [over, name] of [[{ PATH: '/tmp' }, 'PATH'], [{ PATH: '/usr/local/bin:/usr/bin:/bin:/tmp' }, 'PATH'], [{ HOME: '/tmp/evil' }, 'HOME'], [{ HOME: join(r.d, 'home') }, 'HOME']]) {
+      const x = r.rtool(args, { ...r.exactEnv, ...over });
+      assert.equal(x.status, 6, `${name}=${over[name]}`);
+      assert.deepEqual(last(x.stdout).value_not_allowed, [name]);
+      assert.ok(!x.stdout.includes('/tmp/evil'), 'names only, never the value');
+      assert.deepEqual(readFileSync(r.store), before);
+    }
+    // the full source tool's own HOME is <its dir>/home, so the image's HOME does not satisfy it either
+    assert.equal(r.tool(args, r.exactEnv).status, 6);
+    assert.equal(r.rtool(args, r.exactEnv).status, 0, 'the exact values run');
+  } finally { r.done(); }
+});
+
+test('rekey 12197 change B: a temp removed between the guard and the rename refuses in words, exit 1, the store whole and old', () => {
+  const r = rig();
+  try {
+    const pre = join(r.d, 'steal.mjs');
+    // the "second run": removes our in-flight temp just before the rename, as its stale-temp sweep would
+    writeFileSync(pre, "import fs from 'node:fs';\nconst rn = fs.renameSync; fs.renameSync = (a, b) => { fs.rmSync(a); return rn(a, b); };\n");
+    const before = readFileSync(r.store);
+    const x = r.rtool(['rekey', r.store, join(r.pp, 'old'), join(r.pp, 'new')], r.exactEnv, ['--import', pre]);
+    assert.equal(x.status, 1, x.stderr);
+    assert.match(x.stderr, /the temp was removed under us \(a second run\?\); nothing written/);
+    assert.ok(!/ENOENT/.test(x.stderr), 'not a raw ENOENT');
+    assert.deepEqual(readFileSync(r.store), before); assert.deepEqual(temps(r.vol), []);
+    assert.ok(r.opensWith(join(r.pp, 'old')) && !r.opensWith(join(r.pp, 'new')));
   } finally { r.done(); }
 });
