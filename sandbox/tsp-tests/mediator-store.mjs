@@ -108,6 +108,7 @@ export function opens(j, passphrase) {
   } catch { return false; }
 }
 
+// ship:drop-begin (Security 12940 change 1: the one-value open, used only by admin-out; never in the shipped tool)
 export function getEntry(j, shape, passphrase, name) {
   const e = j.entries[name];
   if (e === undefined) return null;
@@ -115,6 +116,7 @@ export function getEntry(j, shape, passphrase, name) {
   const key = deriveKey(passphrase, j.kdf);
   return openAead(key, b64u(e.nonce_b64), b64u(e.ciphertext_b64), entryAad(name));
 }
+// ship:drop-end
 
 function writeAtomic(file, obj) {
   const dir = path.dirname(file);

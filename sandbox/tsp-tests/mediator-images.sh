@@ -8,7 +8,8 @@
 # Writes beside <out>: service-image.json, rekey-image.json, and <out> (the summary; exit 1 if any line is FAIL).
 #   service: the image check (mediator-image-check.mjs service), the binary's libraries all resolve in the image,
 #            `mediator --help` runs in it, and the keyring probe as the service user: refused both = PASS,
-#            landed = AMBER (the host's syscall filter, never red), anything else FAIL.
+#            landed = AMBER (the host's syscall filter, never red), anything else FAIL; and (Security 12940) the
+#            image's own entrypoint, started bare, writes that probe as its first stderr line and still refuses (78).
 #   rekey:   the image check (mediator-image-check.mjs rekey) on the shipped tool; in the image, with no network and
 #            a read-only root: `rekey` refuses while mediator_admin_credential is in the store, the removed
 #            subcommands answer "usage" (exit 2), and after the credential is gone `rekey` re-seals (old no longer
@@ -57,7 +58,7 @@ cp "$HERE/mediator-store.mjs" "$PL/opt/mediator-store.mjs"
 : > "$PL/usr/local/bin/mediator-setup"; : > "$PL/usr/bin/dbus-daemon"; : > "$PL/run/dbus/system_bus_socket"; : > "$PL/run/user/10001/bus"
 
 svc=0; node "$HERE/mediator-image-check.mjs" service "$W/svc-root" "$W/svc-inspect.json" "$PL" "$ODIR/service-image.json" || svc=$?
-rek=0; node "$HERE/mediator-image-check.mjs" rekey "$W/rek-root" "$W/rek-inspect.json" /opt/rekey/mediator-store.mjs "$ODIR/rekey-image.json" || rek=$?
+rek=0; node "$HERE/mediator-image-check.mjs" rekey "$W/rek-root" "$W/rek-inspect.json" /opt/rekey/mediator-store.mjs "$ODIR/rekey-image.json" "$PL" || rek=$?
 
 # --- the service binary in its image: libraries resolve, it runs
 ldd_out="$(docker run --rm --network none --entrypoint /usr/bin/ldd "$SVC" /opt/mediator/mediator 2>&1)"; ldd_rc=$?
@@ -75,6 +76,21 @@ probe_v="$(printf '%s' "$probe" | node -e '
     else if (both.every((x) => x === "refused" || x === "landed") && [j.session_removed, j.user_removed].every((x) => x !== false)) console.log("AMBER");
     else console.log("FAIL");
   });')"
+
+# --- Security 12940: the same probe through the image's OWN entrypoint, started with no arguments (it refuses
+# "missing --bin" after the probe, so nothing else runs). Its first stderr line must be the probe's JSON line:
+# refused = PASS, landed = AMBER, anything else (no line, absent, probe_failed) = FAIL, and the start still refuses 78.
+ep_rc=0; ep_err="$(docker run --rm --network none --read-only "$SVC" 2>&1 > /dev/null)" || ep_rc=$?
+ep_first="$(printf '%s\n' "$ep_err" | head -1)"
+ep_v="$(printf '%s' "$ep_first" | node -e '
+  let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+    let j; try { j = JSON.parse(s); } catch { console.log("FAIL"); return; }
+    if (j.entrypoint !== "keyring_probe") console.log("FAIL");
+    else if (j.verdict === "refused" && j.l8 === "PASS") console.log("PASS");
+    else if (j.verdict === "landed" && j.l8 === "AMBER") console.log("AMBER");
+    else console.log("FAIL");
+  });')"
+[ "$ep_rc" = 78 ] || ep_v=FAIL
 
 # --- the rekey image's behaviour, on a made-up store (the full source tool writes it here, on the runner, never in the image)
 D="$W/rekey-data"; PP="$(mktemp -d /dev/shm/rekeypp.XXXXXX)"; mkdir -p "$D"; chmod 0700 "$D" "$PP"
@@ -107,6 +123,7 @@ const lines = {
   service_libraries_resolve: P($ldd_rc === 0 && $missing === 0),
   service_mediator_help_runs: P($help === 0),
   service_keyring_probe: '$probe_v' || 'FAIL',
+  service_entrypoint_first_line_is_the_keyring_probe: '$ep_v' || 'FAIL',
   rekey_image_check: P(rek && rek.ok),
   rekey_refuses_while_admin_credential_present: P($r1 !== 0 && $r1_names_cred),
   rekey_removed_subcommands_answer_usage: P(Object.values(removed).length === 4 && Object.values(removed).every((c) => c === 2)),
@@ -118,6 +135,7 @@ const rec = {
   service_image_id: fs.readFileSync(w + '/svc.id', 'utf8').trim(), rekey_image_id: fs.readFileSync(w + '/rek.id', 'utf8').trim(),
   shipped_tool_sha256: rek && rek.shipped_sha256, ship_strip_sha256: ship && ship.sha256,
   keyring_probe: (() => { try { return JSON.parse(\`$probe\`); } catch { return null; } })(), keyring_probe_host: 'GitHub ubuntu-latest runner, Docker default seccomp',
+  entrypoint_probe_line: (() => { try { return JSON.parse(\`$ep_first\`); } catch { return null; } })(), entrypoint_exit: $ep_rc,
   removed_subcommand_exits: removed,
   rekey_calls: fs.readFileSync(w + '/rekey-calls.jsonl', 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)),
 };

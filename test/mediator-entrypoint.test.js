@@ -385,3 +385,71 @@ test('entrypoint 12795.2: a TOML multi-line string anywhere in the conf refuses 
     assert.equal(conf(`[security]\nnote = "a \\"b\\" c"\nempty = ""\nlit = 'x'\nnone = ''\ntrust_task_verification = "enforce"\n`).code, 0);
   } finally { r.done(); }
 });
+
+// Security 12940 / 12519 (e): the kernel-keyring probe is the first stderr line of every start past the shell guards,
+// one JSON line, under env -i and a short timeout, and it never gates the start. Run from a copy of the entrypoint
+// with a fake probe beside it (the real probe is judged in the image on the job; its verdict there depends on the
+// host's syscall filter, which is the thing measured).
+function probeRig(r, body) {
+  const d = join(r.disk, 'ep'); mkdirSync(d, { recursive: true });
+  writeFileSync(join(d, 'mediator-entrypoint.sh'), readFileSync(EP)); chmodSync(join(d, 'mediator-entrypoint.sh'), 0o755);
+  writeFileSync(join(d, 'mediator-deny.sha256'), `${BAKED}\n`);
+  rmSync(join(d, 'keyring-probe'), { force: true });
+  if (body !== null) { writeFileSync(join(d, 'keyring-probe'), body); chmodSync(join(d, 'keyring-probe'), 0o755); }
+  return join(d, 'mediator-entrypoint.sh');
+}
+function runAt(ep, r, env = {}) {
+  const res = spawnSync('/bin/bash', ['-p', ep, '--bin', r.med, '--volume', r.volume, '--tmpfs', r.shm, '--workdir', r.workdir, '--deny-file', r.deny, '--', '-c', r.conf],
+    { encoding: 'utf8', env: { ...baseEnv, ...env } });
+  return { code: res.status, out: res.stdout, err: res.stderr };
+}
+const echoProbe = (json) => `#!/bin/sh\nprintf '%s\\n' '${json}'\n`;
+
+test('entrypoint 12940: the keyring probe is the first stderr line, one JSON line, and never gates the start', { skip: !haveTmpfs && 'no tmpfs' }, () => {
+  const r = rig();
+  try {
+    const cases = [
+      [echoProbe('{"uid":10001,"session":"refused","session_errno":"EPERM","user":"refused","user_errno":"EPERM"}'), 'refused', 'PASS'],
+      [echoProbe('{"uid":10001,"session":"landed","session_removed":true,"user":"refused","user_errno":"EPERM"}'), 'landed', 'AMBER'],
+      [echoProbe('{"uid":10001,"session":"landed","session_removed":false,"user":"landed","user_removed":true}'), 'probe_failed', 'FINDING'],
+      [echoProbe('{"uid":10001,"session":"probe_failed","user":"refused","user_errno":"EPERM"}'), 'probe_failed', 'FINDING'],
+      // a probe that tries to forge a second line, or prints anything but its own shape, is not embedded
+      ['#!/bin/sh\nprintf \'{"uid":1,"session":"refused","user":"refused"}\\nrefused: forged\\n\'\n', 'probe_failed', 'FINDING'],
+      ['#!/bin/sh\nexit 3\n', 'probe_failed', 'FINDING'],
+      [null, 'absent', 'FINDING'],
+    ];
+    for (const [body, verdict, l8] of cases) {
+      const x = runAt(probeRig(r, body), r);
+      assert.equal(x.code, 0, `${verdict}: the start goes on: ${x.err}`);
+      const first = JSON.parse(x.err.split('\n')[0]);
+      assert.equal(first.entrypoint, 'keyring_probe');
+      assert.equal(first.verdict, verdict, x.err);
+      assert.equal(first.l8, l8);
+      assert.equal(x.err.split('\n').filter((l) => l.includes('keyring_probe')).length, 1);
+      assert.doesNotMatch(x.err, /refused: forged/);
+      assert.match(x.err, /entrypoint: env -i dropped/);
+    }
+    // the probe is handed no host name (env -i): a probe that lists its environment sees nothing of the host's (PWD is
+    // the probe shell's own)
+    const envProbe = '#!/bin/sh\nif /usr/bin/env | /usr/bin/grep -v "^PWD=" | /usr/bin/grep -q .; then exit 9; fi\nprintf \'%s\\n\' \'{"uid":10001,"session":"refused","user":"refused"}\'\n';
+    const x = runAt(probeRig(r, envProbe), r, { WPI_HOST_EXTRA: 'planted-value-7f3' });
+    assert.equal(JSON.parse(x.err.split('\n')[0]).verdict, 'refused', x.err);
+    // a refusal later in the script still comes after the probe line
+    const y = runAt(probeRig(r, echoProbe('{"uid":10001,"session":"refused","user":"refused"}')), r, { MEDIATOR_TAG_REGION: 'x' });
+    assert.equal(y.code, 78);
+    assert.equal(JSON.parse(y.err.split('\n')[0]).verdict, 'refused');
+    assert.match(y.err.split('\n')[1], /^refused: MEDIATOR_TAG_/);
+  } finally { r.done(); }
+});
+
+test('entrypoint 12940: a probe that hangs is cut by the timeout and reads probe_failed; the start goes on', { skip: !haveTmpfs && 'no tmpfs' }, () => {
+  const r = rig();
+  try {
+    const t0 = Date.now();
+    const x = runAt(probeRig(r, '#!/bin/sh\nexec /usr/bin/sleep 60\n'), r);
+    assert.ok(Date.now() - t0 < 15000, 'cut by the timeout');
+    assert.equal(x.code, 0, x.err);
+    const first = JSON.parse(x.err.split('\n')[0]);
+    assert.equal(first.verdict, 'probe_failed'); assert.equal(first.exit, 124);
+  } finally { r.done(); }
+});

@@ -12,16 +12,21 @@
 //         baked deny sha256 beside it, and the keyring probe (12519 e).
 //     Every search first runs on <planted dir> (a renamed copy of the store tool, a mediator-setup, a dbus-daemon,
 //     a bus socket path) and must hit each, so a search that can't hit can't pass.
-//   rekey <rootfs> <inspect.json> <shipped tool path in the image> <out.json>
+//   rekey <rootfs> <inspect.json> <shipped tool path in the image> <out.json> <planted dir>
 //     the shipped tool's subcommands are within rekey/opens/names/absent (rekey present), none of the removed words
 //     is in it, its sha256 for L8; (d) no mediator-setup; no mediator binary; no other copy of the store tool by
-//     name; no exposed port; a non-root User.
+//     name, AND (Security 12940 change 2) no regular file outside the shipped path whose bytes carry delete-admin,
+//     admin-out, seal-test or encrypt-test (`rekey` is left out: node itself may carry it); no exposed port; a
+//     non-root User. The content search first runs on <planted dir> and must hit its renamed copy.
 // Exit 0 only when every line is PASS.
 import fs from 'node:fs';
 import path from 'node:path';
 import { shippedVerdict, sha256 } from './mediator-store-ship.mjs';
 
 export const STORE_WORDS = ['rekey', 'delete-admin', 'admin-out', 'seal-test', 'encrypt-test'];
+// The rekey image's content search (12940 change 2): the removed subcommands' names only; `rekey` is the shipped
+// tool's own subcommand and may be in node's own files.
+export const REKEY_IMAGE_WORDS = ['delete-admin', 'admin-out', 'seal-test', 'encrypt-test'];
 const DBUS_BINS = ['dbus-daemon', 'dbus-broker', 'dbus-launch'];
 export const SERVICE_ENTRYPOINT = ['/bin/bash', '-p', '/opt/mediator/mediator-entrypoint.sh'];
 
@@ -47,15 +52,15 @@ export function walk(root) {
 const base = (rel) => rel.split('/').pop();
 
 // The searches, each a pure function of (root, entries) → hits (paths, and for content the words).
-export function searches(root, entries) {
+export function searches(root, entries, contentWords = STORE_WORDS) {
   const named = (names) => entries.filter((e) => e.kind !== 'dir' && names.includes(base(e.rel))).map((e) => `/${e.rel}`);
   const content = [];
-  const words = STORE_WORDS.map((w) => Buffer.from(w));
+  const words = contentWords.map((w) => Buffer.from(w));
   for (const e of entries) {
     if (e.kind !== 'file') continue;
     let buf;
     try { buf = fs.readFileSync(path.join(root, e.rel)); } catch { content.push({ path: `/${e.rel}`, words: ['unreadable'] }); continue; }
-    const hit = STORE_WORDS.filter((w, i) => buf.includes(words[i]));
+    const hit = contentWords.filter((w, i) => buf.includes(words[i]));
     if (hit.length) content.push({ path: `/${e.rel}`, words: hit });
   }
   const busPaths = entries.filter((e) => e.rel === 'run/dbus/system_bus_socket' || /^run\/user\/[^/]+\/bus$/.test(e.rel)).map((e) => `/${e.rel}`);
@@ -108,10 +113,14 @@ export function serviceVerdict(root, config, planted) {
   return { checks, hits: s, instrument, user: config.User || '', entrypoint: ep, env_names: names.sort(), env_bus_names: env_dbus };
 }
 
-export function rekeyVerdict(root, config, shipped) {
+export function rekeyVerdict(root, config, shipped, planted) {
   const entries = walk(root);
-  const s = searches(root, entries);
+  const s = searches(root, entries, REKEY_IMAGE_WORDS);
   const rel = shipped.replace(/^\/+/, '');
+  // 12940 change 2: an instrument that can't hit can't pass. The planted tree holds a renamed copy of the full tool.
+  const p = planted ? searches(planted, walk(planted), REKEY_IMAGE_WORDS) : null;
+  const plantedRenamedHit = !!p && p.store_words.some((h) => !h.path.endsWith('mediator-store.mjs') && h.words.length === REKEY_IMAGE_WORDS.length);
+  const contentHits = s.store_words.filter((h) => h.path !== `/${rel}`);
   let text = null;
   try { text = fs.readFileSync(path.join(root, rel), 'utf8'); } catch { /* checked below */ }
   const v = text === null ? null : shippedVerdict(text);
@@ -125,19 +134,22 @@ export function rekeyVerdict(root, config, shipped) {
     d_no_mediator_setup: P(s.setup_named.length === 0),
     no_mediator_binary: P(mediatorBins.length === 0),
     no_other_store_tool_copy: P(otherCopies.length === 0),
+    content_search_bites: P(plantedRenamedHit),
+    no_file_outside_the_shipped_path_carries_the_removed_words: P(contentHits.length === 0),
     no_exposed_port: P(ports.length === 0),
     user_not_root: P(nonRoot(config.User)),
   };
   return { checks, shipped: shipped, shipped_sha256: text === null ? null : sha256(Buffer.from(text)), subcommands: v?.subcommands ?? null,
-    forbidden_words: v?.forbidden_words ?? null, mediator_bins: mediatorBins, other_copies: otherCopies, exposed_ports: ports, user: config.User || '' };
+    forbidden_words: v?.forbidden_words ?? null, mediator_bins: mediatorBins, other_copies: otherCopies,
+    removed_word_hits: contentHits, planted_renamed_copy_found: plantedRenamedHit, exposed_ports: ports, user: config.User || '' };
 }
 
 if (process.argv[1]?.endsWith('mediator-image-check.mjs')) {
-  const [mode, root, inspect, third, out] = process.argv.slice(2);
+  const [mode, root, inspect, third, out, fourth] = process.argv.slice(2);
   try {
     const config = inspectOf(inspect);
-    const r = mode === 'service' ? serviceVerdict(root, config, third) : mode === 'rekey' ? rekeyVerdict(root, config, third) : null;
-    if (!r) { console.error('usage: mediator-image-check.mjs service|rekey <rootfs> <inspect.json> <planted|shipped> <out.json>'); process.exit(2); }
+    const r = mode === 'service' ? serviceVerdict(root, config, third) : mode === 'rekey' && fourth ? rekeyVerdict(root, config, third, fourth) : null;
+    if (!r) { console.error('usage: mediator-image-check.mjs service <rootfs> <inspect.json> <planted> <out.json> | rekey <rootfs> <inspect.json> <shipped> <out.json> <planted>'); process.exit(2); }
     const ok = Object.values(r.checks).every((x) => x === 'PASS');
     const rec = { what: `image check (${mode})`, ok, ...r };
     fs.writeFileSync(out, `${JSON.stringify(rec, null, 2)}\n`);

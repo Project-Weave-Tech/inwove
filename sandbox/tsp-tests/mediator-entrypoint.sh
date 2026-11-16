@@ -90,13 +90,40 @@ unset _odd
 for _n in "${HOST_NAMES[@]}"; do [ "$_n" != PATH ] && export -n "$_n"; done
 unset _n
 export LC_ALL=C
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# Security 12940 / 12519 (e): the kernel-keyring probe, the first line of every start that gets past the shell
+# guards above (builtins only, so they stay first). What it measures is the HOST's syscall filter, which can change
+# under us, so every real start re-proves it and the dry first start reads it; there is no separate one-off. It runs
+# before anything reads the passphrase or a secret, under `env -i` (it is handed no host name at all) with a short
+# timeout, and it NEVER gates the start: it writes one JSON line to stderr and the script carries on.
+#   verdict refused      both add_key calls refused (the guard holds)             l8 PASS
+#   verdict landed       an add landed and was removed (the host lets it through)  l8 AMBER → SECURITY
+#   verdict probe_failed it ran but timed out, failed, or printed the wrong shape  l8 FINDING
+#   verdict absent       no probe beside the entrypoint                            l8 FINDING
+# The probe's own line is embedded only when it is exactly the shape keyring-probe.c prints (no value, id or
+# description is ever in it), so nothing it prints can forge a second line.
+kr_rc=0; kr_out=; kr_verdict=absent
+if [ -x "$HERE/keyring-probe" ] && [ ! -L "$HERE/keyring-probe" ]; then
+  kr_out="$(/usr/bin/env -i /usr/bin/timeout -k 1 5 "$HERE/keyring-probe" 2> /dev/null)" || kr_rc=$?
+  if [ "$kr_rc" -ne 0 ] || ! [[ "$kr_out" =~ ^\{\"uid\":[0-9]+(,\"[a-z_]+\":(\"[A-Za-z_]+\"|true|false))+\}$ ]]; then
+    kr_verdict=probe_failed; kr_out=
+  elif [[ "$kr_out" == *'"session":"refused"'* && "$kr_out" == *'"user":"refused"'* ]]; then
+    kr_verdict=refused
+  elif [[ "$kr_out" =~ \"session\":\"(refused|landed)\" && "$kr_out" =~ \"user\":\"(refused|landed)\" && "$kr_out" != *'_removed":false'* ]]; then
+    kr_verdict=landed
+  else
+    kr_verdict=probe_failed
+  fi
+fi
+case "$kr_verdict" in refused) kr_l8=PASS ;; landed) kr_l8=AMBER ;; *) kr_l8=FINDING ;; esac
+printf '{"entrypoint":"keyring_probe","verdict":"%s","l8":"%s","exit":%d,"probe":%s}\n' "$kr_verdict" "$kr_l8" "$kr_rc" "${kr_out:-null}" >&2
+unset kr_rc kr_out kr_verdict kr_l8
 PASSPHRASE_SOURCE=ENKARA_MEDIATOR_BACKEND_PASSPHRASE
 PINNED_RUST_LOG='info,affinidi_messaging_mediator::common::config=warn'   # condition 15's pinned filter (line D)
 ALLOW=(DATABASE_URL MEDIATOR_FILE_BACKEND_PASSPHRASE_FILE RUST_LOG)          # the record's allow side (L8)
 # The record's floor deny names (bus 12048/12079.1), held here too so a deny file that lost one refuses by name.
 FLOOR_DENY=(MEDIATOR_ACL_MODE BLOCK_REMOTE_ADMIN_MSGS ENABLE_INTER_MEDIATOR_RELAY PROCESSOR_FORWARDING_EXTERNAL
             GLOBAL_DEFAULT_ACL ADMIN_DID MEDIATOR_SECRETS_BACKEND MEDIATOR_FILE_BACKEND_PASSPHRASE)
-HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 bin= volume= tmpfs= workdir= denyfile= pathhome=0
 while [ $# -gt 0 ]; do

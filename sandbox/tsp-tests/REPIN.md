@@ -40,7 +40,12 @@ the host only when every step below holds on the new pin, in one job run, and Se
     `rekey`/`delete-admin`/`admin-out`/`seal-test`/`encrypt-test`, no D-Bus daemon/broker/launcher or bus path, and
     names no `DBUS_*`/`XDG_RUNTIME_DIR`. The rekey image's shipped tool has only `rekey`/`opens`/`names`/`absent`;
     its sha256 goes in L8. A hit in a file we didn't put there is a finding for SECURITY, never a word to drop. Both
-    base images are pinned by digest; a re-pin re-reads them.
+    base images are pinned by digest; a re-pin re-reads them. (Security 12940:) the shipped tool holds no `getEntry`
+    (the one-value open, dropped with `admin-out`; it is on `SHIPPED_FORBIDDEN`), and no file in the rekey image
+    outside the shipped path carries `delete-admin`/`admin-out`/`seal-test`/`encrypt-test`, after that search hits
+    the planted renamed copy. The service image's own entrypoint, started bare, writes the keyring probe as its first
+    stderr line (refused = PASS, landed = AMBER → SECURITY, absent/`probe_failed`/no line = a finding) and still
+    refuses 78. The probe never gates a start; the host's dry first start reads the same line.
 11. **The conf shapes the entrypoint refuses still match the parser** (Security 12795.2, 12892.3): at each re-pin
     read the mediator's `toml` version in its `Cargo.lock` and `SecurityConfigRaw` (`affinidi-messaging-mediator-config/src/security.rs`).
     The entrypoint refuses `"""`/`'''` anywhere and a `{`/`}` on any non-comment line, because a multi-line string or a

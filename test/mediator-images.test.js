@@ -113,23 +113,48 @@ test('service image check: a renamed copy, one word in any file, a bus name in E
 test('rekey image check: reads the shipped file in the image; the source shipped, a mediator binary, a port or a second copy are red', () => {
   const REK = { User: '1000:1000', Entrypoint: ['node', '/opt/rekey/mediator-store.mjs'] };
   const mk = (body) => { const r = tmp(); put(r, 'opt/rekey/mediator-store.mjs', body); put(r, 'usr/local/bin/node', 'ELF'); return r; };
+  const p = planted();
   const ok = mk(strip(SRC));
   try {
-    const v = rekeyVerdict(ok, REK, '/opt/rekey/mediator-store.mjs');
+    const v = rekeyVerdict(ok, REK, '/opt/rekey/mediator-store.mjs', p);
     assert.ok(Object.values(v.checks).every((x) => x === 'PASS'), JSON.stringify(v.checks));
     assert.deepEqual(v.subcommands, ['absent', 'names', 'opens', 'rekey']);
     assert.match(v.shipped_sha256, /^[0-9a-f]{64}$/);
-    assert.equal(rekeyVerdict(ok, { ...REK, ExposedPorts: { '7037/tcp': {} } }, '/opt/rekey/mediator-store.mjs').checks.no_exposed_port, 'FAIL');
-    assert.equal(rekeyVerdict(ok, REK, '/opt/rekey/missing.mjs').checks.shipped_tool_present, 'FAIL');
+    assert.equal(rekeyVerdict(ok, { ...REK, ExposedPorts: { '7037/tcp': {} } }, '/opt/rekey/mediator-store.mjs', p).checks.no_exposed_port, 'FAIL');
+    assert.equal(rekeyVerdict(ok, REK, '/opt/rekey/missing.mjs', p).checks.shipped_tool_present, 'FAIL');
   } finally { rmSync(ok, { recursive: true, force: true }); }
   const src = mk(SRC);
   try {
-    const c = rekeyVerdict(src, REK, '/opt/rekey/mediator-store.mjs').checks;
+    const c = rekeyVerdict(src, REK, '/opt/rekey/mediator-store.mjs', p).checks;
     assert.equal(c.shipped_subcommands_within_rekey_opens_names_absent, 'FAIL');
     assert.equal(c.shipped_file_has_no_removed_words, 'FAIL');
   } finally { rmSync(src, { recursive: true, force: true }); }
   for (const [line, extra] of [['no_mediator_binary', 'opt/mediator/mediator'], ['d_no_mediator_setup', 'usr/bin/mediator-setup'], ['no_other_store_tool_copy', 'tmp/mediator-store.mjs']]) {
     const r = mk(strip(SRC));
-    try { put(r, extra, 'x'); assert.equal(rekeyVerdict(r, REK, '/opt/rekey/mediator-store.mjs').checks[line], 'FAIL', line); } finally { rmSync(r, { recursive: true, force: true }); }
+    try { put(r, extra, 'x'); assert.equal(rekeyVerdict(r, REK, '/opt/rekey/mediator-store.mjs', p).checks[line], 'FAIL', line); } finally { rmSync(r, { recursive: true, force: true }); }
   }
+  // Security 12940 change 2: a renamed copy, or one removed word in any file outside the shipped path, is red; `rekey`
+  // alone (node may carry it) is not; and a content search that can't hit its planted copy can't pass.
+  for (const [body, red] of [[SRC, true], ['see admin-out', true], ['call encrypt-test', true], ['node: rekey of a buffer', false]]) {
+    const r = mk(strip(SRC));
+    try {
+      put(r, 'usr/lib/node/renamed.js', body);
+      const v = rekeyVerdict(r, REK, '/opt/rekey/mediator-store.mjs', p);
+      assert.equal(v.checks.no_file_outside_the_shipped_path_carries_the_removed_words, red ? 'FAIL' : 'PASS', body.slice(0, 20));
+      assert.equal(v.checks.content_search_bites, 'PASS');
+    } finally { rmSync(r, { recursive: true, force: true }); }
+  }
+  const empty = tmp(), clean = mk(strip(SRC));
+  try {
+    assert.equal(rekeyVerdict(clean, REK, '/opt/rekey/mediator-store.mjs', empty).checks.content_search_bites, 'FAIL');
+    assert.equal(rekeyVerdict(clean, REK, '/opt/rekey/mediator-store.mjs').checks.content_search_bites, 'FAIL');
+  } finally { for (const d of [empty, clean, p]) rmSync(d, { recursive: true, force: true }); }
+});
+
+test('ship: getEntry (the one-value open) is dropped with admin-out, and a getEntry left outside a drop block is red (Security 12940 change 1)', () => {
+  assert.ok(SRC.includes('export function getEntry'));
+  assert.ok(!strip(SRC).includes('getEntry'));
+  const leaked = strip(SRC).replace('function writeAtomic(', 'export function getEntry(j) { return j; }\n\nfunction writeAtomic(');
+  assert.deepEqual(shippedVerdict(leaked).forbidden_words, ['getEntry']);
+  assert.equal(shippedVerdict(leaked).ok, false);
 });

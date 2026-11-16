@@ -12,7 +12,9 @@ import crypto from 'node:crypto';
 // The subcommands the shipped tool may have, and the words that must not appear in it at all (12422: "removed from
 // the shipped file, not disabled").
 export const SHIPPED_ALLOWED = ['absent', 'names', 'opens', 'rekey'];
-export const SHIPPED_FORBIDDEN = ['admin-out', 'delete-admin', 'seal-test', 'encrypt-test', 'deleteAdmin', 'sealTest'];
+// `getEntry` (Security 12940 change 1): the one primitive that hands back a single decrypted value; only admin-out
+// uses it, so it is dropped with admin-out, and a re-pin that moves it out of a drop block goes red here.
+export const SHIPPED_FORBIDDEN = ['admin-out', 'delete-admin', 'seal-test', 'encrypt-test', 'deleteAdmin', 'sealTest', 'getEntry'];
 
 export function strip(src) {
   const out = [];
