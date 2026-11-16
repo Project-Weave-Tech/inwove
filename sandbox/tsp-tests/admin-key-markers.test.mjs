@@ -77,3 +77,12 @@ test('admin keys: the CLI writes markers + one planted file per marker kind, and
     assert.ok(!out.includes(cred.private_key_multibase));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('admin keys: the credential as admin-out writes it (the sealed Envelope, data = AdminCredential) is unwrapped', () => {
+  const { cred } = fresh();
+  const env = { version: 1, kind: 'admin-credential', data: cred, created_at: 1 };
+  const m = markers(env);
+  assert.equal(m.every_document_key_held, true);
+  assert.deepEqual(m.kinds, ['ed25519', 'x25519']);
+  assert.ok(m.markers.includes(cred.private_key_multibase));
+});

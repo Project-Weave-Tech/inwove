@@ -115,7 +115,10 @@ PLANT="$SHM/planted"
 // without its multibase prefix, and the credential JSON itself. Not the DID: that is public and may be logged.
 const fs = require("fs"); const out = [];
 let raw = ""; try { raw = fs.readFileSync(process.argv[1], "utf8"); } catch {}
-try { const k = String(JSON.parse(raw).private_key_multibase || ""); if (k.length >= 16) out.push(k, k.slice(1)); } catch {}
+// admin-out writes the sealed entry, Envelope { version, kind, data, created_at } (envelope.rs:25-36): the key is
+// data.private_key_multibase. (Before w-1116-0433 this read the top level only, so the key value itself was never a
+// marker; only the whole JSON line was.)
+try { const j = JSON.parse(raw); const c = j && j.kind === "admin-credential" && j.data ? j.data : j; const k = String(c.private_key_multibase || ""); if (k.length >= 16) out.push(k, k.slice(1)); } catch {}
 const line = raw.trim(); if (line.length >= 16 && !line.includes("\n")) out.push(line);
 fs.writeFileSync(process.argv[2], [...new Set(out)].join("\n") + (out.length ? "\n" : ""));
 ' "$ADMIN_OUT" "$MARKS" )

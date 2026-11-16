@@ -75,9 +75,12 @@ export function profileSecrets(v, out = []) {
   return out
 }
 
+export const unwrap = (c) => (c && typeof c === 'object' && c.kind === 'admin-credential' && c.data && typeof c.data === 'object' ? c.data : c)
+
 // The admin DID's keys, each matched to a private key the credential yields. Red when a key in the document
 // matches none: then a private key lives somewhere the credential doesn't, and the job is red until it's found.
 export function adminKeys(cred) {
+  cred = unwrap(cred)
   const did = String(cred?.did ?? '')
   const seed = seedOf(cred?.private_key_multibase)
   const doc = docOf(did)
@@ -120,6 +123,9 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     try { text = readFileSync(credPath, 'utf8') } catch { throw new KeyError('credential-unreadable') }
     try { cred = JSON.parse(text) } catch { throw new KeyError('credential-not-json', { bytes: text.length }) }
     if (!cred || typeof cred !== 'object') throw new KeyError('credential-not-an-object')
+    // admin-out writes the store's entry as sealed: Envelope { version, kind: "admin-credential", data, created_at }
+    // (secrets/envelope.rs:25-36, well_known.rs:85,454); the AdminCredential is its `data`.
+    cred = unwrap(cred)
     const fields = Object.keys(cred).sort()
     if (typeof cred.did !== 'string' || !('private_key_multibase' in cred)) throw new KeyError('credential-shape', { fields })
     let profile = null
