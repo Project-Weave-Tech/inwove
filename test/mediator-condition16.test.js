@@ -90,6 +90,33 @@ test('features, setup binary (Security 12277): vta-sdk is expected; its own vta/
   assert.equal(clean(tree + '│   ├── rcgen feature "aws_lc_rs"\n│   │   └── aws-lc-rs v1.13.0\n'), true, 'rcgen/rustls crypto is not the AWS SDK');
 });
 
+test('features (Security 12391.1): in setup mode only vta-sdk is expected; any other vta* crate fails', () => {
+  const tree = 'affinidi-messaging-mediator-setup v0.50.0 (/w/med/tools/mediator-setup)\n├── vta-sdk v0.77.1\n├── tokio v1.0.0\n';
+  const v = (t) => verdict(t, { setup: true, root: [] });
+  assert.equal(v(tree).clean, true);
+  assert.equal(v(tree + '│   ├── vta-secrets v0.1.0\n').clean, false, 'a new vta-* backend crate goes red');
+  assert.deepEqual(v(tree + '│   ├── vta-secrets v0.1.0\n').hits, { 'crate vta-secrets': 1 });
+  assert.equal(v(tree + '├── vta v0.1.0\n').clean, false);
+  assert.equal(verdict(tree.replace('vta-sdk', 'vta-sdk-extra')).clean, false);
+});
+
+test('features (Security 12391.2): secret-store backend crates fail in both modes; the named non-store crates pass', () => {
+  const lean = 'affinidi-messaging-mediator v0.50.0 (/w/med/crates/x)\n├── affinidi-secrets-resolver v0.5.4\n├── crypto_secretbox v0.1.1\n'
+    + '├── dbus-secret-service-keyring-store v1.0.1\n│   ├── dbus-secret-service v4.1.0\n│   └── keyring-core v1.0.1\n';
+  const setup = lean.replace('affinidi-messaging-mediator v0.50.0', 'affinidi-messaging-mediator-setup v0.50.0') + '├── vta-sdk v0.77.1\n';
+  for (const [name, t, o] of [['lean', lean, {}], ['setup', setup, { setup: true }]]) {
+    assert.equal(verdict(t, o).clean, true, `${name}: the crates read at 34bbdea4 and named are not stores`);
+    for (const c of ['foo-secrets-bar v1.0.0', 'vta-secrets v0.1.0', 'some_secret_store v2.0.0', 'vaultrs v0.7.0', 'rustify v0.6.0',
+      'kube v0.99.0', 'kube-client v0.99.0', 'k8s-openapi v0.25.0', 'azure_identity v0.27.0', 'azure_security_keyvault_secrets v0.6.0',
+      'google-cloud-secretmanager-v1 v1.0.0', 'google-cloud-gax v1.0.0', 'aws-sdk-secretsmanager v1.0.0',
+      'linux-keyutils-keyring-store v1.0.0', 'apple-native-keyring-store v1.0.0']) {
+      assert.equal(verdict(t + `│   ├── ${c}\n`, o).clean, false, `${name}: ${c}`);
+    }
+  }
+  assert.equal(verdict(lean + '│   ├── affinidi-messaging-mediator-common feature "secrets-keyring"\n').clean, false);
+  assert.deepEqual(verdict(lean + '│   ├── aws-sdk-secretsmanager v1.0.0\n').hits, { 'crate aws-sdk-secretsmanager': 1 }, 'counted once');
+});
+
 test('features: the record hash does not depend on where the checkout sits', () => {
   const t = (p) => `affinidi-messaging-mediator v0.50.0 (${p}/crates/x)\n`;
   assert.equal(normalise(t('/a/med'), '/a/med'), normalise(t('/b/other'), '/b/other'));

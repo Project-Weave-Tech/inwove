@@ -6,12 +6,20 @@
 //
 // `cargo tree` does not print the root crate's own features on its root line, so a default build (which has `vta`)
 // shows no `feature "vta"` line at all: what shows is the `vta-sdk` crate that feature pulls in. The check therefore
-// fails on either sign: a `feature "vta"` / `feature "secrets-..."` edge, or a crate named `vta-*` / `*-secrets-*`
-// backend crate in the tree. The job also runs this on the default build as a control, which must FAIL (a check that
-// can't fail isn't evidence).
+// fails on either sign: a `feature "vta"` / `feature "secrets-..."` edge, or a crate in the tree that is a `vta*`
+// crate or a secret-store backend crate. The job also runs this on the default build as a control, which must FAIL
+// (a check that can't fail isn't evidence).
+//
+// Secret-store backend crates (Security 12391.2), both modes: (i) the crates each `secrets-*` feature of
+// mediator-common pulls at the pin (BACKEND_CRATES), and (ii) any crate whose name holds `secret`, unless it is one
+// of the exact names in SECRET_NAMED_OK (which also holds `keyring-core`, see there), each read at 34bbdea4 with
+// `cargo tree -i` and found not to be a store backend. A literal `*-secrets-*` glob can't be used:
+// `affinidi-secrets-resolver` is a plain dependency of every build. A new secret-named crate at a future pin goes
+// red until it is read and named there.
 //
 // The setup binary (Security 12277, the setup binary row): `vta-sdk` is a plain dependency of mediator-setup at this
-// pin, so its crate is expected and does not count; what fails there is the setup crate's own `vta*`/`secrets-*`/
+// pin, so that one crate is expected and does not count, while any other `vta*` crate does (Security 12391.1: a new
+// `vta-*` backend crate arriving at a future pin goes red); what fails there is the setup crate's own `vta*`/`secrets-*`/
 // `publish-aws` feature (read from its root line, `cargo tree --depth 0 -f '{p}|{f}'`, since the tree itself never
 // shows the root's features), any `feature "vta*"`/`"secrets-*"`/`"aws"` edge, or an `aws-config`/`aws-sdk-*` crate:
 // the admin credential must never have a cloud road out of the setup binary. Its control is the setup crate's
@@ -33,16 +41,35 @@ export function rootFeatures(line) {
   return f.split(',').map((x) => x.trim()).filter(Boolean).sort();
 }
 
+// Read at 34bbdea4 with `cargo tree -i <name>` on the lean and setup builds. Exact names only; each says why it isn't a store.
+export const SECRET_NAMED_OK = new Map([
+  ['affinidi-secrets-resolver', 'the in-memory DID key resolver every affinidi crate (and vta-sdk) uses; holds no store'],
+  ['crypto_secretbox', 'XSalsa20-Poly1305, used by affinidi-tsp and affinidi-messaging-didcomm-v1 for sealing messages'],
+  ['dbus-secret-service', 'pulled only by dbus-secret-service-keyring-store (next line)'],
+  ['dbus-secret-service-keyring-store', "affinidi-tdk-common's default client keyring, via affinidi-messaging-sdk; not mediator-common's secrets-keyring backend"],
+  // keyring-core has no `secret` in its name but is also in BACKEND_CRATES' list (secrets-keyring pulls it). At the pin
+  // it is in EVERY build, lean included, through affinidi-tdk-common's default features (with the dbus store above),
+  // so it can't be the sign of the backend; the backend is told apart by its own two store crates and its feature edge.
+  ['keyring-core', 'affinidi-tdk-common default (client keyring) in every build at the pin; secrets-keyring is caught by linux-keyutils-/apple-native-keyring-store and `feature "secrets-keyring"`'],
+]);
+// The crates mediator-common's `secrets-keyring|aws|gcp|azure|vault|k8s` features pull at the pin (its Cargo.toml).
+export const BACKEND_CRATES = /^(?:apple-native-keyring-store|linux-keyutils-keyring-store|aws-sdk-secretsmanager|google-cloud-secretmanager[\w-]*|google-cloud-gax|azure_[\w-]+|vaultrs|rustify|kube(?:-[\w-]+)?|k8s-openapi)$/;
+
+export function crateHit(name, { setup = false } = {}) {
+  if (/^vta[\w-]*$/.test(name)) return !(setup && name === 'vta-sdk');
+  // `aws` gates the mediator's AWS_REGION read (config/mod.rs, bus 12079.5): its sign is the feature edge or the AWS
+  // SDK crates it pulls in. (`aws-lc-rs` is rustls' crypto, not the SDK, and doesn't count.)
+  if (/^(?:aws-config|aws-sdk-[\w-]+)$/.test(name)) return true;
+  if (SECRET_NAMED_OK.has(name)) return false;
+  return BACKEND_CRATES.test(name) || /secret/i.test(name);
+}
+
 export function verdict(tree, { setup = false, root = [] } = {}) {
   const hits = new Map();
   const add = (k) => hits.set(k, (hits.get(k) ?? 0) + 1);
-  for (const m of tree.matchAll(/feature "(vta[^"]*|secrets-[^"]*)"/g)) add(`feature ${m[1]}`);
-  if (!setup) for (const m of tree.matchAll(/(?:^|[\s│├└─])(vta[\w-]*) v\d/gm)) add(`crate ${m[1]}`);
+  for (const m of tree.matchAll(/feature "(vta[^"]*|secrets-[^"]*|aws)"/g)) add(`feature ${m[1]}`);
+  for (const m of tree.matchAll(/(?:^|[\s│├└─])([A-Za-z0-9_][\w-]*) v\d/gm)) if (crateHit(m[1], { setup })) add(`crate ${m[1]}`);
   for (const f of root) if (/^(vta|secrets-|publish-aws$|aws$)/.test(f)) add(`root feature ${f}`);
-  // `aws` gates the mediator's AWS_REGION read (config/mod.rs, bus 12079.5): its sign is the feature edge or the AWS
-  // SDK crates it pulls in. (`aws-lc-rs` is rustls' crypto, not the SDK, and doesn't count.)
-  for (const m of tree.matchAll(/feature "(aws)"/g)) add(`feature ${m[1]}`);
-  for (const m of tree.matchAll(/(?:^|[\s│├└─])(aws-config|aws-sdk-[\w-]+) v\d/gm)) add(`crate ${m[1]}`);
   const lines = tree.split('\n').filter((l) => l.trim()).length;
   return { lines, hits: Object.fromEntries([...hits].sort()), clean: hits.size === 0 && lines > 0 };
 }
