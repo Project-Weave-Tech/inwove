@@ -24,6 +24,7 @@ function rig() {
     + 'if [ "$(/bin/cat "$MEDIATOR_FILE_BACKEND_PASSPHRASE_FILE")" = "test-only-marker" ]; then echo "passfile ok"; fi\necho "cwd $(pwd)"\n');
   chmodSync(med, 0o755);
   const volume = join(disk, 'volume'); mkdirSync(volume);
+  writeFileSync(join(volume, 'secrets.json'), JSON.stringify({ entries: { mediator_jwt_secret: 'dGVzdA', mediator_operating_secrets: 'dGVzdA' } }));
   const workdir = join(disk, 'work'); mkdirSync(workdir);
   const deny = join(disk, 'deny.txt'); writeFileSync(deny, denyFileText(RECORD));
   return { disk, shm, med, volume, workdir, deny, done: () => { rmSync(disk, { recursive: true, force: true }); rmSync(shm, { recursive: true, force: true }); } };
@@ -73,7 +74,7 @@ test('entrypoint: refuses a non-tmpfs dir, one on the volume\'s filesystem, a sy
   try {
     const plain = join(r.disk, 'plain'); mkdirSync(plain);
     refused(run(r, { tmpfs: plain }), 'not tmpfs');
-    const vol2 = join(r.shm, 'vol'); mkdirSync(vol2);
+    const vol2 = join(r.shm, 'vol'); mkdirSync(vol2); writeFileSync(join(vol2, 'secrets.json'), JSON.stringify({ entries: {} }));
     refused(run(r, { volume: vol2 }), "on the volume's filesystem");
     const link = join(r.disk, 'link'); symlinkSync(r.shm, link);
     refused(run(r, { tmpfs: link }), 'tmpfs dir is a symlink');
@@ -150,5 +151,22 @@ test('entrypoint: one start line names what env -i dropped, never a value (12144
     for (const v of ['planted-value-7f3', 'test-only-marker', 'redis://test-only', '8080']) {
       assert.ok(!x.out.includes(v) && !x.err.includes(v), `value ${v} never printed`);
     }
+  } finally { r.done(); }
+});
+
+test('entrypoint: 16.3(b) refuses a store that names mediator_admin_credential, and a missing or linked store', { skip: !haveTmpfs && 'no tmpfs' }, () => {
+  const r = rig();
+  try {
+    const store = join(r.volume, 'secrets.json');
+    writeFileSync(store, JSON.stringify({ entries: { mediator_admin_credential: 'dGVzdA', mediator_jwt_secret: 'dGVzdA' } }));
+    refused(run(r), 'mediator_admin_credential is in the secret backend');
+    // the encrypted shape names it in plaintext too: no passphrase needed to see it
+    writeFileSync(store, JSON.stringify({ version: 1, kdf: {}, verifier_b64: 'x', verifier_nonce_b64: 'x', entries: { mediator_admin_credential: { nonce_b64: 'x', ciphertext_b64: 'x' } } }));
+    refused(run(r), 'mediator_admin_credential is in the secret backend');
+    rmSync(store);
+    refused(run(r), 'no secret store on the volume');
+    writeFileSync(join(r.disk, 'real.json'), JSON.stringify({ entries: {} }));
+    symlinkSync(join(r.disk, 'real.json'), store);
+    refused(run(r), 'the secret store is a symlink');
   } finally { r.done(); }
 });

@@ -23,6 +23,11 @@
 #     mode 0700 or narrower (12144.3b: no co-tenant gap between the rm and the write); the passphrase file already
 #     exists as a symlink, or ends up wider than 0400 or not owned by this user (2ii)
 #   - the working directory isn't an empty directory (Q1: no decoy file for a working-dir fallback)
+#   - 16.3(b): the backend's own storage (`<volume>/secrets.json`) names `mediator_admin_credential` at all, public or
+#     private. Entry names are plaintext in both file shapes, so this needs no passphrase. Fail closed: the bare name
+#     anywhere in the file refuses (values are base64url, so it can only appear as an entry name).
+#   - the store file is missing, a symlink or not a regular file: the encrypted backend CREATES an empty store when
+#     its file is absent (file_encrypted.rs open → init_new), so a lost volume must stop the start, never be replaced
 # Host names on no list (the platform's own, e.g. its PORT) are not refused: `env -i` drops them, and one start line
 # on stderr says which, by NAME only and never a value (12144.3c, charter §9: drift shows in the log, not nowhere).
 set -uo pipefail
@@ -67,6 +72,11 @@ done < "$denyfile"
 # 12144.2: the families the mediator and its clients read, beyond the allow list
 fam="$(compgen -e | grep -E '^(MEDIATOR_|VAULT_|AWS_)' | grep -vxF -f <(printf '%s\n' "${ALLOW[@]}") || true)"
 [ -z "$fam" ] || refuse "host names in the MEDIATOR_/VAULT_/AWS_ families not on the allow list: $(echo $fam)"
+# 16.3(b): the admin credential is absent from the backend's own storage; the store is there and is ours
+store="$volume/secrets.json"
+[ -L "$store" ] && refuse "the secret store is a symlink"
+[ -f "$store" ] || refuse "no secret store on the volume (the backend would create an empty one)"
+! grep -qF '"mediator_admin_credential"' "$store" || refuse "mediator_admin_credential is in the secret backend"
 # required values
 [ -n "${DATABASE_URL:-}" ] || refuse "DATABASE_URL is missing"
 [ -n "${!PASSPHRASE_SOURCE:-}" ] || refuse "$PASSPHRASE_SOURCE is missing"

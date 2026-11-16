@@ -77,6 +77,10 @@ start() {
   cat "$WORK/$label.json"
 }
 
+# 16.3(b) on the real store: upstream's TEST-ONLY secrets.json carries mediator_admin_credential, so the entrypoint
+# must refuse it as it comes; then the surgical delete (mediator-store.mjs), and only then the starts below.
+start refuse-admin-credential
+node "$HERE/mediator-store.mjs" delete-admin "$VOL/secrets.json" > "$WORK/delete-admin.json"
 start bare
 if ! grep -q '"started":true' "$WORK/bare.json"; then start with-path-home --with-path-home; fi
 # One refuse case on the real binary: a deny name on the host. Expect exit 78, the mediator never up.
@@ -85,7 +89,8 @@ host+=(MEDIATOR_ACL_MODE=explicit_deny); start refuse-deny-name; unset 'host[-1]
 node -e '
 const fs = require("fs"); const W = process.argv[1];
 const rd = (l) => fs.existsSync(`${W}/${l}.json`) ? JSON.parse(fs.readFileSync(`${W}/${l}.json`, "utf8")) : null;
-const bare = rd("bare"), ph = rd("with-path-home"), ref = rd("refuse-deny-name");
+const bare = rd("bare"), ph = rd("with-path-home"), ref = rd("refuse-deny-name"), cred = rd("refuse-admin-credential");
+const del = JSON.parse(fs.readFileSync(`${W}/delete-admin.json`, "utf8"));
 const up = bare.started ? bare : ph;
 const clean = (r) => r && r.environ_is_allow_list && !r.passphrase_source_name_in_environ && r.environ_values_matching_markers === 0;
 const quiet = (r) => r && r.lines_with_passphrase_marker === 0 && r.lines_with_redis_password === 0 && r.lines_with_planted_value === 0;
@@ -93,12 +98,15 @@ const out = {
   what: "16.2(c) + 15(iv): the real mediator through mediator-entrypoint.sh (Security 11984, 12144)",
   rust_log_filter: process.argv[3],
   run_d_needs_path_home: !bare.started && !!(ph && ph.started),
-  runs: [bare, ph, ref].filter(Boolean),
+  runs: [cred, bare, ph, ref].filter(Boolean),
+  surgical_delete: del,
   verdicts: {
     starts_through_entrypoint: !!(up && up.started),
     environ_16_2c: clean(up) ? "PASS" : "FAIL",
-    marker_15_iv: [bare, ph].filter(Boolean).every(quiet) && quiet(ref) ? "PASS" : "FAIL",
+    marker_15_iv: [cred, bare, ph].filter(Boolean).every(quiet) && quiet(ref) ? "PASS" : "FAIL",
     dropped_line_names_only: !!(up && up.dropped_line_names_planted_extra) && quiet(up) ? "PASS" : "FAIL",
+    refuses_admin_credential_16_3b: cred && !cred.started && cred.exit === 78 && /mediator_admin_credential/.test(cred.refusal) ? "PASS" : "FAIL",
+    surgical_delete: del.had_admin_credential && !del.admin_credential_present && del.others_unchanged && del.entries_after === del.entries_before - 1 ? "PASS" : "FAIL",
     refuses_deny_name: ref && !ref.started && ref.exit === 78 && /MEDIATOR_ACL_MODE/.test(ref.refusal) ? "PASS" : "FAIL",
   },
 };
