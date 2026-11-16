@@ -162,14 +162,15 @@ file_backends="$(grep -E '^[[:space:]]*backend[[:space:]]*=[[:space:]]*"file://'
 # Security 12672.2: trust_task_verification = "enforce" as a typed literal, exactly once, in [security]. Under `warn`
 # (upstream's default, security.rs:450, and the shipped conf) every acceptance failure is logged and let through
 # (trust_task_verify.rs:176-187): a write with no proof, so the admin's X25519 key alone could write as the admin, and a
-# stale or replayed one. Fail closed: the name (any case) on exactly one line of the whole file, that line exactly
+# stale or replayed one. Fail closed: the name (any case) on exactly one non-comment line of the whole file (a
+# whole-line `#` comment changes nothing; setup's template names it in one, conf/mediator.toml:283), that line exactly
 # `trust_task_verification = "enforce"` (bare key, basic string, nothing after it), under a `[security]` header. A
 # quoted or dotted key, an inline table, a `${VAR:…}` expansion, `warn`, a duplicate or a missing line all refuse.
 # TRUST_TASK_VERIFICATION on the host refuses by the deny list above (the record's deny side), and the mediator never
 # gets one: env -i passes the allow list only. This is the cheap tripwire; the behaviour proof is E1 in the job.
-[ "$(grep -ci 'trust_task_verification' "$conf" || true)" = 1 ] || refuse "the mediator conf does not name trust_task_verification on exactly one line"
+[ "$(grep -vE '^[[:space:]]*#' "$conf" | grep -ci 'trust_task_verification' || true)" = 1 ] || refuse "the mediator conf does not name trust_task_verification on exactly one line"
 grep -qE '^[[:space:]]*trust_task_verification[[:space:]]*=[[:space:]]*"enforce"[[:space:]]*$' "$conf" || refuse "the mediator conf's trust_task_verification is not the literal \"enforce\""
-ttv_section="$(awk '/^[[:space:]]*\[/ { s = $0; gsub(/[[:space:]]/, "", s) } /trust_task_verification/ { print s; exit }' "$conf")"
+ttv_section="$(awk '/^[[:space:]]*#/ { next } /^[[:space:]]*\[/ { s = $0; gsub(/[[:space:]]/, "", s) } /trust_task_verification/ { print s; exit }' "$conf")"
 [ "$ttv_section" = "[security]" ] || refuse "the mediator conf's trust_task_verification is not under [security]"
 # required values
 [ -n "${DATABASE_URL:-}" ] || refuse "DATABASE_URL is missing"

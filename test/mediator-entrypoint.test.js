@@ -339,6 +339,10 @@ test('entrypoint 12672.2: the conf must hold trust_task_verification = "enforce"
     refused(conf('[security.sub]\ntrust_task_verification = "enforce"\n'), 'is not under \\[security\\]');
     // a host TRUST_TASK_VERIFICATION refuses by the deny list, whatever the conf says
     refused(conf('[security]\ntrust_task_verification = "enforce"\n') && run(r, { env: { TRUST_TASK_VERIFICATION: 'warn' }, medArgs: ['-c', other] }), 'TRUST_TASK_VERIFICATION is set on the host');
+    // green: setup's own shape at the pin (the template's comment names it, conf/mediator.toml:283)
+    assert.equal(conf('[security]\n### Env: TRUST_TASK_VERIFICATION\n### warn | enforce\ntrust_task_verification = "enforce"\n').code, 0);
+    // a commented-out second value still changes nothing; a comment can't hide a real second line
+    refused(conf('[security]\n# trust_task_verification = "warn"\ntrust_task_verification = "enforce"\n[other]\ntrust_task_verification = "warn"\n'), 'exactly one');
     // green: the literal under [security], with spacing and other keys around it
     assert.equal(conf('[security]\nssl = "none"\n  trust_task_verification   =   "enforce"  \n').code, 0);
   } finally { r.done(); }
