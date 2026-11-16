@@ -15,10 +15,14 @@
 //     /opt/rekey included, is red. Only each value's sha256 is kept; a value is never printed;
 //   - a base directory whose mode or owner changed is red (directories are compared like files, bar bytes);
 //   - deleted base entries are fine, and listed.
+// Security 12327 + 12358: the base side is the tree built from the pinned layers (mediator-base-layers.mjs), never the
+// local pull; the local pull's export is cross-checked against that tree entry for entry (its own instrument plants one
+// changed file). Names are read after pax/GNU headers; a doubled, orphan or global-path header is red. The container's
+// own setup entries are allowed only as rekey-added.json's exact `container_init` list (STOP while "VERIFY").
 // The line must first go red on the planted tree plus a base64 copy of the full tool (instrument bites), or it can't
 // pass. Names, paths, shas and verdicts only; no file's bytes are printed.
 //
-//   mediator-base-diff.mjs <rekey export tar> <base export tar> <added.json> <planted dir> <full tool source> <out.json>
+//   mediator-base-diff.mjs <rekey export tar> <registry tree.json> <local base export tar> <added.json> <planted dir> <full tool source> <out.json>
 // Exit 0 only when instrument_bites and rekey_matches_base_plus_added_set are both PASS.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -31,19 +35,39 @@ const str = (b) => b.toString('utf8').replace(/\0.*$/s, '');
 const XATTR_PREFIX = 'SCHILY.xattr.';
 const TYPES = { '0': 'file', '\0': 'file', '7': 'file', '1': 'hardlink', '2': 'link', '5': 'dir', '3': 'other', '4': 'other', '6': 'other' };
 
-// Every entry of a tar file: Map path → {type, mode, uid, gid, size, sha256 (files), linkname (links)}. Reads ustar,
-// pax ('x'; 'g' is ignored) and GNU long names ('L'/'K'). The file is read in chunks; content is hashed, never kept.
-export function tarList(file) {
+// Security 12358 (Railroad 12351): every name is the EFFECTIVE one tar will write: after a pax 'x' header (`path`,
+// `linkpath`) and GNU 'L'/'K' long-name/long-link entries, never the raw ustar field. These are red, as `anomalies`:
+//   - a pax global header ('g') carrying `path` or `linkpath`;
+//   - two headers of one kind ('x', 'L' or 'K') before one member, or a GNU long name and a pax path that disagree;
+//   - a pax/long-name header with no member after it;
+//   - a malformed pax record.
+// tarWalk(file, onEntry) calls onEntry({name, linkname, type, mode, uid, gid, size, xattrs?, sha256? (files)}) for each
+// member in stream order, with `name`/`linkname` as written (not normalised), and returns the anomalies. Content is
+// hashed in chunks, never kept.
+export function tarWalk(file, onEntry) {
   const fd = fs.openSync(file, 'r');
-  const out = new Map();
+  const anomalies = [];
   const hdr = Buffer.alloc(512);
-  let pos = 0, pax = {}, xattrs = {}, longName = null, longLink = null;
+  let pos = 0, pax = null, xattrs = {}, longName = null, longLink = null, member = 0;
   const readExact = (buf, len, at) => { let n = 0; while (n < len) { const r = fs.readSync(fd, buf, n, len - n, at + n); if (!r) throw new Error('tar: short read'); n += r; } };
   const readBody = (size, onChunk) => {
     const chunk = Buffer.alloc(1 << 20);
     let left = size, at = pos;
     while (left > 0) { const n = Math.min(left, chunk.length); readExact(chunk, n, at); onChunk(chunk.subarray(0, n)); left -= n; at += n; }
     pos += Math.ceil(size / 512) * 512;
+  };
+  const paxRecords = (body, where) => {
+    const recs = {};
+    let i = 0;
+    while (i < body.length) {
+      const sp = body.indexOf(0x20, i); const len = sp > i ? Number(body.subarray(i, sp).toString()) : NaN;
+      if (!(Number.isInteger(len) && len > 0) || i + len > body.length || body[i + len - 1] !== 0x0a) { anomalies.push({ kind: 'pax_malformed', at: where }); break; }
+      const rec = body.subarray(sp + 1, i + len - 1); const eq = rec.indexOf(0x3d);
+      if (eq < 1) { anomalies.push({ kind: 'pax_malformed', at: where }); break; }
+      recs[rec.subarray(0, eq).toString('utf8')] = rec.subarray(eq + 1);
+      i += len;
+    }
+    return recs;
   };
   try {
     for (;;) {
@@ -55,41 +79,79 @@ export function tarList(file) {
       if (t === 'x' || t === 'g' || t === 'L' || t === 'K') {
         const parts = []; readBody(size, (c) => parts.push(Buffer.from(c)));
         const body = Buffer.concat(parts);
-        if (t === 'L') longName = str(body);
-        else if (t === 'K') longLink = str(body);
-        else if (t === 'x') {
-          let i = 0;
-          while (i < body.length) {
-            const sp = body.indexOf(0x20, i); const len = parseInt(body.subarray(i, sp).toString(), 10);
-            if (!(len > 0)) break;
-            const rec = body.subarray(sp + 1, i + len - 1); const eq = rec.indexOf(0x3d);
-            const key = rec.subarray(0, eq).toString('utf8'), val = rec.subarray(eq + 1);
+        const where = `before member ${member + 1}`;
+        if (t === 'L') { if (longName !== null) anomalies.push({ kind: 'two_long_names', at: where }); longName = str(body); }
+        else if (t === 'K') { if (longLink !== null) anomalies.push({ kind: 'two_long_links', at: where }); longLink = str(body); }
+        else if (t === 'g') {
+          const recs = paxRecords(body, where);
+          for (const k of ['path', 'linkpath']) if (k in recs) anomalies.push({ kind: `pax_global_${k}`, at: where });
+        } else {
+          if (pax !== null) anomalies.push({ kind: 'two_pax_headers', at: where });
+          pax = {}; xattrs = {};
+          for (const [key, val] of Object.entries(paxRecords(body, where))) {
             // xattr values are binary: hash the bytes, keep only the digest
             if (key.startsWith(XATTR_PREFIX)) xattrs[key.slice(XATTR_PREFIX.length)] = sha().update(val).digest('hex');
             else pax[key] = val.toString('utf8');
-            i += len;
           }
         }
         continue;
       }
+      member += 1;
+      const p = pax || {};
       const prefix = str(hdr.subarray(345, 500));
-      let name = longName ?? pax.path ?? (prefix ? `${prefix}/${str(hdr.subarray(0, 100))}` : str(hdr.subarray(0, 100)));
-      const linkname = longLink ?? pax.linkpath ?? str(hdr.subarray(157, 257));
-      if (pax.size !== undefined) size = Number(pax.size);
+      const ustarName = prefix ? `${prefix}/${str(hdr.subarray(0, 100))}` : str(hdr.subarray(0, 100));
+      if (longName !== null && p.path !== undefined && longName !== p.path) anomalies.push({ kind: 'long_name_and_pax_path_disagree', at: `member ${member}` });
+      if (longLink !== null && p.linkpath !== undefined && longLink !== p.linkpath) anomalies.push({ kind: 'long_link_and_pax_linkpath_disagree', at: `member ${member}` });
+      const name = p.path ?? longName ?? ustarName;
+      const linkname = p.linkpath ?? longLink ?? str(hdr.subarray(157, 257));
+      if (p.size !== undefined) size = Number(p.size);
       const e = {
+        name,
         type: TYPES[t] ?? 'other',
         mode: octal(hdr.subarray(100, 108)) & 0o7777,
-        uid: pax.uid !== undefined ? Number(pax.uid) : octal(hdr.subarray(108, 116)),
-        gid: pax.gid !== undefined ? Number(pax.gid) : octal(hdr.subarray(116, 124)),
+        uid: p.uid !== undefined ? Number(p.uid) : octal(hdr.subarray(108, 116)),
+        gid: p.gid !== undefined ? Number(p.gid) : octal(hdr.subarray(116, 124)),
       };
       if (Object.keys(xattrs).length) e.xattrs = xattrs;
       if (e.type === 'file') { const h = sha(); readBody(size, (c) => h.update(c)); e.size = size; e.sha256 = h.digest('hex'); }
       else { if (size) readBody(size, () => {}); if (e.type === 'link' || e.type === 'hardlink') e.linkname = linkname; }
-      name = norm(name);
-      if (name) out.set(name, e);
-      pax = {}; xattrs = {}; longName = null; longLink = null;
+      onEntry(e);
+      pax = null; xattrs = {}; longName = null; longLink = null;
     }
+    if (pax !== null || longName !== null || longLink !== null) anomalies.push({ kind: 'header_without_member', at: 'end of archive' });
   } finally { fs.closeSync(fd); }
+  return anomalies;
+}
+
+// A name's path components after the effective-name read, or a reason it is red: absolute, or a `..` component.
+export function components(name) {
+  const s = String(name);
+  if (s.startsWith('/')) return { red: 'absolute' };
+  const parts = s.split('/').filter((c) => c !== '' && c !== '.');
+  if (parts.includes('..')) return { red: 'dotdot' };
+  return { parts };
+}
+
+// Every entry of a tar file (an export stream): Map path → {type, mode, uid, gid, size, sha256 (files and hard links,
+// a hard link carrying its target's bytes' sha), linkname (links)}. The map carries `.anomalies` (the 12358 list, plus
+// a `..` member or a hard link whose target is missing or outside the stream).
+export function tarList(file) {
+  const out = new Map();
+  const extra = [];
+  const anomalies = tarWalk(file, (e) => {
+    const name = norm(e.name);
+    if (!name) return;
+    if (components(name).red === 'dotdot') extra.push({ kind: 'dotdot_member', path: `/${name}` });
+    delete e.name;
+    if (e.type === 'hardlink') {
+      const c = components(norm(e.linkname));
+      const tgt = c.parts ? out.get(c.parts.join('/')) : null;
+      if (!tgt || tgt.sha256 === undefined) extra.push({ kind: 'hardlink_target_not_a_file_in_the_stream', path: `/${name}` });
+      else { e.sha256 = tgt.sha256; e.size = tgt.size; }
+    }
+    out.set(name, e);
+  });
+  out.anomalies = [...anomalies, ...extra];
   return out;
 }
 
@@ -125,20 +187,102 @@ const xattrDiff = (e, b) => {
   return [...new Set([...Object.keys(x), ...Object.keys(y)])].filter((n) => x[n] !== y[n]).sort();
 };
 
-// rek, base: Maps from tarList. added: Map path → sha256. Returns the hits by kind, and ok.
-export function baseDiff(rek, base, added) {
+// Two entries compared field by field, the way the walk compares them: kind (a hard link counts as a file, judged by
+// its target's bytes, since which path of a linked pair a tar writer calls "the file" is the writer's choice), mode,
+// owner, bytes (sha256 + size) for files, target for symlinks, xattrs. Returns the names of the fields that differ.
+const kindOf = (e) => (e.type === 'hardlink' ? 'file' : e.type);
+export function entryDiff(e, b) {
+  const why = [];
+  if (kindOf(b) !== kindOf(e)) why.push('type');
+  if (b.mode !== e.mode) why.push('mode');
+  if (b.uid !== e.uid || b.gid !== e.gid) why.push('owner');
+  if (kindOf(e) === 'file' && kindOf(b) === 'file' && (b.sha256 === undefined || b.sha256 !== e.sha256 || b.size !== e.size)) why.push('bytes');
+  if (e.type === 'link' && b.type === 'link' && b.linkname !== e.linkname) why.push('link');
+  if (xattrDiff(e, b).length) why.push('xattrs');
+  return why;
+}
+
+// The container's own setup entries (WPI-BUILD's question to Security, w-1116-1443 and w-1116-1526): `docker create`
+// lays entries into the container's root that are not the image's. Some are in no layer (/.dockerenv, /etc/hosts,
+// /etc/mtab, /dev/console, …); some REPLACE a layer's file (/etc/hostname, /etc/resolv.conf come back empty, 0755), so
+// the export shows the runtime's placeholder, not the image's bytes. rekey-added.json's `container_init` is the exact
+// list, [{path, type, mode, uid, gid, size?, sha256?, linkname?, in_layer}], every field pinned by Security from a
+// run's print; until then it is "VERIFY" and the line reads STOP. Never globbed. Returns Map path → pinned entry, or
+// null while unpinned, or throws on a malformed list.
+export function containerInitList(j) {
+  const c = j?.container_init;
+  if (c === undefined || c === 'VERIFY') return null;
+  const okE = (x) => typeof x?.path === 'string' && x.path.startsWith('/') && !/[*?[\]]/.test(x.path) && ['file', 'dir', 'link', 'other'].includes(x.type)
+    && Number.isInteger(x.mode) && Number.isInteger(x.uid) && Number.isInteger(x.gid) && typeof x.in_layer === 'boolean'
+    && (x.type !== 'file' || (Number.isInteger(x.size) && /^[0-9a-f]{64}$/.test(String(x.sha256)))) && (x.type !== 'link' || typeof x.linkname === 'string');
+  if (!Array.isArray(c) || c.some((x) => !okE(x)))
+    throw new Error('container_init must be "VERIFY" or a list of {path (absolute, no glob), type, mode, uid, gid, size + sha256 (files), linkname (links), in_layer}');
+  return new Map(c.map((x) => [norm(x.path), { ...x, path: undefined }]));
+}
+
+// One listed entry as an export holds it, against its pin and against where it may sit (in a layer or not).
+const initWhy = (e, pin, inRegistry, side) => {
+  const why = [];
+  if (!e) return [`not_in_the_${side}`];
+  why.push(...entryDiff(e, pin).map((w) => `${side}_${w}_not_the_pinned_one`));
+  if (inRegistry !== pin.in_layer) why.push(pin.in_layer ? 'not_in_a_registry_layer' : 'in_a_registry_layer');
+  return why;
+};
+
+// The setup entries as they are: where the local base export and the registry tree disagree (missing from the tree,
+// or other than it) and the rekey export holds the same entry as the local one. Full entries (no content beyond a
+// sha256), for Security to pin from (printed while the list is "VERIFY").
+export function runtimeEntriesRead(rek, localBase, registry) {
+  const out = [];
+  for (const [p, e] of localBase) {
+    const r = registry.get(p);
+    if (r && !entryDiff(e, r).length) continue;
+    const k = rek.get(p);
+    const x = { path: `/${p}`, type: kindOf(e), mode: e.mode, uid: e.uid, gid: e.gid, in_layer: !!r, same_in_both_exports: !!k && entryDiff(k, e).length === 0 };
+    if (kindOf(e) === 'file') { x.size = e.size; x.sha256 = e.sha256; }
+    if (e.type === 'link') x.linkname = e.linkname;
+    out.push(x);
+  }
+  return out.sort((a, b) => (a.path < b.path ? -1 : 1));
+}
+
+// The 12327.4 cross-check (widens change C): the local pull's export walk must equal the registry-built tree entry for
+// entry. Listed container_init entries are the only allowed difference, and only exactly as pinned.
+export function crossCheck(local, registry, init) {
+  const only_local = [], only_registry = [], differ = [], init_bad = [];
+  for (const [p, e] of local) {
+    const r = registry.get(p);
+    if (init && init.has(p)) { const why = initWhy(e, init.get(p), !!r, 'local_base_export'); if (why.length) init_bad.push({ path: `/${p}`, why }); continue; }
+    if (!r) { only_local.push({ path: `/${p}`, type: kindOf(e) }); continue; }
+    const why = entryDiff(e, r);
+    if (why.length) differ.push({ path: `/${p}`, why });
+  }
+  for (const p of registry.keys()) if (!local.has(p)) only_registry.push(`/${p}`);
+  if (init) for (const p of init.keys()) if (!local.has(p)) init_bad.push({ path: `/${p}`, why: ['not_in_the_local_base_export'] });
+  return { ok: !only_local.length && !only_registry.length && !differ.length && !init_bad.length, only_local, only_registry: only_registry.sort(), differ, init_bad };
+}
+
+// rek, base: Maps from tarList (base may be the registry-built tree). added: Map path → sha256. init: the pinned
+// container_init Map (or null), local: the local base export's Map, needed when init is given. Returns the hits by
+// kind, and ok.
+export function baseDiff(rek, base, added, init = null, local = null) {
   const xattr = [], changed = [], addedFile = [], addedDir = [], addedOther = [], suid = [], missing = [], deleted = [];
+  const initBad = [], initSeen = [];
   for (const [p, e] of rek) {
     const b = base.get(p);
+    if (init && init.has(p)) {
+      const pin = init.get(p);
+      const why = initWhy(e, pin, !!b, 'rekey_export');
+      const l = local?.get(p);
+      if (!l) why.push('not_in_the_local_base_export');
+      else why.push(...entryDiff(e, l).map((w) => `${w}_differs_from_the_local_base_export`));
+      if (why.length) initBad.push({ path: `/${p}`, why }); else initSeen.push(`/${p}`);
+      continue;
+    }
     const xn = xattrDiff(e, b);
     if (xn.length) xattr.push({ path: `/${p}`, names: xn });
     if (b) {
-      const why = [];
-      if (b.type !== e.type) why.push('type');
-      if (b.mode !== e.mode) why.push('mode');
-      if (b.uid !== e.uid || b.gid !== e.gid) why.push('owner');
-      if (e.type === 'file' && b.type === 'file' && (b.sha256 !== e.sha256 || b.size !== e.size)) why.push('bytes');
-      if ((e.type === 'link' || e.type === 'hardlink') && b.linkname !== e.linkname) why.push('link');
+      const why = entryDiff(e, b).filter((w) => w !== 'xattrs');
       if (why.length) changed.push({ path: `/${p}`, why });
       continue;
     }
@@ -147,11 +291,18 @@ export function baseDiff(rek, base, added) {
     if (e.mode & SUID) suid.push(`/${p}`);
     if (!underAddedRoot(p) || added.get(p) !== e.sha256) addedFile.push({ path: `/${p}`, sha256: e.sha256, in_added_set: added.has(p) });
   }
+  if (init) for (const p of init.keys()) if (!rek.has(p)) initBad.push({ path: `/${p}`, why: ['not_in_the_rekey_export'] });
   for (const p of added.keys()) { const e = rek.get(p); if (!e || e.type !== 'file') missing.push(`/${p}`); }
-  for (const p of base.keys()) if (!rek.has(p)) deleted.push(`/${p}`);
-  const ok = !changed.length && !addedFile.length && !addedDir.length && !addedOther.length && !suid.length && !missing.length && !xattr.length;
+  for (const p of base.keys()) if (!rek.has(p) && !(init && init.has(p))) deleted.push(`/${p}`);
+  const ok = !changed.length && !addedFile.length && !addedDir.length && !addedOther.length && !suid.length && !missing.length && !xattr.length && !initBad.length;
   return { ok, changed, added_file_not_in_set: addedFile, added_dir_outside: addedDir, added_not_a_file: addedOther,
-    xattr_changed: xattr, added_setuid: suid, added_set_missing: missing, deleted_base_entries: deleted.sort() };
+    xattr_changed: xattr, added_setuid: suid, added_set_missing: missing, container_init_bad: initBad, container_init_seen: initSeen.sort(), deleted_base_entries: deleted.sort() };
+}
+
+// The registry-built tree, as mediator-base-layers.mjs writes it: {entries: [[path, entry], …]}.
+export function treeFromJson(j) {
+  if (!Array.isArray(j?.entries)) throw new Error('registry tree: no entries');
+  return new Map(j.entries);
 }
 
 // The instrument: the rekey listing plus the planted tree and a base64 copy of the full tool at usr/share/<name>.
@@ -171,20 +322,47 @@ export function instrument(rek, base, added, plantedDir, toolSource) {
   return { bites: !v.ok && plantedFiles.length > 1 && missed.length === 0, planted_files: plantedFiles.length, missed };
 }
 
+// The cross-check's own instrument: the local walk with one file's bytes changed must come back red on that path.
+export function crossCheckBites(local, registry, init) {
+  const f = [...local].find(([p, e]) => e.type === 'file' && registry.has(p) && !(init && init.has(p)));
+  if (!f) return { bites: false, why: 'no file in both walks' };
+  const planted = new Map(local); planted.set(f[0], { ...f[1], sha256: '0'.repeat(64) });
+  const v = crossCheck(planted, registry, init);
+  return { bites: !v.ok && v.differ.some((d) => d.path === `/${f[0]}` && d.why.includes('bytes')) };
+}
+
 if (process.argv[1]?.endsWith('mediator-base-diff.mjs')) {
-  const [rekTar, baseTar, addedJson, planted, tool, out] = process.argv.slice(2);
+  const [rekTar, treeJson, localTar, addedJson, planted, tool, out] = process.argv.slice(2);
   try {
-    if (!out) { console.error('usage: mediator-base-diff.mjs <rekey tar> <base tar> <added.json> <planted dir> <full tool> <out.json>'); process.exit(2); }
-    const rek = tarList(rekTar), base = tarList(baseTar);
-    const added = addedSet(JSON.parse(fs.readFileSync(addedJson, 'utf8')));
+    if (!out) { console.error('usage: mediator-base-diff.mjs <rekey tar> <registry tree.json> <local base tar> <added.json> <planted dir> <full tool> <out.json>'); process.exit(2); }
+    // Security 12327: the base side is the tree built from the pinned layers (mediator-base-layers.mjs); a missing tree
+    // (the layer checks failed, or the fetch did) throws here, so the line is red, never a pass on the local pull.
+    const base = treeFromJson(JSON.parse(fs.readFileSync(treeJson, 'utf8')));
+    const rek = tarList(rekTar), local = tarList(localTar);
+    const addedJ = JSON.parse(fs.readFileSync(addedJson, 'utf8'));
+    const added = addedSet(addedJ);
+    const init = containerInitList(addedJ);
     const ins = instrument(rek, base, added, planted, fs.readFileSync(tool));
-    const v = baseDiff(rek, base, added);
+    const v = baseDiff(rek, base, added, init, local);
+    const cc = crossCheck(local, base, init);
+    const ccb = crossCheckBites(local, base, init);
+    const anomalies = { rekey_export: rek.anomalies, local_base_export: local.anomalies };
     // What the image actually holds under /opt/rekey, printed once for Security to pin (the noble files' shas).
-    const added_read = [...rek].filter(([p, e]) => e.type === 'file' && !base.has(p)).map(([p, e]) => ({ path: `/${p}`, sha256: e.sha256, mode: e.mode.toString(8), owner: `${e.uid}:${e.gid}` })).sort((a, b) => (a.path < b.path ? -1 : 1));
-    const checks = { instrument_bites: ins.bites ? 'PASS' : 'FAIL', rekey_matches_base_plus_added_set: v.ok ? 'PASS' : 'FAIL' };
+    const added_read = [...rek].filter(([p, e]) => e.type === 'file' && !base.has(p) && !(init && init.has(p))).map(([p, e]) => ({ path: `/${p}`, sha256: e.sha256, mode: e.mode.toString(8), owner: `${e.uid}:${e.gid}` })).sort((a, b) => (a.path < b.path ? -1 : 1));
+    const checks = {
+      instrument_bites: ins.bites ? 'PASS' : 'FAIL',
+      rekey_matches_base_plus_added_set: v.ok ? 'PASS' : 'FAIL',
+      local_base_equals_registry_tree: cc.ok ? 'PASS' : 'FAIL',
+      cross_check_bites: ccb.bites ? 'PASS' : 'FAIL',
+      exports_well_formed: !rek.anomalies.length && !local.anomalies.length ? 'PASS' : 'FAIL',
+      // WPI-BUILD's (i)-(iv) to Security: the list is pinned from a run's print; until then STOP, never a pass
+      container_init_pinned: init === null ? 'STOP' : (v.container_init_bad.length || cc.init_bad.length ? 'FAIL' : 'PASS'),
+    };
     const ok = Object.values(checks).every((x) => x === 'PASS');
-    fs.writeFileSync(out, `${JSON.stringify({ what: 'rekey image base diff (Security 11869.4)', ok, checks, instrument: ins, ...v, added_read, rek_entries: rek.size, base_entries: base.size }, null, 2)}\n`);
-    console.log(JSON.stringify({ ok, checks, changed: v.changed.length, added_file_not_in_set: v.added_file_not_in_set, added_dir_outside: v.added_dir_outside, added_not_a_file: v.added_not_a_file, added_setuid: v.added_setuid, xattr_changed: v.xattr_changed, added_set_missing: v.added_set_missing, deleted: v.deleted_base_entries.length }));
+    const runtime_entries_read = runtimeEntriesRead(rek, local, base);
+    fs.writeFileSync(out, `${JSON.stringify({ what: 'rekey image base diff against the registry-built base (Security 11869.4, 12327, 12358)', ok, checks, instrument: ins, cross_check: cc, cross_check_instrument: ccb, anomalies, runtime_entries_read, ...v, added_read, rek_entries: rek.size, local_base_entries: local.size, registry_entries: base.size }, null, 2)}\n`);
+    console.log(JSON.stringify({ ok, checks, changed: v.changed.length, added_file_not_in_set: v.added_file_not_in_set, added_dir_outside: v.added_dir_outside, added_not_a_file: v.added_not_a_file, added_setuid: v.added_setuid, xattr_changed: v.xattr_changed, added_set_missing: v.added_set_missing, container_init_bad: v.container_init_bad, deleted: v.deleted_base_entries.length,
+      cross_check: { only_local: cc.only_local, only_registry: cc.only_registry.length, init_bad: cc.init_bad, differ: cc.differ.slice(0, 50), differ_count: cc.differ.length }, anomalies, runtime_entries_read }));
     process.exit(ok ? 0 : 1);
   } catch (e) { console.error(`mediator-base-diff: ${e.message}`); process.exit(1); }
 }

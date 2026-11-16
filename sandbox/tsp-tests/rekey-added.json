@@ -252,5 +252,7 @@
       "path": "/opt/rekey/node_modules/@noble/hashes/webcrypto.js",
       "sha256": "83f476a634233b999ce6e6cd67dc03e64f07b8d5a826e67ad4a50c940d9ce7ee"
     }
-  ]
+  ],
+  "container_init": "VERIFY",
+  "container_init_what": "The container's own setup entries (WPI-BUILD to Security, w-1116-1443 + w-1116-1526): exact entries docker create lays into an export that are not the image's, each {path, type, mode, uid, gid, size + sha256 (files), linkname (links), in_layer}. \"VERIFY\" until Security pins them from a run's container_init_read; while VERIFY the base diff's container_init_pinned line reads STOP."
 }

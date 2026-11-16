@@ -11,7 +11,9 @@
 #            landed = AMBER (the host's syscall filter, never red), anything else FAIL; and (Security 12940) the
 #            image's own entrypoint, started bare, writes that probe as its first stderr line and still refuses (78).
 #   rekey:   the image check (mediator-image-check.mjs rekey) on the shipped tool; (Security 11869.4) the base diff
-#            against the pinned base (mediator-base-diff.mjs, added set rekey-added.json); in the image, with no network and
+#            against the pinned base (mediator-base-diff.mjs, added set rekey-added.json), whose base side (Security
+#            12327) is built from the pinned layers (mediator-base-layers.mjs) with the local pull cross-checked
+#            against it; in the image, with no network and
 #            a read-only root: `rekey` refuses while mediator_admin_credential is in the store, the removed
 #            subcommands answer "usage" (exit 2), and after the credential is gone `rekey` re-seals (old no longer
 #            opens, new does, same entries).
@@ -65,7 +67,13 @@ docker pull -q --platform linux/amd64 "$BASE_REF" > /dev/null && docker image in
 # Security 12197.2 + 12232.1: the registry chain the pin names (index by the FROM digest, the one linux/amd64 manifest,
 # its config blob), raw, so the config record checks every hash itself and ties inspect's read to the pinned blob. A
 # failed fetch is not fatal here: the record reads the missing blob as FAIL, never as a pass.
-node "$HERE/mediator-base-fetch.mjs" "$BASE_REF" "$W/base-chain" || echo "mediator-images: base registry chain not fully fetched (the config record goes red)" >&2
+node "$HERE/mediator-base-fetch.mjs" "$BASE_REF" "$W/base-chain" || echo "mediator-images: base registry chain not fully fetched (the config record and the base layers go red)" >&2
+# Security 12327 + 12358: the base diff's base side is built from the layers the pinned manifest names, each checked
+# (compressed digest + size, media type, count, decompressed digest = the blob's diff_ids[i]) and applied in order
+# (whiteouts, opaque dirs, effective pax/GNU names; an escape or a write through a symlink is red). The tree is written
+# only when all of it passes, so a failed fetch or check leaves no tree and the base diff is red.
+bl=0; node "$HERE/mediator-base-layers.mjs" "$W/base-chain" "$HERE/rekey-config.json" "$W/base-tree.json" "$ODIR/rekey-base-layers.json" || bl=$?
+rm -rf "$W/base-chain/layers"
 
 # --- the planted tree: every search must hit each of these first
 PL="$W/planted"; mkdir -p "$PL/usr/lib/node" "$PL/usr/local/bin" "$PL/usr/bin" "$PL/run/dbus" "$PL/run/user/10001" "$PL/opt"
@@ -76,8 +84,9 @@ gzip -9nc "$HERE/mediator-store.mjs" > "$PL/usr/lib/node/renamed-tool.bin"
 : > "$PL/usr/local/bin/mediator-setup"; : > "$PL/usr/bin/dbus-daemon"; : > "$PL/run/dbus/system_bus_socket"; : > "$PL/run/user/10001/bus"
 
 svc=0; node "$HERE/mediator-image-check.mjs" service "$W/svc-root" "$W/svc-inspect.json" "$PL" "$ODIR/service-image.json" || svc=$?
-bd=0; node "$HERE/mediator-base-diff.mjs" "$W/rek.tar" "$W/base.tar" "$HERE/rekey-added.json" "$PL" "$HERE/mediator-store.mjs" "$ODIR/rekey-base-diff.json" || bd=$?
-rm -f "$W/rek.tar" "$W/base.tar"
+# The base side is the registry-built tree; the local pull's export is the 12327.4 cross-check against it.
+bd=0; node "$HERE/mediator-base-diff.mjs" "$W/rek.tar" "$W/base-tree.json" "$W/base.tar" "$HERE/rekey-added.json" "$PL" "$HERE/mediator-store.mjs" "$ODIR/rekey-base-diff.json" || bd=$?
+rm -f "$W/rek.tar" "$W/base.tar" "$W/base-tree.json"
 cfg=0; node "$HERE/mediator-image-config.mjs" "$W/rek-inspect.json" "$W/base-inspect.json" "$HERE/rekey-config.json" "$HERE/mediator-rekey.Dockerfile" "$W/base-chain" "$ODIR/rekey-config-record.json" || cfg=$?
 rek=0; node "$HERE/mediator-image-check.mjs" rekey "$W/rek-root" "$W/rek-inspect.json" /opt/rekey/mediator-store.mjs "$ODIR/rekey-image.json" "$PL" || rek=$?
 
@@ -150,7 +159,7 @@ rm -rf "$PP"; [ -e "$PP" ] && fail "passphrase dir still there"
 node - "$OUT" "$ODIR" "$W" <<EOF
 const fs = require('fs'); const [out, odir, w] = process.argv.slice(2);
 const rd = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
-const svc = rd(odir + '/service-image.json'), rek = rd(odir + '/rekey-image.json'), ship = rd(w + '/ship.json'), bdiff = rd(odir + '/rekey-base-diff.json');
+const svc = rd(odir + '/service-image.json'), rek = rd(odir + '/rekey-image.json'), ship = rd(w + '/ship.json'), bdiff = rd(odir + '/rekey-base-diff.json'), blay = rd(odir + '/rekey-base-layers.json');
 const removed = JSON.parse('{${removed[*]}}'.replace(/ /g, ','));
 let r2 = null; try { r2 = JSON.parse(\`$r2_out\`); } catch {}
 const P = (b) => (b ? 'PASS' : 'FAIL');
@@ -161,6 +170,7 @@ const lines = {
   service_keyring_probe: '$probe_v' || 'FAIL',
   service_entrypoint_first_line_is_the_keyring_probe: '$ep_v' || 'FAIL',
   rekey_image_check: P(rek && rek.ok),
+  rekey_base_layers: P($bl === 0 && blay && blay.ok),
   rekey_base_diff: P($bd === 0 && bdiff && bdiff.ok),
   rekey_refuses_while_admin_credential_present: P($r1 !== 0 && $r1_names_cred),
   rekey_removed_subcommands_answer_usage: P(Object.values(removed).length === 4 && Object.values(removed).every((c) => c === 2)),
@@ -185,7 +195,12 @@ console.log(JSON.stringify(rec.rekey_calls));
 // Security 13081.1: the shipped tool's sha256 in the log too, so it can be read against the L8 pin without the artifact
 console.log(JSON.stringify({ shipped_tool_sha256: rec.shipped_tool_sha256, ship_strip_sha256: rec.ship_strip_sha256, rekey_archive_hits: rek && rek.archive_hits, rekey_archives_allowed_read: rek && rek.archives_allowed_read }));
 // Security 11869.4: the base diff's verdict, and what the image added (path, sha256, mode, owner), once, for the pin
-console.log(JSON.stringify({ rekey_base_diff: bdiff && { ok: bdiff.ok, checks: bdiff.checks, instrument: bdiff.instrument, changed: bdiff.changed, added_file_not_in_set: bdiff.added_file_not_in_set, added_dir_outside: bdiff.added_dir_outside, added_not_a_file: bdiff.added_not_a_file, added_setuid: bdiff.added_setuid, added_set_missing: bdiff.added_set_missing, deleted_base_entries: bdiff.deleted_base_entries } }));
+// Security 12327.6: per-layer digest verdicts and counts only
+console.log(JSON.stringify({ rekey_base_layers: blay && { ok: blay.ok, checks: blay.checks, layers: blay.layers, counts: blay.counts, apply_red: blay.apply_red } }));
+console.log(JSON.stringify({ rekey_base_diff: bdiff && { ok: bdiff.ok, checks: bdiff.checks, instrument: bdiff.instrument, changed: bdiff.changed, added_file_not_in_set: bdiff.added_file_not_in_set, added_dir_outside: bdiff.added_dir_outside, added_not_a_file: bdiff.added_not_a_file, added_setuid: bdiff.added_setuid, added_set_missing: bdiff.added_set_missing, container_init_bad: bdiff.container_init_bad, deleted_base_entries: bdiff.deleted_base_entries, anomalies: bdiff.anomalies } }));
+// Security 12327.4: the local pull against the registry-built tree; and the container's own entries, for the pin
+console.log(JSON.stringify({ rekey_base_cross_check: bdiff && { checks: bdiff.checks && { local_base_equals_registry_tree: bdiff.checks.local_base_equals_registry_tree, cross_check_bites: bdiff.checks.cross_check_bites }, only_local: bdiff.cross_check.only_local, only_registry: bdiff.cross_check.only_registry, differ: bdiff.cross_check.differ, init_bad: bdiff.cross_check.init_bad, entries: { rekey: bdiff.rek_entries, local_base: bdiff.local_base_entries, registry: bdiff.registry_entries } } }));
+console.log(JSON.stringify({ container_init_read: bdiff && bdiff.runtime_entries_read, container_init_pinned: bdiff && bdiff.checks.container_init_pinned }));
 console.log(JSON.stringify({ rekey_added_read: bdiff && bdiff.added_read }));
 // Security 11935 (a), (e), 12197.2 (c), 12232.1: the base's manifest and config digests read from the registry chain
 // (for the L8 pins), inspect's Id as evidence only, and the base half beside the verdict

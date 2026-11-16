@@ -6,6 +6,8 @@
 //   index.raw     the image index, fetched by the digest pinned on the rekey Dockerfile's FROM line
 //   manifest.raw  the one linux/amd64 manifest (no variant) the index lists, fetched by its descriptor's digest
 //   config.raw    that manifest's config blob, fetched by its config.digest
+//   layers/<i>.blob  each layer the manifest names, in order, fetched by its digest (Security 12327.1); judged, and
+//                 applied, by mediator-base-layers.mjs
 // This script only fetches and writes bytes; it judges nothing, so a registry (or a proxy) that answers with other
 // bytes is caught by the verdict, not trusted here. Anonymous pull token only; the token is never printed or written.
 // A failed fetch writes what it got and exits 1; the verdict then reads the missing file as red, never as a pass.
@@ -57,6 +59,17 @@ async function main([ref, out]) {
     if (!/^sha256:[0-9a-f]{64}$/.test(String(cd))) throw new Error('the manifest names no sha256 config digest');
     const config = await get('blobs', cd, null);
     fs.writeFileSync(path.join(out, 'config.raw'), config); say.config_bytes = config.length;
+    // Security 12327.1: every layer, by digest. A layer that fails to come (a rate limit included) stops the fetch, so
+    // its file is missing and the layer verdict reads it as red.
+    const layers = JSON.parse(manifest.toString('utf8'))?.layers;
+    if (!Array.isArray(layers) || !layers.length) throw new Error('the manifest names no layers');
+    fs.mkdirSync(path.join(out, 'layers'), { recursive: true });
+    say.layers = 0; say.layer_bytes = 0;
+    for (const [i, l] of layers.entries()) {
+      if (!/^sha256:[0-9a-f]{64}$/.test(String(l?.digest))) throw new Error(`layer ${i} names no sha256 digest`);
+      const b = await get('blobs', l.digest, null);
+      fs.writeFileSync(path.join(out, 'layers', `${i}.blob`), b); say.layers += 1; say.layer_bytes += b.length;
+    }
   } catch (e) {
     console.log(JSON.stringify({ fetched: false, why: e.message, ...say }));
     return 1;

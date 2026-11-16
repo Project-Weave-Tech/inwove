@@ -1,0 +1,229 @@
+// Security 12327 + 12358 (Railroad 12314, 12351): the base diff's base side built from the pinned layers. Every unit
+// Security listed is red first, except the whiteout/opaque ones, which must delete their paths. Made-up layers only.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import crypto from 'node:crypto';
+import { gzipSync, gunzipSync } from 'node:zlib';
+import { layerVerdict, applyLayers } from '../sandbox/tsp-tests/mediator-base-layers.mjs';
+import { tarWalk, tarList, crossCheck, crossCheckBites, baseDiff, containerInitList, runtimeEntriesRead } from '../sandbox/tsp-tests/mediator-base-diff.mjs';
+
+const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
+const dirs = [];
+const tmp = () => { const d = mkdtempSync(join(tmpdir(), 'blay-')); dirs.push(d); return d; };
+test.after(() => dirs.forEach((d) => rmSync(d, { recursive: true, force: true })));
+
+// A small tar writer. entries: [{name, type ('0' file | '1' hardlink | '2' symlink | '5' dir | 'x' | 'g' | 'L' | 'K'),
+// mode, uid, body, linkname, pax: {key: value}}]. A pax: {} on a member writes an 'x' header before it.
+function header(name, type, mode, size, linkname = '', uid = 0) {
+  const h = Buffer.alloc(512);
+  h.write(name.slice(0, 100), 0, 100); h.write(`${mode.toString(8).padStart(7, '0')}\0`, 100); h.write(`${uid.toString(8).padStart(7, '0')}\0`, 108); h.write('0000000\0', 116);
+  h.write(`${size.toString(8).padStart(11, '0')}\0`, 124); h.write('00000000000\0', 136); h.write('        ', 148); h.write(type, 156);
+  h.write(linkname.slice(0, 100), 157, 100); h.write('ustar\0', 257); h.write('00', 263);
+  h.write(`${[...h].reduce((a, b) => a + b, 0).toString(8).padStart(6, '0')}\0 `, 148);
+  return h;
+}
+const pad = (b) => Buffer.concat([b, Buffer.alloc((512 - (b.length % 512)) % 512)]);
+const paxBody = (kv) => Buffer.concat(Object.entries(kv).map(([k, v]) => {
+  const rest = Buffer.from(` ${k}=${v}\n`);
+  let len = rest.length + 1; while (String(len).length + rest.length !== len) len = String(len).length + rest.length;
+  return Buffer.concat([Buffer.from(String(len)), rest]);
+}));
+function tarBytes(entries, { end = true } = {}) {
+  const parts = [];
+  for (const e of entries) {
+    const t = e.type ?? '0';
+    if (t === 'x' || t === 'g') { const b = paxBody(e.pax); parts.push(header(e.name ?? 'PaxHeader', t, 0o644, b.length), pad(b)); continue; }
+    if (t === 'L' || t === 'K') { const b = Buffer.from(`${e.body}\0`); parts.push(header('././@LongLink', t, 0o644, b.length), pad(b)); continue; }
+    if (e.pax) { const b = paxBody(e.pax); parts.push(header(`PaxHeaders/${e.name}`.slice(0, 99), 'x', 0o644, b.length), pad(b)); }
+    const body = Buffer.from(e.body ?? '');
+    parts.push(header(e.name, t, e.mode ?? (t === '5' ? 0o755 : 0o644), t === '0' ? body.length : 0, e.linkname ?? '', e.uid ?? 0), t === '0' ? pad(body) : Buffer.alloc(0));
+  }
+  if (end) parts.push(Buffer.alloc(1024));
+  return Buffer.concat(parts);
+}
+const tarFile = (entries, o) => { const f = join(tmp(), 'l.tar'); writeFileSync(f, tarBytes(entries, o)); return f; };
+
+// A made-up chain: layer tars → {manifestRaw, configRaw, pins, blobs}
+const OCI = 'application/vnd.oci.image.manifest.v1+json', GZ = 'application/vnd.oci.image.layer.v1.tar+gzip';
+function chain(layerTars, { manifestLayers = null, diffIds = null } = {}) {
+  const blobs = layerTars.map((t) => gzipSync(t));
+  const ids = diffIds ?? layerTars.map((t) => `sha256:${sha(t)}`);
+  const configRaw = Buffer.from(JSON.stringify({ architecture: 'amd64', os: 'linux', rootfs: { type: 'layers', diff_ids: ids } }));
+  const layers = manifestLayers ?? blobs.map((b) => ({ mediaType: GZ, digest: `sha256:${sha(b)}`, size: b.length }));
+  const manifestRaw = Buffer.from(JSON.stringify({ schemaVersion: 2, mediaType: OCI, config: { digest: `sha256:${sha(configRaw)}` }, layers }));
+  return { manifestRaw, configRaw, blobs, pins: { base_manifest_digest: `sha256:${sha(manifestRaw)}`, base_config_digest: `sha256:${sha(configRaw)}` } };
+}
+const unzipSha = (b, gz) => { try { return sha(gz ? gunzipSync(b) : b); } catch { return null; } };
+const verdict = (c) => layerVerdict({ ...c, decompressedSha: unzipSha });
+const L1 = tarBytes([{ name: 'usr/', type: '5' }, { name: 'usr/bin/', type: '5' }, { name: 'usr/bin/node', body: 'ELF', mode: 0o755 }]);
+const L2 = tarBytes([{ name: 'etc/', type: '5' }, { name: 'etc/os-release', body: 'debian' }]);
+
+test('layers: the pinned chain passes every check; per-layer verdicts and counts only', () => {
+  const v = verdict(chain([L1, L2]));
+  assert.equal(v.ok, true, JSON.stringify(v));
+  assert.deepEqual(v.counts, { layers: 2, diff_ids: 2, blobs: 2 });
+  assert.ok(v.layers.every((l) => l.compressed === 'PASS' && l.diff_id === 'PASS'));
+  assert.ok(!JSON.stringify(v).includes('ELF'));
+});
+
+test('layers: compressed digest right but uncompressed bytes wrong is red (Railroad 12314)', () => {
+  // the manifest's digest is the blob's, the blob is what came, but it unpacks to other bytes than the diff_id
+  const c = chain([L1, L2], { diffIds: [`sha256:${sha(L1)}`, `sha256:${sha(L1)}`] });
+  const v = verdict(c);
+  assert.equal(v.ok, false);
+  assert.equal(v.layers[1].compressed, 'PASS');
+  assert.equal(v.layers[1].diff_id, 'FAIL');
+});
+
+test('layers: two layers swapped, a layer missing, an extra layer, a wrong size, a type not the manifest\'s own: all red', () => {
+  const good = chain([L1, L2]);
+  // swapped: the blobs come in the other order
+  assert.equal(verdict({ ...good, blobs: [good.blobs[1], good.blobs[0]] }).ok, false);
+  // missing: the fetch stopped (a rate limit) and one file is absent
+  const miss = verdict({ ...good, blobs: [good.blobs[0], null] });
+  assert.equal(miss.ok, false); assert.equal(miss.checks.layer_count_equals_diff_ids, 'FAIL');
+  // an extra layer in the manifest that the config's diff_ids don't list
+  const L3 = tarBytes([{ name: 'x', body: 'x' }]);
+  const three = chain([L1, L2, L3]);
+  const extra = layerVerdict({ ...three, configRaw: good.configRaw, pins: { ...three.pins, base_config_digest: good.pins.base_config_digest }, decompressedSha: unzipSha });
+  assert.equal(extra.ok, false);
+  // size other than the manifest's
+  const ml = JSON.parse(good.manifestRaw).layers; ml[0].size += 1;
+  const sized = chain([L1, L2], { manifestLayers: ml });
+  assert.equal(verdict(sized).layers[0].size, 'FAIL');
+  // a layer type from the other manifest family
+  const ml2 = JSON.parse(good.manifestRaw).layers; ml2[0].mediaType = 'application/vnd.docker.image.rootfs.diff.tar.gzip';
+  const typed = verdict(chain([L1, L2], { manifestLayers: ml2 }));
+  assert.equal(typed.ok, false); assert.equal(typed.layers[0].media_type, 'FAIL');
+  // a manifest or config other than the pins
+  assert.equal(verdict({ ...good, pins: { ...good.pins, base_manifest_digest: `sha256:${'0'.repeat(64)}` } }).checks.manifest_is_the_pin, 'FAIL');
+  assert.equal(verdict({ ...good, pins: { ...good.pins, base_config_digest: `sha256:${'0'.repeat(64)}` } }).checks.config_is_the_pin, 'FAIL');
+});
+
+test('apply: a .. member, an absolute member, and a member written through an earlier symlink are red', () => {
+  const lower = tarFile([{ name: 'usr/', type: '5' }, { name: 'usr/lib', type: '2', linkname: '/tmp' }]);
+  for (const [name, entries, kind] of [
+    ['dotdot', [{ name: 'usr/../../etc/x', body: 'x' }], 'dotdot_name'],
+    ['absolute', [{ name: '/etc/x', body: 'x' }], 'absolute_name'],
+    ['through symlink', [{ name: 'usr/lib/evil', body: 'x' }], 'write_through_symlink'],
+  ]) {
+    const a = applyLayers([lower, tarFile(entries)]);
+    assert.ok(a.red.some((r) => r.kind === kind), `${name}: ${JSON.stringify(a.red)}`);
+  }
+});
+
+test('apply: a whiteout in an upper layer deletes its path (and what is under it); an opaque dir empties what the layers below put there', () => {
+  const lower = tarFile([{ name: 'etc/', type: '5' }, { name: 'etc/a', body: 'a' }, { name: 'etc/d/', type: '5' }, { name: 'etc/d/x', body: 'x' }, { name: 'opt/', type: '5' }, { name: 'opt/old', body: 'o' }]);
+  const upper = tarFile([{ name: 'etc/.wh.d', body: '' }, { name: 'etc/.wh.a', body: '' }, { name: 'opt/new', body: 'n' }, { name: 'opt/.wh..wh..opq', body: '' }]);
+  const a = applyLayers([lower, upper]);
+  assert.deepEqual(a.red, []);
+  assert.equal(a.tree.has('etc/a'), false);
+  assert.equal(a.tree.has('etc/d'), false);
+  assert.equal(a.tree.has('etc/d/x'), false);
+  assert.equal(a.tree.has('opt/old'), false, 'opaque: the lower layer\'s child is gone');
+  assert.equal(a.tree.has('opt/new'), true, 'opaque: the same layer\'s child stays');
+  assert.equal(a.whiteouts, 2); assert.equal(a.opaque, 1);
+  // a whiteout of what its own layer just wrote is a malformed layer
+  const bad = applyLayers([lower, tarFile([{ name: 'etc/b', body: 'b' }, { name: 'etc/.wh.b', body: '' }])]);
+  assert.ok(bad.red.some((r) => r.kind === 'whiteout_of_same_layer_entry'));
+});
+
+test('apply: a hard link resolves inside the tree, carrying its target\'s bytes; one to a missing target is red', () => {
+  const a = applyLayers([tarFile([{ name: 'usr/', type: '5' }, { name: 'usr/a', body: 'same' }, { name: 'usr/b', type: '1', linkname: 'usr/a' }])]);
+  assert.deepEqual(a.red, []);
+  assert.equal(a.tree.get('usr/b').sha256, sha('same'));
+  const m = applyLayers([tarFile([{ name: 'usr/b', type: '1', linkname: 'usr/none' }])]);
+  assert.ok(m.red.some((r) => r.kind === 'hardlink_target_not_a_file_in_the_tree'));
+});
+
+// Security 12358 (Railroad 12351): the effective name, never the raw ustar field
+test('pax/GNU: a plain ustar name with a pax path of ../x is red; so is a hard link whose pax linkpath leaves the tree', () => {
+  const a = applyLayers([tarFile([{ name: 'plain', body: 'x', pax: { path: '../x' } }])]);
+  assert.ok(a.red.some((r) => r.kind === 'dotdot_name'), JSON.stringify(a.red));
+  const b = applyLayers([tarFile([{ name: 'usr/', type: '5' }, { name: 'usr/a', body: 'a' }, { name: 'usr/b', type: '1', linkname: 'usr/a', pax: { linkpath: '../../etc/shadow' } }])]);
+  assert.ok(b.red.some((r) => r.kind === 'hardlink_leaves_tree'), JSON.stringify(b.red));
+});
+
+test('pax/GNU: a GNU L long name holding .. is red', () => {
+  const a = applyLayers([tarFile([{ type: 'L', body: `${'a/'.repeat(60)}../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../../x` }, { name: 'short', body: 'x' }])]);
+  assert.ok(a.red.some((r) => r.kind === 'dotdot_name'), JSON.stringify(a.red));
+  // and the effective name, not the ustar one, is what lands
+  const ok = applyLayers([tarFile([{ type: 'L', body: `deep/${'n'.repeat(120)}` }, { name: 'short', body: 'x' }])]);
+  assert.ok(ok.tree.has(`deep/${'n'.repeat(120)}`)); assert.equal(ok.tree.has('short'), false);
+});
+
+test('pax/GNU: a global header with path or linkpath, an orphan header, two of one kind before a member: all red', () => {
+  const kinds = (entries, o) => tarWalk(tarFile(entries, o), () => {}).map((x) => x.kind);
+  assert.ok(kinds([{ type: 'g', pax: { path: 'etc' } }, { name: 'a', body: 'a' }]).includes('pax_global_path'));
+  assert.ok(kinds([{ type: 'g', pax: { linkpath: '/x' } }, { name: 'a', body: 'a' }]).includes('pax_global_linkpath'));
+  assert.deepEqual(kinds([{ type: 'g', pax: { comment: 'fine' } }, { name: 'a', body: 'a' }]), []);
+  assert.ok(kinds([{ name: 'a', body: 'a' }, { type: 'x', pax: { path: 'b' } }]).includes('header_without_member'));
+  assert.ok(kinds([{ type: 'x', pax: { path: 'a' } }, { type: 'x', pax: { path: 'b' } }, { name: 'c', body: 'c' }]).includes('two_pax_headers'));
+  assert.ok(kinds([{ type: 'L', body: 'a' }, { type: 'L', body: 'b' }, { name: 'c', body: 'c' }]).includes('two_long_names'));
+  assert.ok(kinds([{ type: 'L', body: 'a' }, { name: 'c', body: 'c', pax: { path: 'b' } }]).includes('long_name_and_pax_path_disagree'));
+  // in a layer, every one of these lands in the apply's red list
+  const a = applyLayers([tarFile([{ type: 'g', pax: { path: 'etc' } }, { name: 'a', body: 'a' }])]);
+  assert.ok(a.red.some((r) => r.kind === 'pax_global_path' && r.layer === 0));
+  // and an export stream carrying one is not well formed
+  assert.ok(tarList(tarFile([{ type: 'g', pax: { path: 'etc' } }, { name: 'a', body: 'a' }])).anomalies.length > 0);
+});
+
+// Security 12327.4: the local pull checked against the registry tree, not trusted
+const REG = () => applyLayers([tarFile([{ name: 'etc/', type: '5' }, { name: 'etc/hostname', body: 'made-up-host\n' }, { name: 'etc/a', body: 'a' }, { name: 'usr/', type: '5' }, { name: 'usr/x', body: 'x' }])]).tree;
+const LOCAL = (over = []) => tarList(tarFile([{ name: 'etc/', type: '5' }, { name: 'etc/hostname', body: '', mode: 0o755 }, { name: 'etc/a', body: 'a' }, { name: 'etc/hosts', body: '', mode: 0o755 }, { name: 'usr/', type: '5' }, { name: 'usr/x', body: 'x' }, ...over]));
+const EMPTY = sha('');
+const INIT = { container_init: [
+  { path: '/etc/hostname', type: 'file', mode: 0o755, uid: 0, gid: 0, size: 0, sha256: EMPTY, in_layer: true },
+  { path: '/etc/hosts', type: 'file', mode: 0o755, uid: 0, gid: 0, size: 0, sha256: EMPTY, in_layer: false },
+] };
+
+test('cross-check: while container_init is VERIFY, the runtime entries are red and printed in full for the pin', () => {
+  const reg = REG(), loc = LOCAL();
+  assert.equal(containerInitList({ container_init: 'VERIFY' }), null);
+  const c = crossCheck(loc, reg, null);
+  assert.equal(c.ok, false);
+  assert.deepEqual(c.only_local, [{ path: '/etc/hosts', type: 'file' }]);
+  assert.deepEqual(c.differ, [{ path: '/etc/hostname', why: ['mode', 'bytes'] }]);
+  const read = runtimeEntriesRead(loc, loc, reg);
+  assert.deepEqual(read.map((x) => [x.path, x.in_layer, x.same_in_both_exports]), [['/etc/hostname', true, true], ['/etc/hosts', false, true]]);
+});
+
+test('cross-check: the pinned list passes exactly as pinned; local base.tar with one file changed is red; the instrument bites', () => {
+  const reg = REG(), init = containerInitList(INIT);
+  assert.equal(crossCheck(LOCAL(), reg, init).ok, true);
+  const changed = tarList(tarFile([{ name: 'etc/', type: '5' }, { name: 'etc/hostname', body: '', mode: 0o755 }, { name: 'etc/a', body: 'A' }, { name: 'etc/hosts', body: '', mode: 0o755 }, { name: 'usr/', type: '5' }, { name: 'usr/x', body: 'x' }]));
+  const c = crossCheck(changed, reg, init);
+  assert.equal(c.ok, false); assert.deepEqual(c.differ, [{ path: '/etc/a', why: ['bytes'] }]);
+  assert.equal(crossCheckBites(LOCAL(), reg, init).bites, true);
+  // a listed entry other than its pin (mode, bytes), or one whose in_layer is wrong, is red
+  const wrongMode = containerInitList({ container_init: [{ ...INIT.container_init[0], mode: 0o644 }, INIT.container_init[1]] });
+  assert.equal(crossCheck(LOCAL(), reg, wrongMode).ok, false);
+  const wrongLayer = containerInitList({ container_init: [INIT.container_init[0], { ...INIT.container_init[1], in_layer: true }] });
+  assert.ok(crossCheck(LOCAL(), reg, wrongLayer).init_bad.some((b) => b.why.includes('not_in_a_registry_layer')));
+  // a glob, a relative path or a missing field is refused outright
+  for (const bad of [[{ ...INIT.container_init[1], path: '/etc/*' }], [{ ...INIT.container_init[1], path: 'etc/hosts' }], [{ path: '/etc/hosts', type: 'file' }]])
+    assert.throws(() => containerInitList({ container_init: bad }));
+});
+
+test('base diff on the registry tree: a pinned container_init entry passes only when the rekey export, the pin and the local base export agree', () => {
+  const reg = REG(), init = containerInitList(INIT), loc = LOCAL();
+  const rek = LOCAL([{ name: 'opt/', type: '5' }, { name: 'opt/rekey/', type: '5' }, { name: 'opt/rekey/t.mjs', body: 'tool', mode: 0o444 }]);
+  const added = new Map([['opt/rekey/t.mjs', sha('tool')]]);
+  const v = baseDiff(rek, reg, added, init, loc);
+  assert.equal(v.ok, false, 'opt/ is an added dir outside /opt/rekey');
+  assert.deepEqual(v.added_dir_outside, ['/opt']);
+  const regOpt = new Map(reg); regOpt.set('opt', { type: 'dir', mode: 0o755, uid: 0, gid: 0 });
+  const ok = baseDiff(rek, regOpt, added, init, loc);
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+  assert.deepEqual(ok.container_init_seen, ['/etc/hostname', '/etc/hosts']);
+  // the rekey export with bytes at a listed path (the runtime would hide them; if the export ever shows them) is red
+  const planted = LOCAL([{ name: 'opt/', type: '5' }, { name: 'opt/rekey/', type: '5' }, { name: 'opt/rekey/t.mjs', body: 'tool', mode: 0o444 }]);
+  planted.set('etc/hosts', { ...planted.get('etc/hosts'), size: 4, sha256: sha('tool') });
+  const p = baseDiff(planted, regOpt, added, init, loc);
+  assert.equal(p.ok, false); assert.ok(p.container_init_bad.some((b) => b.path === '/etc/hosts'));
+  // without the pin (VERIFY), the runtime entries are red as before
+  assert.equal(baseDiff(rek, regOpt, added, null, loc).ok, false);
+});

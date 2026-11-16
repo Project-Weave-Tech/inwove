@@ -67,3 +67,12 @@ the host only when every step below holds on the new pin, in one job run, and Se
     `rekey-added.json` (the shipped tool at the L8 pin, each `@noble/hashes` file at its sha); added directories only
     under `/opt/rekey`. At a base re-pin, or when `@noble/hashes` or the shipped tool moves, the job prints
     `rekey_added_read`; the new shas come to SECURITY and are re-pinned only by a Security block, never in place.
+14. **The base diff's base side is the pinned layers** (Security 12327, 12358; Railroad 12314, 12351):
+    `mediator-base-fetch.mjs` fetches every layer the pinned amd64 manifest names; `mediator-base-layers.mjs` checks each
+    (compressed sha256 + size, media type, count = `diff_ids`, decompressed sha256 = `diff_ids[i]`) and applies them in
+    order (whiteouts, opaque dirs, effective pax/GNU names; an escape or a write through a symlink is red). The local
+    pull's export must equal that tree entry for entry, bar `rekey-added.json`'s exact `container_init` list. At a base
+    re-pin the job prints `rekey_base_layers` (per-layer verdicts + counts) and `container_init_read`; a new list comes
+    to SECURITY and is pinned only by a Security block. Open with Security (WPI-BUILD w-1116-1526): `docker export`
+    shows the runtime's placeholders at `/etc/hosts`, `/etc/hostname`, `/etc/resolv.conf`, `/.dockerenv`, whatever the
+    image holds there; until the read moves off the export, those paths are not judged by bytes.
