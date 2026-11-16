@@ -311,6 +311,15 @@ jobs:
         id: setuprun
         continue-on-error: true
         run: bash "$WPI_DIR/mediator-setup-run.sh" "$RUNNER_TEMP/med/target/release/mediator" "$RUNNER_TEMP/setup-target/release/mediator-setup" "$WPI_DIR/redis-docker.sh" "$WPI_DIR/mediator-env-lists.json" "$OUT/setup-run.json"
+      - name: "the Dockerfile batch: the service image and the one-off rekey image, built here and judged (Security 12422 e, 12491 b image half, 12519 e, 12195.1 d)"
+        # TEST BUILD on the runner's Docker: nothing pushed to a registry, nothing deployed. The service image holds the
+        # lean binary above, the entrypoint, the deny file + its baked sha256 and the keyring probe; the rekey image the
+        # SHIPPED store tool (rekey/opens/names/absent only). Each image's whole filesystem is searched, after the same
+        # search hits a planted tree. The keyring probe runs as the service user: refused = PASS, landed = AMBER (the
+        # host's syscall filter), never red. Units: test/mediator-images.test.js.
+        id: images
+        continue-on-error: true
+        run: bash "$WPI_DIR/mediator-images.sh" "$RUNNER_TEMP/med/target/release/mediator" "$OUT/images.json"
       - name: summary (statuses and problem codes only)
         if: always()
         run: |
@@ -322,8 +331,8 @@ jobs:
           path: results/mediator-early
           retention-days: 30
       - name: fail if any step failed
-        if: always() && (steps.feats.outcome == 'failure' || steps.envreads.outcome == 'failure' || steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.expectred.outcome != 'success' || steps.dcself.outcome == 'failure' || steps.aclclosedd.outcome == 'failure' || steps.entrypoint.outcome == 'failure' || steps.setupbuild.outcome == 'failure' || steps.setupfeats.outcome == 'failure' || steps.keyringpaths.outcome == 'failure' || steps.adminkeys.outcome == 'failure' || steps.setuprun.outcome == 'failure')
-        run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed over tsp (red by design) ${{ steps.aclclosed.outcome }}, admin over TSP refused (expected) ${{ steps.expectred.outcome }}, didcomm selftest ${{ steps.dcself.outcome }}, acl closed over didcomm ${{ steps.aclclosedd.outcome }}, entrypoint ${{ steps.entrypoint.outcome }}, setup build ${{ steps.setupbuild.outcome }}, setup features ${{ steps.setupfeats.outcome }}, keyring paths ${{ steps.keyringpaths.outcome }}, admin keys units ${{ steps.adminkeys.outcome }}, setup run ${{ steps.setuprun.outcome }}" && exit 1
+        if: always() && (steps.feats.outcome == 'failure' || steps.envreads.outcome == 'failure' || steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.expectred.outcome != 'success' || steps.dcself.outcome == 'failure' || steps.aclclosedd.outcome == 'failure' || steps.entrypoint.outcome == 'failure' || steps.setupbuild.outcome == 'failure' || steps.setupfeats.outcome == 'failure' || steps.keyringpaths.outcome == 'failure' || steps.adminkeys.outcome == 'failure' || steps.setuprun.outcome == 'failure' || steps.images.outcome == 'failure')
+        run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed over tsp (red by design) ${{ steps.aclclosed.outcome }}, admin over TSP refused (expected) ${{ steps.expectred.outcome }}, didcomm selftest ${{ steps.dcself.outcome }}, acl closed over didcomm ${{ steps.aclclosedd.outcome }}, entrypoint ${{ steps.entrypoint.outcome }}, setup build ${{ steps.setupbuild.outcome }}, setup features ${{ steps.setupfeats.outcome }}, keyring paths ${{ steps.keyringpaths.outcome }}, admin keys units ${{ steps.adminkeys.outcome }}, setup run ${{ steps.setuprun.outcome }}, images ${{ steps.images.outcome }}" && exit 1
 
   report:
     name: report (one markdown report; fails while a line is missing)

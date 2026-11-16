@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// ship:drop-begin (Security 12422: the rekey image ships this file with every ship:drop block removed; mediator-store-ship.mjs)
 // The mediator's `file://` secret store, read and changed from outside the mediator (condition 16.3, Security 11984
 // §2, Railroad note ii). Format at 0.50.0 @ 34bbdea4: `affinidi-messaging-mediator-common/src/secrets/backends/`
 // `file.rs` (plain: {"entries": {<key>: <base64url value>}}) and `file_encrypted.rs` (`?encrypt=1`: {"version":1,"kdf":{argon2id,
@@ -33,6 +34,8 @@
 //   encrypt-test <plain store> <passphrase file>
 //                                          TEST ONLY: re-seals a plain store in place in the ?encrypt=1 shape, same
 //                                          entry names and values (upstream's test store, for the entrypoint run)
+// ship:drop-end
+// The mediator's `file://` secret store, read from outside the mediator. Prints names, counts and verdicts only.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -122,6 +125,7 @@ function writeAtomic(file, obj) {
   fs.renameSync(tmp, file);
 }
 
+// ship:drop-begin
 // Removes ADMIN_CREDENTIAL and nothing else. Returns a names-only record. Throws (and writes nothing) if the result
 // would differ from the original in anything but that one entry, or if an encrypted store no longer opens.
 export function deleteAdmin(file, passphrase) {
@@ -149,6 +153,7 @@ export function deleteAdmin(file, passphrase) {
   };
 }
 
+// ship:drop-end
 export function rekey(file, oldPass, newPass) {
   const { j, shape } = readStore(file);
   if (shape !== 'encrypted') throw new Error('not an encrypted store');
@@ -158,7 +163,7 @@ export function rekey(file, oldPass, newPass) {
   const oldKey = deriveKey(oldPass, j.kdf);
   const values = {};
   for (const [k, e] of Object.entries(j.entries)) values[k] = openAead(oldKey, b64u(e.nonce_b64), b64u(e.ciphertext_b64), entryAad(k));
-  sealTest(file, newPass, values, j.kdf);
+  sealStore(file, newPass, values, j.kdf);
   const after = readStore(file).j;
   const newKey = deriveKey(newPass, after.kdf);
   const same = Object.keys(values).length === Object.keys(after.entries).length && Object.entries(values).every(([k, v]) => {
@@ -168,7 +173,7 @@ export function rekey(file, oldPass, newPass) {
     old_opens: opens(after, oldPass), new_opens: opens(after, newPass), mode: (fs.statSync(file).mode & 0o777).toString(8) };
 }
 
-export function sealTest(file, passphrase, values, like = null) {
+function sealStore(file, passphrase, values, like = null) {
   const salt = crypto.randomBytes(16);
   const kdf = { algo: 'argon2id', salt_b64: salt.toString('base64url'), memory_kib: like?.memory_kib ?? KDF_CAP.memory_kib,
     iterations: like?.iterations ?? KDF_CAP.iterations, parallelism: like?.parallelism ?? KDF_CAP.parallelism };
@@ -178,6 +183,10 @@ export function sealTest(file, passphrase, values, like = null) {
   for (const [k, val] of Object.entries(values)) entries[k] = seal(key, Buffer.isBuffer(val) ? val : Buffer.from(val), entryAad(k));
   writeAtomic(file, { version: 1, kdf, verifier_nonce_b64: v.nonce_b64, verifier_b64: v.ciphertext_b64, entries });
 }
+
+// ship:drop-begin
+export const sealTest = sealStore;
+// ship:drop-end
 
 async function main(argv) {
   const [cmd, store, a, b] = argv;
@@ -202,6 +211,7 @@ async function main(argv) {
       say({ shape, opens: ok });
       return ok ? 0 : 4;
     }
+      // ship:drop-begin
     case 'delete-admin': {
       const { shape } = readStore(store);
       const r = deleteAdmin(store, shape === 'encrypted' ? readPassphrase(a) : null);
@@ -226,11 +236,13 @@ async function main(argv) {
       say({ admin_credential_present: true, did_method: method, did_fragments: fragments });
       return 0;
     }
+      // ship:drop-end
     case 'rekey': {
       const r = rekey(store, readPassphrase(a), readPassphrase(b));
       say(r);
       return r.values_unchanged && r.salt_changed && !r.old_opens && r.new_opens ? 0 : 1;
     }
+      // ship:drop-begin
     case 'encrypt-test': {
       const { j, shape } = readStore(store);
       if (shape !== 'plain') { say({ refused: 'not a plain store' }); return 1; }
@@ -245,8 +257,9 @@ async function main(argv) {
       say({ written: true });
       return 0;
     }
+      // ship:drop-end
     default:
-      console.error('usage: mediator-store.mjs names|absent|opens|delete-admin|admin-out|seal-test <store> …');
+      console.error('usage: mediator-store.mjs <subcommand> <store> …');
       return 2;
   }
 }

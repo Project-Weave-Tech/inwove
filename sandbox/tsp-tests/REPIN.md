@@ -34,3 +34,10 @@ the host only when every step below holds on the new pin, in one job run, and Se
    is gone at the end. If a re-pin drops the echo (upstream report 4), the "must first hit" line turns red: re-read it
    with Security, never loosen it in place.
 9. **The rest of the mediator job green**, and the units (`npm test`; `node --test admin-key-markers.test.mjs` here).
+10. **The images** (Security 12422 e, 12491 b, 12519 e, 12195.1 d): `mediator-images.sh` builds the service image
+    and the one-off rekey image from the same commit and judges both on their whole filesystems (after the same search
+    hits a planted tree). The service image holds no `mediator-setup`, no `mediator-store.mjs`, no file carrying
+    `rekey`/`delete-admin`/`admin-out`/`seal-test`/`encrypt-test`, no D-Bus daemon/broker/launcher or bus path, and
+    names no `DBUS_*`/`XDG_RUNTIME_DIR`. The rekey image's shipped tool has only `rekey`/`opens`/`names`/`absent`;
+    its sha256 goes in L8. A hit in a file we didn't put there is a finding for SECURITY, never a word to drop. Both
+    base images are pinned by digest; a re-pin re-reads them.
