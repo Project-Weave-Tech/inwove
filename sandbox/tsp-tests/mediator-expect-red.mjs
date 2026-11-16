@@ -12,6 +12,9 @@
 //     confirmed by an answer; every non-admin check in that run still passes;
 //   - the DIDComm run says pass with S2 admin-list, S2 adds and E1 (Security 12672.2: an unsigned admin write is refused
 //     proof_required and does not land, an unsigned read answers) passing;
+//     and E1r (Security 12856: the same signed admin write played back is refused duplicate inside the window, in a
+//     fresh envelope and as the same bytes, and stale after it; none of them lands, read back) passing; a replay that
+//     lands under enforce is a STOP and a finding for SECURITY;
 //   - the known-gap line tsp_account_add_lands_despite_refusal (Security 12672.1) reads 3/3, AMBER; any other count is
 //     a STOP (red, a re-pin note), never silently accepted;
 //   - both record block_remote_admin_msgs: true and their admin_transport (tsp / didcomm).
@@ -64,6 +67,11 @@ export function evaluate(tsp, didcomm) {
     if (d.checks?.S2_admin_allow_list_is_mediator_only?.pass !== true) red('didcomm: S2 admin list not mediator-only')
     if (d.checks?.S2_adds_confirmed_under_closed_default?.pass !== true) red('didcomm: S2 adds not confirmed')
     if (d.checks?.E1_enforce_unsigned_admin_write_refused?.pass !== true) red('didcomm: E1 an unsigned admin write was not refused proof_required (enforce), or it landed')
+    // Security 12856: a signed admin write played back is refused `duplicate` inside the window and `stale` after it,
+    // and the read-back shows it did not land. A replay that LANDS under enforce stops the line and is a finding.
+    const e1r = d.checks?.E1r_enforce_signed_replay_refused
+    if (e1r?.landed_under_enforce === true) { red('STOP: didcomm: E1r a replayed signed admin write landed under enforce (to SECURITY before anything is written upstream)'); findings.push('a replayed signed admin write landed under trust_task_verification = "enforce"') }
+    else if (e1r?.pass !== true) red('didcomm: E1r a replayed signed admin write was not refused duplicate (inside the window) and stale (after it), or the read-back could not tell')
   }
 
   // ---- the TSP run: refused exactly as known, and nothing landed by that call ----

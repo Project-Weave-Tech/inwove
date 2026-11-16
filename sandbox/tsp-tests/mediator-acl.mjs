@@ -213,6 +213,7 @@ if (!sa.ok || !sb.ok || !sd.ok) { results.error = 'a registered DID could not si
 // through (:176-187). The answer is never the proof: B's list is read back (signed) and U must not be on it. A READ with
 // no proof (access-list/list, IS_PROOF_REQUIRED false) must still answer. Control: the same update signed lands and the
 // read-back shows U, so the read-back can see a landed write; then B's list is cleared back to empty.
+let e1rLate = null // the after-window half of E1r, run at the end
 if (ADMIN_DIDCOMM) {
   const bHash = await sha256hex(B.id), uHash = await sha256hex(U.id)
   const listed = async () => { const l = await adminTask(LIST_LIST, { did: bHash, entries: [uHash] }); return { answered: !!l.answerType, listed: (l.answer?.entries ?? []).map(String).includes(uHash), status: l.status, problem: l.problem ?? null } }
@@ -231,6 +232,42 @@ if (ADMIN_DIDCOMM) {
   e1.pass = !e1.unsigned_write.answered && e1.unsigned_write.tt_code === 'message.trust_task.proof_required' && afterUnsigned.answered && !afterUnsigned.listed && e1.unsigned_read.answered && afterSigned.listed
   results.checks.E1_enforce_unsigned_admin_write_refused = e1
   log('E1 unsigned admin write (enforce)', e1)
+
+  // ---- E1r (Security 12856): a signed admin write played back is refused, inside the window and after it ----
+  // Inside the window: claim() (trust_task_verify.rs claim, keyed on sender + document id, digest-bound) must refuse the
+  // same document `message.trust_task.duplicate`. After it (issuedAt + DEFAULT_MAX_AGE 5 min + DEFAULT_SKEW 60 s,
+  // trust-tasks-rs 0.37.0 freshness.rs:44/:54, FreshnessPolicy::consequential, no expiresAt): `message.trust_task.stale`.
+  // An add is idempotent, so "one change, not two" is read this way: R (add a fresh hash to B's list) is sent once and
+  // read back listed; a second, fresh signed update clears the list and reads back empty; then R is played back. If the
+  // replay landed, the hash is on the list again. Played back two ways: the same signed document in a fresh envelope
+  // (what claim() exists to catch), and the exact bytes again (a network replay). Both must be refused and not land.
+  // The after-window replay runs at the end of this run (below), so the wait doesn't age anyone else's session.
+  // A replay that lands under `enforce` stops the line: the expect-red goes red with a STOP and a finding for SECURITY.
+  const rHash = await sha256hex(keyVid().id)
+  const listedR = async () => { const l = await adminTask(LIST_LIST, { did: bHash, entries: [rHash] }); return { answered: !!l.answerType, listed: (l.answer?.entries ?? []).map(String).includes(rHash) } }
+  const R = await didcommAdmin.packDoc(ADMIN, MED, didcommAdmin.trustTaskDoc(ADMIN, MED, LIST_UPDATE, { did: bHash, add: [rHash] }))
+  const first = await didcommAdmin.sendPacked(post, ADMIN, sAdm.token, MED, R)
+  const afterFirst = await listedR()
+  const cleared = await adminTask(LIST_UPDATE, { did: bHash, clear: true })
+  const afterClear = await listedR()
+  const again = await didcommAdmin.sendPacked(post, ADMIN, sAdm.token, MED, await didcommAdmin.packDoc(ADMIN, MED, R.doc))
+  const afterAgain = await listedR()
+  const bytes = await didcommAdmin.sendPacked(post, ADMIN, sAdm.token, MED, R)
+  const afterBytes = await listedR()
+  const code = (x) => ({ status: x.status, answered: !!x.answerType, problem: typeof x.problem === 'number' ? x.problem : (x.problem ? 'other' : null), tt_code: x.tt_code ?? null })
+  const e1r = {
+    first: code(first), first_landed: afterFirst.listed, cleared: { answered: !!cleared.answerType }, cleared_readback_empty: afterClear.answered && !afterClear.listed,
+    replay_same_doc: code(again), replay_same_doc_landed: afterAgain.listed, readback_after_replay_answered: afterAgain.answered,
+    replay_same_bytes: code(bytes), replay_same_bytes_landed: afterBytes.listed, readback_after_bytes_answered: afterBytes.answered,
+  }
+  e1r.landed_under_enforce = afterAgain.listed || afterBytes.listed
+  e1r.inside_window_pass = e1r.first.answered && e1r.first_landed && e1r.cleared_readback_empty
+    && !e1r.replay_same_doc.answered && e1r.replay_same_doc.tt_code === 'message.trust_task.duplicate' && afterAgain.answered && !afterAgain.listed
+    && !e1r.replay_same_bytes.answered && afterBytes.answered && !afterBytes.listed
+  e1r.pass = false // set at the end, once the after-window replay has run
+  results.checks.E1r_enforce_signed_replay_refused = e1r
+  log('E1r replay inside the window', e1r)
+  e1rLate = { R, bHash, rHash, issuedAt: Date.parse(R.doc.issuedAt) }
 }
 
 // ---- step 0 (Railroad 11606): account/add over TSP skips check_permissions; prove it is still admin-only ----
@@ -327,6 +364,23 @@ log('C4 D → A (denied)', { status: c4.status, problem: c4.problem, reached_A: 
   const after = sa2.ok ? await task(A, sa2.token, LIST_UPDATE, { did: await sha256hex(A.id), add: [await sha256hex(X.id)] }) : null
   results.findings = { Z3_readd_existing_account: { readd_answer: re.answerType ?? re.problem ?? null, a_signs_in_after: sa2.ok, a_list_update_after: after ? { status: after.status, answerType: after.answerType, problem: after.problem ?? null } : null, overwritten: !!after && !after.answerType } }
   log('Z3 re-add existing A', results.findings.Z3_readd_existing_account)
+}
+// ---- E1r, after the window (Security 12856): the same signed document once more → message.trust_task.stale ----
+// Waits until issuedAt + 5 min + 60 s skew + a 20 s margin (about six minutes of this run). The admin signs in afresh
+// first, so an expired session can't stand in for the refusal.
+if (e1rLate) {
+  const e1r = results.checks.E1r_enforce_signed_replay_refused
+  const waitMs = e1rLate.issuedAt + (5 * 60 + 60 + 20) * 1000 - Date.now()
+  if (waitMs > 0) { log('E1r waiting for the window to close', `${Math.ceil(waitMs / 1000)} s`); await new Promise((r) => setTimeout(r, waitMs)) }
+  const s2 = await adminSignIn()
+  const late = s2.ok ? await didcommAdmin.sendPacked(post, ADMIN, s2.token, MED, await didcommAdmin.packDoc(ADMIN, MED, e1rLate.R.doc)) : null
+  const l = s2.ok ? await didcommAdmin.task(post, ADMIN, s2.token, MED, LIST_LIST, { did: e1rLate.bHash, entries: [e1rLate.rHash] }) : null
+  const lateListed = (l?.answer?.entries ?? []).map(String).includes(e1rLate.rHash)
+  e1r.after_window = { admin_signed_in: s2.ok, seconds_after_issued: Math.round((Date.now() - e1rLate.issuedAt) / 1000), ...(late ? { status: late.status, answered: !!late.answerType, tt_code: late.tt_code ?? null } : {}), readback_answered: !!l?.answerType, landed: lateListed }
+  e1r.landed_under_enforce = e1r.landed_under_enforce || lateListed
+  e1r.after_window_pass = !!late && !late.answerType && late.tt_code === 'message.trust_task.stale' && !!l?.answerType && !lateListed
+  e1r.pass = e1r.inside_window_pass && e1r.after_window_pass && !e1r.landed_under_enforce
+  log('E1r replay after the window', e1r.after_window)
 }
 results.pass = Object.values(results.checks).every((c) => c.pass)
 results.log_lines_with_redis_password = medLog.split('\n').filter((l) => l.includes(PW)).length

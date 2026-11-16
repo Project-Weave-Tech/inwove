@@ -40,7 +40,8 @@
 #     line other than exactly `file://<volume>/secrets.json?encrypt=1`, or not exactly one (Security 12247.4: the
 #     check above must read the same file the mediator opens)
 #   - the conf's `[security]` doesn't hold `trust_task_verification = "enforce"` as a typed literal, exactly once
-#     (Security 12672.2; under `warn` an unsigned or replayed admin write is let through)
+#     (Security 12672.2; under `warn` an unsigned or replayed admin write is let through), or holds a TOML
+#     multi-line string anywhere (Security 12795.2: one can hide a line that reads as the key)
 #   - the store file is missing, a symlink or not a regular file: the encrypted backend CREATES an empty store when
 #     its file is absent (file_encrypted.rs open → init_new), so a lost volume must stop the start, never be replaced
 # Host names on no list (the platform's own, e.g. its PORT) are not refused: `env -i` drops them, and one start line
@@ -168,6 +169,13 @@ file_backends="$(grep -E '^[[:space:]]*backend[[:space:]]*=[[:space:]]*"file://'
 # quoted or dotted key, an inline table, a `${VAR:…}` expansion, `warn`, a duplicate or a missing line all refuse.
 # TRUST_TASK_VERIFICATION on the host refuses by the deny list above (the record's deny side), and the mediator never
 # gets one: env -i passes the allow list only. This is the cheap tripwire; the behaviour proof is E1 in the job.
+# Security 12795.2: a TOML multi-line string (three double or three single quotes) can carry a line that reads as the
+# key while the real key is absent, so the mediator runs its default `warn`. Neither upstream's template
+# (conf/mediator.toml, which setup includes at config_writer.rs:45) nor setup's writer uses one at the pin, so any
+# line holding either refuses, comment lines included (a line-based check can't tell where a string starts). 16.1's
+# conf hash pin closes it for good once that conf exists.
+grep -qF '"""' "$conf" && refuse "the mediator conf holds a TOML multi-line string (three double quotes)"
+grep -qF "'''" "$conf" && refuse "the mediator conf holds a TOML multi-line string (three single quotes)"
 [ "$(grep -vE '^[[:space:]]*#' "$conf" | grep -ci 'trust_task_verification' || true)" = 1 ] || refuse "the mediator conf does not name trust_task_verification on exactly one line"
 grep -qE '^[[:space:]]*trust_task_verification[[:space:]]*=[[:space:]]*"enforce"[[:space:]]*$' "$conf" || refuse "the mediator conf's trust_task_verification is not the literal \"enforce\""
 ttv_section="$(awk '/^[[:space:]]*#/ { next } /^[[:space:]]*\[/ { s = $0; gsub(/[[:space:]]/, "", s) } /trust_task_verification/ { print s; exit }' "$conf")"

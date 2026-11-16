@@ -347,3 +347,23 @@ test('entrypoint 12672.2: the conf must hold trust_task_verification = "enforce"
     assert.equal(conf('[security]\nssl = "none"\n  trust_task_verification   =   "enforce"  \n').code, 0);
   } finally { r.done(); }
 });
+
+test('entrypoint 12795.2: a TOML multi-line string anywhere in the conf refuses (it can hide a line that reads as the key)', { skip: !haveTmpfs && 'no tmpfs' }, () => {
+  const r = rig();
+  try {
+    const other = join(r.disk, 'ml.toml');
+    const be = `[secrets]\nbackend = "file://${r.volume}/secrets.json?encrypt=1"\n`;
+    const conf = (sec) => { writeFileSync(other, sec + be); return run(r, { medArgs: ['-c', other] }); };
+    const DQ = '"""', SQ = "'''";
+    // Security's probe: the real key absent, a string body that reads as it (accepted before this check)
+    refused(conf(`[security]\nnote = ${DQ}\ntrust_task_verification = "enforce"\n${DQ}\n`), 'multi-line string \\(three double quotes\\)');
+    refused(conf(`[security]\nnote = ${SQ}\ntrust_task_verification = "enforce"\n${SQ}\n`), 'multi-line string \\(three single quotes\\)');
+    // the real key present too: still refused (fails closed)
+    refused(conf(`[security]\ntrust_task_verification = "enforce"\nnote = ${DQ}x${DQ}\n`), 'multi-line string');
+    refused(conf(`[security]\ntrust_task_verification = "enforce"\nnote = ${SQ}x${SQ}\n`), 'multi-line string');
+    // in a comment line too
+    refused(conf(`[security]\n# see ${DQ}\ntrust_task_verification = "enforce"\n`), 'multi-line string');
+    // green: one or two quotes in a row are not caught
+    assert.equal(conf(`[security]\nnote = "a \\"b\\" c"\nempty = ""\nlit = 'x'\nnone = ''\ntrust_task_verification = "enforce"\n`).code, 0);
+  } finally { r.done(); }
+});

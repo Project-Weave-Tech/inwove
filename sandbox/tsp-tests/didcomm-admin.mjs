@@ -69,10 +69,16 @@ export const ttCodeOf = (s) => (String(s ?? '').match(/message\.trust_task\.[a-z
 
 // One Trust Task over DIDComm. Same return shape as the TSP path's task(): { status, answerType, answer, problem? }.
 export async function task(post, who, token, med, typeUri, payload, opts = {}) {
+  return sendPacked(post, who, token, med, await packDoc(who, med, trustTaskDoc(who, med, typeUri, payload, opts)))
+}
+// Security 12856's replay probe: a document built (and signed) once, so the same document can be sent again in a fresh
+// envelope (packDoc again), or the exact bytes resent (sendPacked with the same packed value).
+export async function packDoc(who, med, doc) {
   const p = parties(who, med)
-  const doc = trustTaskDoc(who, med, typeUri, payload, opts)
   const msg = envelopeFor(who, med, doc)
-  const jwe = await dc.pack({ message: msg, sender: p.me, recipient: p.medRecipient })
+  return { doc, msg, jwe: await dc.pack({ message: msg, sender: p.me, recipient: p.medRecipient }) }
+}
+export async function sendPacked(post, who, token, med, { msg, jwe }) {
   const sent = await post('/inbound', jwe, token)
   if (sent.status >= 300) return { status: sent.status, problem: problemOf(sent), tt_code: ttCodeOf(sent.text), via: 'didcomm' }
   const replies = await collect(post, who, token, med)

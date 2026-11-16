@@ -29,7 +29,7 @@ const tspRun = () => ({
 });
 const dcRun = () => ({
   setup: { block_remote_admin_msgs: true, admin_transport: 'didcomm', admin_sign_in: { ok: true, via: 'didcomm' } },
-  checks: { ...otherChecks(), S2_admin_allow_list_is_mediator_only: { pass: true }, S2_adds_confirmed_under_closed_default: { pass: true }, E1_enforce_unsigned_admin_write_refused: { pass: true } },
+  checks: { ...otherChecks(), S2_admin_allow_list_is_mediator_only: { pass: true }, S2_adds_confirmed_under_closed_default: { pass: true }, E1_enforce_unsigned_admin_write_refused: { pass: true }, E1r_enforce_signed_replay_refused: { pass: true, landed_under_enforce: false } },
   pass: true, log_lines_with_redis_password: 0,
 });
 
@@ -158,4 +158,22 @@ test('expect-red 12672.2: the DIDComm run must carry a passing E1 (unsigned admi
     assert.equal(v.pass, false);
     assert.ok(v.reasons.some((r) => r.startsWith('didcomm: E1')));
   }
+});
+
+test('expect-red 12856: the DIDComm run must carry a passing E1r (a signed admin write played back is refused)', () => {
+  for (const e1r of [undefined, { pass: false, landed_under_enforce: false }, { pass: 'yes' }]) {
+    const d = dcRun(); if (e1r) d.checks.E1r_enforce_signed_replay_refused = e1r; else delete d.checks.E1r_enforce_signed_replay_refused;
+    const v = evaluate(ok(tspRun()), ok(d));
+    assert.equal(v.pass, false);
+    assert.ok(v.reasons.some((r) => r.startsWith('didcomm: E1r')));
+    assert.equal(v.finding_for_security, false);
+  }
+});
+
+test('expect-red 12856: a replay that lands under enforce is a STOP and a finding for SECURITY, even if pass says true', () => {
+  const d = dcRun(); d.checks.E1r_enforce_signed_replay_refused = { pass: true, landed_under_enforce: true };
+  const v = evaluate(ok(tspRun()), ok(d));
+  assert.equal(v.pass, false);
+  assert.ok(v.reasons.some((r) => r.startsWith('STOP: didcomm: E1r')));
+  assert.equal(v.finding_for_security, true);
 });
