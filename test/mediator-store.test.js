@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -69,12 +69,14 @@ test('store: admin-out writes the credential 0600 and prints only its shape; rot
   try {
     const s = join(r.d, 'secrets.json');
     run('seal-test', s, join(r.d, 'p1'), VALUES);
-    const o = join(r.d, 'admin.json');
+    const shm = mkdtempSync('/dev/shm/store-');
+    const o = join(shm, 'admin.json');
     const x = run('admin-out', s, join(r.d, 'p1'), o);
     assert.equal(x.code, 0, x.err); assert.equal(x.j.did_method, 'did:key');
     assert.equal(JSON.parse(readFileSync(o, 'utf8')).did, 'did:key:zTEST');
     assert.equal((statSync(o).mode & 0o777).toString(8), '600');
     assert.ok(!x.out.includes('zTESTONLY'));
+    rmSync(shm, { recursive: true, force: true });
     const s2 = join(r.d, 'rotated.json');
     run('seal-test', s2, join(r.d, 'p2'), VALUES);
     assert.equal(run('opens', s2, join(r.d, 'p1')).code, 4);
@@ -87,10 +89,48 @@ test('store: rekey (v) re-seals every entry under the new passphrase in place; t
   try {
     const s = join(r.d, 'secrets.json');
     run('seal-test', s, join(r.d, 'p1'), VALUES);
+    // 12247 (i)(a): refused while the admin credential is in the store, and nothing written
+    const before = readFileSync(s, 'utf8');
+    const refusedRekey = run('rekey', s, join(r.d, 'p1'), join(r.d, 'p2'));
+    assert.notEqual(refusedRekey.code, 0); assert.match(refusedRekey.err, /mediator_admin_credential is still in the store/);
+    assert.equal(readFileSync(s, 'utf8'), before);
+    assert.equal(run('delete-admin', s, join(r.d, 'p1')).code, 0);
     const x = run('rekey', s, join(r.d, 'p1'), join(r.d, 'p2'));
     assert.equal(x.code, 0, x.err);
-    assert.deepEqual(x.j, { entries: ['mediator_admin_credential', 'mediator_jwt_secret', 'mediator_operating_secrets'], values_unchanged: true, salt_changed: true, old_opens: false, new_opens: true, mode: '600' });
+    assert.deepEqual(x.j, { entries: ['mediator_jwt_secret', 'mediator_operating_secrets'], values_unchanged: true, salt_changed: true, old_opens: false, new_opens: true, mode: '600' });
     assert.equal(run('opens', s, join(r.d, 'p1')).code, 4);
     assert.notEqual(run('rekey', s, join(r.d, 'p1'), join(r.d, 'p2')).code, 0, 'the old passphrase can no longer rekey');
+  } finally { r.done(); }
+});
+
+test('store 12247.3: admin-out refuses an <out> off /dev/shm or under a results/ path, and writes nothing there', () => {
+  const r = rig();
+  const shm = mkdtempSync('/dev/shm/store-');
+  try {
+    const s = join(r.d, 'secrets.json');
+    run('seal-test', s, join(r.d, 'p1'), VALUES);
+    const disk = join(r.d, 'admin.json');
+    assert.equal(run('admin-out', s, join(r.d, 'p1'), disk).code, 5); assert.ok(!existsSync(disk));
+    mkdirSync(join(shm, 'results'));
+    const res = join(shm, 'results', 'admin.json');
+    assert.equal(run('admin-out', s, join(r.d, 'p1'), res).code, 5); assert.ok(!existsSync(res));
+  } finally { r.done(); rmSync(shm, { recursive: true, force: true }); }
+});
+
+test('store 12247 nit: KDF parameters above what upstream writes refuse before Argon2 runs (a planted store cannot hang the tool)', () => {
+  const r = rig();
+  try {
+    const s = join(r.d, 'secrets.json');
+    run('seal-test', s, join(r.d, 'p1'), VALUES);
+    const j = JSON.parse(readFileSync(s, 'utf8'));
+    for (const [k, v] of [['memory_kib', 65537], ['iterations', 1000000], ['parallelism', 5], ['iterations', 0], ['memory_kib', 1.5]]) {
+      const bad = join(r.d, `bad-${k}-${v}.json`);
+      writeFileSync(bad, JSON.stringify({ ...j, kdf: { ...j.kdf, [k]: v } }));
+      const t0 = Date.now();
+      const x = run('opens', bad, join(r.d, 'p1'));
+      assert.equal(x.code, 4, `${k}=${v}`); assert.ok(Date.now() - t0 < 10000, `${k}=${v} returned quickly`);
+      assert.notEqual(run('delete-admin', bad, join(r.d, 'p1')).code, 0, `${k}=${v} delete refuses`);
+    }
+    assert.equal(run('opens', s, join(r.d, 'p1')).code, 0, 'upstream values themselves still open');
   } finally { r.done(); }
 });

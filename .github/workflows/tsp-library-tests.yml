@@ -245,6 +245,20 @@ jobs:
         continue-on-error: true
         working-directory: ${{ runner.temp }}/med
         run: cargo build --locked --release -p affinidi-messaging-mediator-setup --no-default-features --target-dir "$RUNNER_TEMP/setup-target" 2>&1 | tail -n 40; exit ${PIPESTATUS[0]}
+      - name: "the setup binary's record (Security 12277 setup row — resolved features + its sha256, no vta/secrets-*/publish-aws/aws road, control = its default build must fail)"
+        id: setupfeats
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/med
+        run: |
+          set -euo pipefail
+          cargo tree -e features -p affinidi-messaging-mediator-setup --no-default-features --locked > "$RUNNER_TEMP/tree-setup.txt"
+          cargo tree -e normal -p affinidi-messaging-mediator-setup --no-default-features --locked --depth 0 -f '{p}|{f}' > "$RUNNER_TEMP/root-setup.txt"
+          cargo tree -e features -p affinidi-messaging-mediator-setup --locked > "$RUNNER_TEMP/tree-setup-default.txt"
+          cargo tree -e normal -p affinidi-messaging-mediator-setup --locked --depth 0 -f '{p}|{f}' > "$RUNNER_TEMP/root-setup-default.txt"
+          s=0; node "$GITHUB_WORKSPACE/$WPI_DIR/mediator-features.mjs" "$RUNNER_TEMP/tree-setup.txt" "$RUNNER_TEMP/med" "$GITHUB_WORKSPACE/$OUT/features-setup.json" --setup "$RUNNER_TEMP/root-setup.txt" --bin "$RUNNER_TEMP/setup-target/release/mediator-setup" || s=$?
+          c=0; node "$GITHUB_WORKSPACE/$WPI_DIR/mediator-features.mjs" "$RUNNER_TEMP/tree-setup-default.txt" "$RUNNER_TEMP/med" "$GITHUB_WORKSPACE/$OUT/features-setup-control.json" --setup "$RUNNER_TEMP/root-setup-default.txt" --expect-fail || c=$?
+          sed "s#$RUNNER_TEMP/med#<checkout>#g" "$RUNNER_TEMP/tree-setup.txt" > "$GITHUB_WORKSPACE/$OUT/tree-setup.txt"
+          test "$s" -eq 0 && test "$c" -eq 0
       - name: the setup job's backend half (mediator-setup → ?encrypt=1, 16.3(b) refuse, surgical delete, green on the encrypted store, (v) rotation)
         # Security 11984 §2(v) + 16.3, Railroad note ii. The setup binary is never beside the mediator binary (1b).
         id: setuprun
@@ -261,8 +275,8 @@ jobs:
           path: results/mediator-early
           retention-days: 30
       - name: fail if any step failed
-        if: always() && (steps.feats.outcome == 'failure' || steps.envreads.outcome == 'failure' || steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.aclclosed.outcome == 'failure' || steps.entrypoint.outcome == 'failure' || steps.setupbuild.outcome == 'failure' || steps.setuprun.outcome == 'failure')
-        run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed ${{ steps.aclclosed.outcome }}, entrypoint ${{ steps.entrypoint.outcome }}, setup build ${{ steps.setupbuild.outcome }}, setup run ${{ steps.setuprun.outcome }}" && exit 1
+        if: always() && (steps.feats.outcome == 'failure' || steps.envreads.outcome == 'failure' || steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.aclclosed.outcome == 'failure' || steps.entrypoint.outcome == 'failure' || steps.setupbuild.outcome == 'failure' || steps.setupfeats.outcome == 'failure' || steps.setuprun.outcome == 'failure')
+        run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed ${{ steps.aclclosed.outcome }}, entrypoint ${{ steps.entrypoint.outcome }}, setup build ${{ steps.setupbuild.outcome }}, setup features ${{ steps.setupfeats.outcome }}, setup run ${{ steps.setuprun.outcome }}" && exit 1
 
   report:
     name: report (one markdown report; fails while a line is missing)

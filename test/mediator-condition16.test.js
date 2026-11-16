@@ -7,7 +7,7 @@ import { readsOf, constsOf, stripTestModules, wrapperCalls, classify, closureCal
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { verdict, normalise } from '../sandbox/tsp-tests/mediator-features.mjs';
+import { verdict, normalise, rootFeatures } from '../sandbox/tsp-tests/mediator-features.mjs';
 
 const lists = {
   allow: ['DATABASE_URL', 'RUST_LOG'],
@@ -70,6 +70,24 @@ test('features: the lean tree passes; a vta feature edge, a vta crate or a secre
   assert.equal(verdict(lean + '│   ├── aws-config v1.8.0\n').clean, false);
   assert.equal(verdict(lean + '│   ├── rustls feature "aws-lc-rs"\n│   │   └── aws-lc-rs v1.13.0\n').clean, true, 'rustls crypto is not the AWS SDK');
   assert.equal(verdict('').clean, false, 'an empty tree is not a clean one');
+});
+
+test('features, setup binary (Security 12277): vta-sdk is expected; its own vta/secrets-*/publish-aws, an aws edge or an AWS SDK crate fails', () => {
+  const tree = 'affinidi-messaging-mediator-setup v0.50.0 (/w/med/tools/mediator-setup)\n├── vta-sdk feature "provision-client"\n│   └── vta-sdk v0.77.1\n├── tokio v1.0.0\n';
+  const clean = (t, root = []) => verdict(t, { setup: true, root }).clean;
+  assert.equal(clean(tree), true, 'the vta-sdk crate alone is expected in the setup binary');
+  assert.equal(verdict(tree).clean, false, 'but it still fails the running image check');
+  assert.deepEqual(rootFeatures('affinidi-messaging-mediator-setup v0.50.0 (/w)|secrets-aws,publish-aws\n'), ['publish-aws', 'secrets-aws']);
+  assert.deepEqual(rootFeatures('affinidi-messaging-mediator-setup v0.50.0 (/w)|\n'), []);
+  assert.equal(clean(tree, ['secrets-vault']), false);
+  assert.equal(clean(tree, ['publish-aws']), false);
+  assert.equal(clean(tree, ['vta']), false);
+  assert.equal(clean(tree + '│   ├── affinidi-messaging-mediator-common feature "secrets-k8s"\n'), false);
+  assert.equal(clean(tree + '├── some-crate feature "vta"\n'), false);
+  assert.equal(clean(tree + '├── x feature "aws"\n'), false);
+  assert.equal(clean(tree + '│   ├── aws-sdk-ssm v1.0.0\n'), false);
+  assert.equal(clean(tree + '│   ├── aws-config v1.8.0\n'), false);
+  assert.equal(clean(tree + '│   ├── rcgen feature "aws_lc_rs"\n│   │   └── aws-lc-rs v1.13.0\n'), true, 'rcgen/rustls crypto is not the AWS SDK');
 });
 
 test('features: the record hash does not depend on where the checkout sits', () => {

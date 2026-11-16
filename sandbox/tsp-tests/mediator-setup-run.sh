@@ -14,7 +14,14 @@
 #   6. (v) rotation in place (mediator-store.mjs rekey, same entries so the DID is kept): the old passphrase no longer
 #      opens the store; the mediator through the entrypoint with the OLD passphrase does not start; with the NEW one
 #      it starts and answers.
-#   7. No stdout/stderr line of setup or any start carries either passphrase or the Redis password (15(iv)).
+#   7. No stdout/stderr line of setup or any start carries either passphrase or the Redis password (15(iv)), nor
+#      any value of the admin credential that setup made (Security 12247.2: on the real host setup's stdout goes to
+#      Railway's log). The markers are the credential's own string values, read by `admin-out` to tmpfs before the
+#      delete; the scan must first find them in the credential itself (a scan that can't hit isn't evidence).
+#   8. admin-out custody (Security 12247.3): its <out> only under this job's /dev/shm dir; a results/ path is refused
+#      (tried, must exit 5); the file is removed right after the admin calls (none yet: they come with the DIDComm
+#      admin client) and before delete-admin; the job fails if it still exists at the end, and the artifact dir is
+#      listed by name for it.
 # The conf is setup's own output with its relative paths made absolute; it is NOT the pinned production conf
 # (16.1's hash pin and four-value check belong to that conf, which isn't written yet). Not yet here: the DIDComm
 # admin calls and the read-back-is-truth test (they come with the DIDComm admin path).
@@ -84,6 +91,26 @@ names_before=$(node "$STORE" names "$VOL/secrets.json" 2>/dev/null || echo '{}')
 opens_p1=$(node "$STORE" opens "$VOL/secrets.json" "$SHM/p1" >/dev/null 2>&1 && echo true || echo false)
 opens_wrong=$(node "$STORE" opens "$VOL/secrets.json" "$SHM/pwrong" >/dev/null 2>&1 && echo true || echo false)
 
+# 8. admin-out to tmpfs, the markers from it, then the file goes before the delete (12247.2/.3)
+RESDIR=$(dirname "$(readlink -f "$OUT" 2>/dev/null || echo "$OUT")"); mkdir -p "$RESDIR"
+ao_results_code=0; node "$STORE" admin-out "$VOL/secrets.json" "$SHM/p1" "$RESDIR/admin.json" >/dev/null 2>&1 || ao_results_code=$?
+ADMIN_OUT="$SHM/admin.json"
+ao_code=0; node "$STORE" admin-out "$VOL/secrets.json" "$SHM/p1" "$ADMIN_OUT" > "$WORK/admin-out.json" 2>"$WORK/admin-out.err" || ao_code=$?
+MARKS="$SHM/admin-markers"
+( umask 077; node -e '
+// The private key value (AdminCredential.private_key_multibase, well_known.rs:111 at 34bbdea4), it without its
+// multibase prefix, and the credential JSON itself. Not the DID: that is public and may be logged.
+const fs = require("fs"); const out = [];
+let raw = ""; try { raw = fs.readFileSync(process.argv[1], "utf8"); } catch {}
+try { const k = String(JSON.parse(raw).private_key_multibase || ""); if (k.length >= 16) out.push(k, k.slice(1)); } catch {}
+const line = raw.trim(); if (line.length >= 16 && !line.includes("\n")) out.push(line);
+fs.writeFileSync(process.argv[2], [...new Set(out)].join("\n") + (out.length ? "\n" : ""));
+' "$ADMIN_OUT" "$MARKS" )
+admin_marks=$(grep -c . "$MARKS" || true)
+admin_self_hits=$(grep -c -F -f "$MARKS" "$ADMIN_OUT" 2>/dev/null || true)
+# (the DIDComm admin calls go here, reading $ADMIN_OUT)
+rm -f -- "$ADMIN_OUT"; admin_out_removed_before_delete=$([ -e "$ADMIN_OUT" ] && echo false || echo true)
+
 DENY="$WORK/deny.txt"; node "$HERE/mediator-deny-file.mjs" "$RECORD" "$DENY" > /dev/null
 # One start through the entrypoint: $1 label, $2 the passphrase file to give the host secret. Results → $WORK/<label>.json
 start() {
@@ -126,9 +153,12 @@ names_after=$(node "$STORE" names "$VOL/secrets.json" 2>/dev/null || echo '{}')
 
 # 7. no line anywhere carries either passphrase or the Redis password
 leaks=$(cat "$WORK"/*.out "$WORK"/*.err | grep -c -F -e "$P1" -e "$P2" -e "$REDIS_MARK" || true)
+admin_leaks=$( [ "${admin_marks:-0}" -gt 0 ] && { cat "$WORK"/*.out "$WORK"/*.err | grep -c -F -f "$MARKS" || true; } || echo 0)
+admin_out_at_end=$([ -e "$ADMIN_OUT" ] && echo present || echo absent)
+results_named_admin=$(find "$RESDIR" \( -name 'admin.json' -o -name 'admin-out*' -o -name 'admin-markers' -o -name '*admin_credential*' \) 2>/dev/null | grep -c . || true)
 
 node -e '
-const fs = require("fs"); const [W, out, setupCode, backend, nb, na, o1, ow, leaks] = process.argv.slice(1);
+const fs = require("fs"); const [W, out, setupCode, backend, nb, na, o1, ow, leaks, aoRes, ao, marks, selfHits, removed, aLeaks, atEnd, resNamed] = process.argv.slice(1);
 const rd = (f) => { try { return JSON.parse(fs.readFileSync(`${W}/${f}`, "utf8")); } catch { return null; } };
 const before = JSON.parse(nb), after = JSON.parse(na);
 const cred = rd("refuse-admin-credential.json"), green = rd("green-encrypted.json"), del = rd("delete-admin.json");
@@ -144,14 +174,18 @@ const v = {
   rotation_v_old_refused_by_mediator: old && !old.started && old.exit !== 0 ? "PASS" : "FAIL",
   rotation_v_new_starts: neu && neu.started && neu.environ_is_allow_list ? "PASS" : "FAIL",
   marker_15_iv: leaks === "0" ? "PASS" : `FAIL (${leaks} lines)`,
+  marker_admin_credential_12247_2: ao === "0" && Number(marks) > 0 && Number(selfHits) > 0 && aLeaks === "0" ? "PASS" : `FAIL (admin-out ${ao}, ${marks} markers, self ${selfHits}, ${aLeaks} lines)`,
+  admin_out_custody_12247_3: aoRes === "5" && removed === "true" && atEnd === "absent" && resNamed === "0" ? "PASS" : `FAIL (results path ${aoRes}, removed ${removed}, at end ${atEnd}, ${resNamed} named in results)`,
 };
 const res = {
   what: "setup job, backend half: mediator-setup → ?encrypt=1, 16.3(b) refuse, surgical delete, green on the encrypted store, (v) rotation (Security 11984)",
   conf_backend_line: backend, entries_before: before.entries || null, entries_after: after.entries || null,
+  admin_out: rd("admin-out.json"), admin_credential_markers: Number(marks),
   surgical_delete: del, rekey: rk, runs: [cred, green, old, neu].filter(Boolean), verdicts: v,
   not_covered: ["the pinned production conf (16.1 hash + four values)", "DIDComm admin calls + read-back-is-truth"],
 };
 fs.writeFileSync(out, JSON.stringify(res, null, 2) + "\n");
 console.log(JSON.stringify(v));
 process.exit(Object.values(v).every((x) => x === "PASS") ? 0 : 1);
-' "$WORK" "$OUT" "$setup_code" "$backend_line" "$names_before" "$names_after" "$opens_p1" "$opens_wrong" "$leaks"
+' "$WORK" "$OUT" "$setup_code" "$backend_line" "$names_before" "$names_after" "$opens_p1" "$opens_wrong" "$leaks" \
+  "$ao_results_code" "$ao_code" "${admin_marks:-0}" "${admin_self_hits:-0}" "$admin_out_removed_before_delete" "$admin_leaks" "$admin_out_at_end" "$results_named_admin"

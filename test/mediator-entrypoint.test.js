@@ -27,11 +27,13 @@ function rig() {
   writeFileSync(join(volume, 'secrets.json'), JSON.stringify({ entries: { mediator_jwt_secret: 'dGVzdA', mediator_operating_secrets: 'dGVzdA' } }));
   const workdir = join(disk, 'work'); mkdirSync(workdir);
   const deny = join(disk, 'deny.txt'); writeFileSync(deny, denyFileText(RECORD));
-  return { disk, shm, med, volume, workdir, deny, done: () => { rmSync(disk, { recursive: true, force: true }); rmSync(shm, { recursive: true, force: true }); } };
+  const conf = join(disk, 'mediator.toml');
+  writeFileSync(conf, `[secrets]\nbackend = "file://${volume}/secrets.json?encrypt=1"\n[storage]\nbackend = "redis"\n`);
+  return { disk, shm, med, volume, workdir, deny, conf, done: () => { rmSync(disk, { recursive: true, force: true }); rmSync(shm, { recursive: true, force: true }); } };
 }
 const baseEnv = { PATH: '/usr/bin:/bin', DATABASE_URL: 'redis://test-only', ENKARA_MEDIATOR_BACKEND_PASSPHRASE: 'test-only-marker' };
-function run(r, { env = {}, tmpfs = r.shm, volume = r.volume, workdir = r.workdir, deny = r.deny, extra = [] } = {}) {
-  const res = spawnSync('/bin/bash', ['-p', EP, '--bin', r.med, '--volume', volume, '--tmpfs', tmpfs, '--workdir', workdir, '--deny-file', deny, ...extra, '--', '-c', 'mediator.toml'],
+function run(r, { env = {}, tmpfs = r.shm, volume = r.volume, workdir = r.workdir, deny = r.deny, extra = [], medArgs = ['-c', r.conf] } = {}) {
+  const res = spawnSync('/bin/bash', ['-p', EP, '--bin', r.med, '--volume', volume, '--tmpfs', tmpfs, '--workdir', workdir, '--deny-file', deny, ...extra, '--', ...medArgs],
     { encoding: 'utf8', env: { ...baseEnv, ...env } });
   return { code: res.status, out: res.stdout, err: res.stderr };
 }
@@ -75,7 +77,8 @@ test('entrypoint: refuses a non-tmpfs dir, one on the volume\'s filesystem, a sy
     const plain = join(r.disk, 'plain'); mkdirSync(plain);
     refused(run(r, { tmpfs: plain }), 'not tmpfs');
     const vol2 = join(r.shm, 'vol'); mkdirSync(vol2); writeFileSync(join(vol2, 'secrets.json'), JSON.stringify({ entries: {} }));
-    refused(run(r, { volume: vol2 }), "on the volume's filesystem");
+    const conf2 = join(r.disk, 'vol2.toml'); writeFileSync(conf2, `backend = "file://${vol2}/secrets.json?encrypt=1"\n`);
+    refused(run(r, { volume: vol2, medArgs: ['-c', conf2] }), "on the volume's filesystem");
     const link = join(r.disk, 'link'); symlinkSync(r.shm, link);
     refused(run(r, { tmpfs: link }), 'tmpfs dir is a symlink');
     symlinkSync(join(r.disk, 'elsewhere'), join(r.shm, 'backend-passphrase'));
@@ -240,4 +243,34 @@ test('entrypoint 12180: the script starts as bash -p, sets PATH first, and calls
   assert.equal(execs.length, 1);
   assert.match(execs[0], /^exec \/usr\/bin\/env -i /);
   assert.ok(!lines.some((l) => !l.trim().startsWith('#') && /compgen -e/.test(l)), 'host names come from /proc, not compgen -e');
+});
+
+test('entrypoint 12247.1: a store key spelled with a \\u escape is refused, though JSON.parse reads it as the admin credential', { skip: !haveTmpfs && 'no tmpfs' }, () => {
+  const r = rig();
+  try {
+    const raw = '{"entries":{"\\u006dediator_admin_credential":"eA","mediator_jwt_secret":"dGVzdA"}}';
+    assert.ok(Object.keys(JSON.parse(raw).entries).includes('mediator_admin_credential'), 'the escape decodes to the real name');
+    assert.ok(!raw.includes('"mediator_admin_credential"'), 'and the plain name is not in the file');
+    writeFileSync(join(r.volume, 'secrets.json'), raw);
+    refused(run(r), 'u escape');
+    writeFileSync(join(r.volume, 'secrets.json'), '{"entries":{"mediator_jwt_secret":"dGVzdA","x":"\\u0041"}}');
+    refused(run(r), 'u escape');
+  } finally { r.done(); }
+});
+
+test('entrypoint 12247.4: the conf must point the backend at exactly file://<volume>/secrets.json?encrypt=1', { skip: !haveTmpfs && 'no tmpfs' }, () => {
+  const r = rig();
+  try {
+    refused(run(r, { medArgs: [] }), 'no mediator conf');
+    const other = join(r.disk, 'other.toml');
+    const bad = (body) => { writeFileSync(other, body); return run(r, { medArgs: ['-c', other] }); };
+    refused(bad(`backend = "file://${r.disk}/decoy/secrets.json?encrypt=1"\n`), "conf's backend is not");
+    refused(bad(`backend = "file://${r.volume}/secrets.json"\n`), "conf's backend is not");
+    refused(bad(`backend = "file://${r.volume}/secrets.json?encrypt=1"\nbackend = "file://${r.disk}/x.json"\n`), 'exactly one file:// backend');
+    refused(bad('backend = "redis"\n'), 'exactly one file:// backend');
+    const link = join(r.disk, 'link.toml'); symlinkSync(r.conf, link);
+    refused(run(r, { medArgs: ['-c', link] }), 'conf is a symlink');
+    assert.equal(run(r, { medArgs: ['--config', r.conf] }).code, 0);
+    assert.equal(run(r, { medArgs: [`--config=${r.conf}`] }).code, 0);
+  } finally { r.done(); }
 });

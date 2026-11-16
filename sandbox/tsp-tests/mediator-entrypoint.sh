@@ -31,7 +31,14 @@
 #   - the working directory isn't an empty directory (Q1: no decoy file for a working-dir fallback)
 #   - 16.3(b): the backend's own storage (`<volume>/secrets.json`) names `mediator_admin_credential` at all, public or
 #     private. Entry names are plaintext in both file shapes, so this needs no passphrase. Fail closed: the bare name
-#     anywhere in the file refuses (values are base64url, so it can only appear as an entry name).
+#     anywhere in the file refuses (values are base64url, so it can only appear as an entry name), AND any `\u` escape
+#     anywhere in the file refuses (Security 12247.1: a key spelled `"\u006dediator_admin_credential"` is missed by a
+#     plain grep, yet JSON.parse and serde_json both decode it to the real name; serde writes no `\u` for these
+#     names, and values and salts are base64url, so a `\u` in our store only ever means someone wrote it by hand).
+#     JSON's other escapes (\" \\ \/ \b \f \n \r \t) can't produce a letter or `_`, so they can't spell the name.
+#   - the mediator's own conf (its `-c`/`--config` argument) is missing, a symlink, or has any `backend = "file://…"`
+#     line other than exactly `file://<volume>/secrets.json?encrypt=1`, or not exactly one (Security 12247.4: the
+#     check above must read the same file the mediator opens)
 #   - the store file is missing, a symlink or not a regular file: the encrypted backend CREATES an empty store when
 #     its file is absent (file_encrypted.rs open → init_new), so a lost volume must stop the start, never be replaced
 # Host names on no list (the platform's own, e.g. its PORT) are not refused: `env -i` drops them, and one start line
@@ -103,6 +110,19 @@ store="$volume/secrets.json"
 [ -L "$store" ] && refuse "the secret store is a symlink"
 [ -f "$store" ] || refuse "no secret store on the volume (the backend would create an empty one)"
 ! grep -qF '"mediator_admin_credential"' "$store" || refuse "mediator_admin_credential is in the secret backend"
+! grep -qF '\u' "$store" || refuse "the secret store has a \\u escape (a name could be spelled round the check)"
+# 12247.4: the store path the checks read is the one the conf points the mediator at
+conf=
+_a=("$@"); for ((i = 0; i < ${#_a[@]}; i++)); do
+  case "${_a[$i]}" in -c|--config) conf="${_a[$((i + 1))]:-}" ;; --config=*) conf="${_a[$i]#--config=}" ;; esac
+done; unset _a i
+[ -n "$conf" ] || refuse "no mediator conf (-c/--config) in the mediator's arguments"
+[ -L "$conf" ] && refuse "the mediator conf is a symlink"
+[ -f "$conf" ] || refuse "the mediator conf is not a regular file"
+want_backend="file://$store?encrypt=1"
+file_backends="$(grep -E '^[[:space:]]*backend[[:space:]]*=[[:space:]]*"file://' "$conf" | sed -E 's/^[[:space:]]*backend[[:space:]]*=[[:space:]]*"([^"]*)".*$/\1/' || true)"
+[ "$(printf '%s' "$file_backends" | grep -c . || true)" = 1 ] || refuse "the mediator conf does not have exactly one file:// backend line"
+[ "$file_backends" = "$want_backend" ] || refuse "the mediator conf's backend is not file://<volume>/secrets.json?encrypt=1"
 # required values
 [ -n "${DATABASE_URL:-}" ] || refuse "DATABASE_URL is missing"
 [ -n "${!PASSPHRASE_SOURCE:-}" ] || refuse "$PASSPHRASE_SOURCE is missing"

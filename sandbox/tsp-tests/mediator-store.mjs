@@ -21,11 +21,13 @@
 //                                          byte-identical and (encrypted) still open; atomic write, mode 0600
 //   admin-out <store> <passphrase file> <out>
 //                                          writes the admin credential JSON to <out> (0600) for the setup job's
-//                                          admin client; prints only its DID's method and fragment count
+//                                          admin client; prints only its DID's method and fragment count. Refuses
+//                                          (exit 5) an <out> not under /dev/shm or under any results/ path (12247.3)
 //   rekey <store> <old passphrase file> <new passphrase file>
 //                                          (v) rotation in place: every entry opened with the old passphrase and
 //                                          re-sealed under the new one with a fresh salt; same entry names, same
-//                                          values (so the mediator keeps its DID); proves old no longer opens
+//                                          values (so the mediator keeps its DID); proves old no longer opens.
+//                                          Refuses while mediator_admin_credential is in the store (12247 i(a))
 //   seal-test <store> <passphrase file> <json of {key: utf8 value}>
 //                                          TEST ONLY: writes an encrypted store in the mediator's format (unit tests)
 import fs from 'node:fs';
@@ -47,8 +49,20 @@ export function readStore(file) {
   return { j, shape };
 }
 
+// Security 12247 nit: the KDF parameters come from the file, so a planted store could make our own tool hang. Cap
+// them at what upstream writes (file_encrypted.rs:86-88 at 34bbdea4: KDF_MEMORY_KIB 64*1024, KDF_ITERATIONS 3,
+// KDF_PARALLELISM 4); anything above, or not a positive integer, refuses before Argon2 runs.
+export const KDF_CAP = { memory_kib: 65536, iterations: 3, parallelism: 4 };
+export function checkKdf(kdf) {
+  if (!kdf || kdf.algo !== 'argon2id') throw new Error('unsupported kdf');
+  for (const [k, max] of Object.entries(KDF_CAP)) {
+    const v = kdf[k];
+    if (!Number.isInteger(v) || v < 1 || v > max) throw new Error(`kdf ${k} outside 1..${max}`);
+  }
+}
+
 export function deriveKey(passphrase, kdf) {
-  if (kdf.algo !== 'argon2id') throw new Error('unsupported kdf');
+  checkKdf(kdf);
   return Buffer.from(argon2id(Buffer.from(passphrase), b64u(kdf.salt_b64), {
     t: kdf.iterations, m: kdf.memory_kib, p: kdf.parallelism, dkLen: KEY_BYTES, version: 0x13,
   }));
@@ -135,6 +149,8 @@ export function deleteAdmin(file, passphrase) {
 export function rekey(file, oldPass, newPass) {
   const { j, shape } = readStore(file);
   if (shape !== 'encrypted') throw new Error('not an encrypted store');
+  // Security 12247 (i)(a): a rotation must never re-seal the one entry we delete.
+  if (Object.prototype.hasOwnProperty.call(j.entries, ADMIN_CREDENTIAL)) throw new Error('mediator_admin_credential is still in the store; delete it first');
   if (!opens(j, oldPass)) throw new Error('the old passphrase does not open the store');
   const oldKey = deriveKey(oldPass, j.kdf);
   const values = {};
@@ -151,8 +167,8 @@ export function rekey(file, oldPass, newPass) {
 
 export function sealTest(file, passphrase, values, like = null) {
   const salt = crypto.randomBytes(16);
-  const kdf = { algo: 'argon2id', salt_b64: salt.toString('base64url'), memory_kib: like?.memory_kib ?? 65536,
-    iterations: like?.iterations ?? 3, parallelism: like?.parallelism ?? 4 };
+  const kdf = { algo: 'argon2id', salt_b64: salt.toString('base64url'), memory_kib: like?.memory_kib ?? KDF_CAP.memory_kib,
+    iterations: like?.iterations ?? KDF_CAP.iterations, parallelism: like?.parallelism ?? KDF_CAP.parallelism };
   const key = deriveKey(passphrase, kdf);
   const v = seal(key, Buffer.alloc(32), VERIFIER_AAD);
   const entries = {};
@@ -190,6 +206,13 @@ async function main(argv) {
       return !r.admin_credential_present && r.others_unchanged && r.still_opens !== false ? 0 : 1;
     }
     case 'admin-out': {
+      // Security 12247 change 3: <out> only on tmpfs under /dev/shm, never under a results/ (artifact) path; the
+      // setup job removes it right after the admin calls and fails if it is still there at the end.
+      const outAbs = path.resolve(b || '');
+      const real = fs.realpathSync(path.dirname(outAbs));
+      if (!b || !real.startsWith('/dev/shm/') || real.split('/').includes('results') || outAbs.split('/').includes('results')) {
+        say({ refused: 'admin-out goes only under /dev/shm, never under results/' }); return 5;
+      }
       const { j, shape } = readStore(store);
       const v = getEntry(j, shape, shape === 'encrypted' ? readPassphrase(a) : null, ADMIN_CREDENTIAL);
       if (!v) { say({ admin_credential_present: false }); return 3; }
