@@ -130,6 +130,8 @@ async function task(who, token, typeUri, payload) {
   const answer = reply.map((r) => r.json).find((j) => j?.threadId === doc.id || j?.id) ?? null
   return { status: sent.status, answerType: answer?.type ?? null, answer: answer?.payload ?? null }
 }
+// One request in flight at a time (Security 12552): Optimistic delete of up to 20 means a reply to a later request
+// fetched in the same batch would be lost unread. Every caller here awaits each task() before the next.
 async function collect(who, token, senderSpk, del = true) {
   const got = await post('/fetch', JSON.stringify({ limit: 20, delete_policy: del ? 'Optimistic' : 'DoNotDelete' }), token)
   const out = []
@@ -176,9 +178,20 @@ if (CLOSED) {
   const u = await adminTask(LIST_UPDATE, { did: admHash, clear: true, add: [medHash] })
   const l = await adminTask(LIST_LIST, { did: admHash, entries: [medHash] })
   const listed = (l.answer?.entries ?? []).map(String)
-  results.setup.admin_list = { update_status: u.status, update_answer: u.answerType, list_answer: l.answerType, accessListCount: l.answer?.accessListCount ?? null, mediator_listed: listed.includes(medHash), only_entry: l.answer?.accessListCount === 1 && listed.includes(medHash) }
+  results.setup.admin_list = { update_status: u.status, update_answer: u.answerType, update_problem: u.problem ?? null, list_status: l.status, list_answer: l.answerType, list_problem: l.problem ?? null, accessListCount: l.answer?.accessListCount ?? null, mediator_listed: listed.includes(medHash), only_entry: l.answer?.accessListCount === 1 && listed.includes(medHash) }
   results.checks.S2_admin_allow_list_is_mediator_only = { pass: results.setup.admin_list.only_entry, ...results.setup.admin_list }
   log('admin list = mediator only', results.setup.admin_list)
+  // The read-back is the truth, never the update's answer (Security 12552.1): with the admin on TSP, read its list
+  // again over DIDComm, read-only, before any add. Answered: the entries say whether the TSP update set the mediator.
+  // Refused 403/73 at /inbound: the mediator's own reply to the admin was refused by the admin's list, which is
+  // behaviour showing the mediator is not on it. Anything else is "can't tell" and the evaluator reads it as red.
+  if (!ADMIN_DIDCOMM) {
+    const sd = await didcommAdmin.signIn(post, ADMIN, MED)
+    const rb = sd.ok ? await didcommAdmin.task(post, ADMIN, sd.token, MED, LIST_LIST, { did: admHash, entries: [medHash] }) : null
+    const rbListed = (rb?.answer?.entries ?? []).map(String)
+    results.setup.admin_list_readback_didcomm = { sign_in_ok: sd.ok, status: rb?.status ?? null, problem: rb?.problem ?? null, answered: !!rb?.answerType, answerType: rb?.answerType ?? null, accessListCount: rb?.answer?.accessListCount ?? null, mediator_listed: rbListed.includes(medHash) }
+    log('admin list read back over DIDComm', results.setup.admin_list_readback_didcomm)
+  }
 }
 const aclA = { accessListMode: 'explicitDeny', selfManageList: true, local: true, sendMessages: true, receiveMessages: true }
 results.setup.account_A_acl = aclA

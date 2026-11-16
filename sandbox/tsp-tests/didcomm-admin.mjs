@@ -7,6 +7,9 @@
 //   task      the same Trust Task document the TSP path sends (eddsa-jcs-2022 proof), wrapped in the DIDComm binding
 //             envelope (`body` = the whole document), authcrypt to the mediator's keyAgreement kid, POST /inbound
 //   collect   POST /fetch, open each stored authcrypt JWE from the mediator DID, keep the ones threaded to the request
+// One request in flight at a time (Security 12552, non-blocking): collect fetches up to 20 with the Optimistic delete
+// policy, so a reply to a later request fetched in the same batch is deleted unread. Callers await each task() before
+// sending the next; a caller that pipelines must switch to DoNotDelete and delete only what it took.
 // Test keys only. Prints nothing; the caller records statuses and problem codes, never a key or a token.
 import * as dc from '@openvtc/vti-didcomm-js'
 import { attachProof } from './lib.mjs'

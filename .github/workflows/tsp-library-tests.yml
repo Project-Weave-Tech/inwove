@@ -137,8 +137,9 @@ jobs:
     # (docker/test/conf, its secrets.json is committed upstream as test-only); Redis by digest. Every other key is
     # made by the scripts and dies with them. The scripts print statuses and problem codes, never a key or password.
     # Its results go in their own artifact (not results-*): the report's `mediator` line stays NOT BUILT until
-    # steps 3-8 land. The closed-default run is expected red while admin calls ride TSP (check_admin_signature
-    # needs did#fragment); that stays a fail in the record, never a skip.
+    # steps 3-8 land. The closed-default run with the admin on TSP is red by design (check_admin_signature needs
+    # did#fragment); it no longer gates on its own outcome. The expect-red step judges both closed-default results files
+    # (Security 12552): green only when TSP is refused exactly as known and the DIDComm run is green; never a skip.
     runs-on: ubuntu-latest
     timeout-minutes: 75
     env:
@@ -229,7 +230,7 @@ jobs:
         id: aclopen
         continue-on-error: true
         run: node "$WPI_DIR/mediator-acl.mjs" "$RUNNER_TEMP/med/target/release/mediator" "$RUNNER_TEMP/med/docker/test/conf" "$WPI_DIR/redis-docker.sh" "$OUT/acl-open.json"
-      - name: the same with --closed-default (expected red while admin calls ride TSP)
+      - name: the same with --closed-default, the admin over TSP (red by design; judged by the expect-red step below)
         id: aclclosed
         continue-on-error: true
         run: node "$WPI_DIR/mediator-acl.mjs" "$RUNNER_TEMP/med/target/release/mediator" "$RUNNER_TEMP/med/docker/test/conf" "$WPI_DIR/redis-docker.sh" "$OUT/acl-closed.json" --closed-default
@@ -244,6 +245,18 @@ jobs:
         id: aclclosedd
         continue-on-error: true
         run: node "$WPI_DIR/mediator-acl.mjs" "$RUNNER_TEMP/med/target/release/mediator" "$RUNNER_TEMP/med/docker/test/conf" "$WPI_DIR/redis-docker.sh" "$OUT/acl-closed-didcomm.json" --closed-default --admin-didcomm
+      - name: admin over TSP is refused with the guard on (expected)
+        # Security 12552 conditions 1-6, Railroad 12567.1 / Security 12582.1. Reads acl-closed.json and
+        # acl-closed-didcomm.json, never the steps' outcomes. Green only when the TSP list update is refused 403, the
+        # read-back over DIDComm does not show the mediator on the admin's list, no TSP add is confirmed, the TSP run's
+        # other checks hold, the DIDComm run is green on S2, and both record the guard on + their transport. A missing
+        # file, a crash, another code or "can't tell" is red. An accepted TSP update or add is red AND a finding for
+        # SECURITY, never a test to update. This step is part of every re-pin's evidence: a re-pin it doesn't pass
+        # doesn't reach the host. Units: test/mediator-expect-red.test.js.
+        id: expectred
+        if: always()
+        continue-on-error: true
+        run: node "$WPI_DIR/mediator-expect-red.mjs" "$OUT/acl-closed.json" "$OUT/acl-closed-didcomm.json" "$OUT/expect-red.json"
       - name: the mediator through its entrypoint (16.2(c) /proc environ = the allow list; 15(iv) marker passphrase; a refuse case)
         # Security 11984 §2(iii)-(iv) + 12144: started the way the host will start it (mediator-entrypoint.sh, env -i,
         # the record's deny file checked against the sha256 baked beside the script), from a platform-shaped host with a
@@ -304,8 +317,8 @@ jobs:
           path: results/mediator-early
           retention-days: 30
       - name: fail if any step failed
-        if: always() && (steps.feats.outcome == 'failure' || steps.envreads.outcome == 'failure' || steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.aclclosed.outcome == 'failure' || steps.dcself.outcome == 'failure' || steps.aclclosedd.outcome == 'failure' || steps.entrypoint.outcome == 'failure' || steps.setupbuild.outcome == 'failure' || steps.setupfeats.outcome == 'failure' || steps.keyringpaths.outcome == 'failure' || steps.setuprun.outcome == 'failure')
-        run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed ${{ steps.aclclosed.outcome }}, didcomm selftest ${{ steps.dcself.outcome }}, acl closed over didcomm ${{ steps.aclclosedd.outcome }}, entrypoint ${{ steps.entrypoint.outcome }}, setup build ${{ steps.setupbuild.outcome }}, setup features ${{ steps.setupfeats.outcome }}, keyring paths ${{ steps.keyringpaths.outcome }}, setup run ${{ steps.setuprun.outcome }}" && exit 1
+        if: always() && (steps.feats.outcome == 'failure' || steps.envreads.outcome == 'failure' || steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.expectred.outcome != 'success' || steps.dcself.outcome == 'failure' || steps.aclclosedd.outcome == 'failure' || steps.entrypoint.outcome == 'failure' || steps.setupbuild.outcome == 'failure' || steps.setupfeats.outcome == 'failure' || steps.keyringpaths.outcome == 'failure' || steps.setuprun.outcome == 'failure')
+        run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed over tsp (red by design) ${{ steps.aclclosed.outcome }}, admin over TSP refused (expected) ${{ steps.expectred.outcome }}, didcomm selftest ${{ steps.dcself.outcome }}, acl closed over didcomm ${{ steps.aclclosedd.outcome }}, entrypoint ${{ steps.entrypoint.outcome }}, setup build ${{ steps.setupbuild.outcome }}, setup features ${{ steps.setupfeats.outcome }}, keyring paths ${{ steps.keyringpaths.outcome }}, setup run ${{ steps.setuprun.outcome }}" && exit 1
 
   report:
     name: report (one markdown report; fails while a line is missing)
