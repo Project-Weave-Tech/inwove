@@ -52,3 +52,7 @@ the host only when every step below holds on the new pin, in one job run, and Se
     TOML 1.1 multi-line inline table can hide `trust_task_verification` while the mediator runs `warn`. If the new
     template or setup's writer uses either shape, re-read it with Security; never loosen the refusal in place. If
     upstream adds `deny_unknown_fields` (report 5, ask 4), the brace check stays: it is the tripwire, not the proof.
+    If upstream's parser ever accepts bare words in arrays, re-read the section tracker with Security (Security 13044.1:
+    an array element line reading `[security]` fools the awk tracker today, and is safe only because TOML refuses the
+    bare word, so the mediator won't start). Re-read upstream's `conf/mediator.toml` for braces here too: today it
+    rests on the grep plus the green entrypoint step on run `43840858890`.
