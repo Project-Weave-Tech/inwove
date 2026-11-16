@@ -136,21 +136,35 @@ const INV_SETUP = 'dbus-secret-service-keyring-store v1.0.1\n└── affinidi-
   + '    │       └── vta-sdk v0.77.1\n    │           └── affinidi-messaging-mediator-setup v0.50.0 (/w/setup)\n    ├── affinidi-tdk v0.36.0 (*)\n    └── affinidi-tdk v0.37.0\n'
   + '        └── affinidi-messaging-mediator-setup v0.50.0 (/w/setup)\n';
 test('keyring paths (Security 12491 a): the exception holds only while every path runs through affinidi-tdk-common', () => {
-  assert.equal(pathVerdict(INV_LEAN).pass, true, 'lean at the pin');
-  assert.equal(pathVerdict(INV_SETUP).pass, true, 'setup at the pin');
+  assert.equal(pathVerdict(INV_LEAN, 'keyring-core').pass, true, 'lean at the pin');
+  assert.equal(pathVerdict(INV_SETUP, 'dbus-secret-service-keyring-store').pass, true, 'setup at the pin');
   // mediator-common pulls the store directly (a future pin): red, by the forbidden crate and by the bypass.
   const viaCommon = INV_LEAN + '└── affinidi-messaging-mediator-common v0.50.0\n    └── affinidi-messaging-mediator v0.50.0 (/w/med)\n';
-  const v = pathVerdict(viaCommon.replace('└── dbus-secret-service-keyring-store', '├── dbus-secret-service-keyring-store'));
+  const v = pathVerdict(viaCommon.replace('└── dbus-secret-service-keyring-store', '├── dbus-secret-service-keyring-store'), 'keyring-core');
   assert.equal(v.pass, false); assert.equal(v.forbidden_in_tree, true); assert.equal(v.paths_bypassing.length, 1);
   // Any other crate reaching the root without tdk-common: red, and the path is named.
   const bypass = 'keyring-core v1.0.1\n├── affinidi-tdk-common v0.7.0\n│   └── affinidi-messaging-mediator v0.50.0 (/w/med)\n└── some-new-crate v0.1.0\n    └── affinidi-messaging-mediator v0.50.0 (/w/med)\n';
-  assert.deepEqual(pathVerdict(bypass).paths_bypassing, ['keyring-core <- some-new-crate <- affinidi-messaging-mediator']);
+  assert.deepEqual(pathVerdict(bypass, 'keyring-core').paths_bypassing, ['keyring-core <- some-new-crate <- affinidi-messaging-mediator']);
   // The target straight on the root (no tdk-common at all): red.
-  assert.equal(pathVerdict('keyring-core v1.0.1\n└── affinidi-messaging-mediator v0.50.0 (/w/med)\n').pass, false);
+  assert.equal(pathVerdict('keyring-core v1.0.1\n└── affinidi-messaging-mediator v0.50.0 (/w/med)\n', 'keyring-core').pass, false);
   // Absent from the build: nothing to land, passes and says so. Anything unreadable fails closed.
-  assert.deepEqual(pathVerdict('error: package ID specification `keyring-core` did not match any packages\n'), { pass: true, absent: true });
-  assert.equal(pathVerdict('error: failed to download from crates.io\n').pass, false);
-  assert.equal(pathVerdict('').pass, false, 'an empty tree is not an absent crate');
+  assert.deepEqual(pathVerdict('error: package ID specification `keyring-core` did not match any packages\n', 'keyring-core'), { pass: true, absent: true });
+  assert.equal(pathVerdict('error: failed to download from crates.io\n', 'keyring-core').pass, false);
+  assert.equal(pathVerdict('', 'keyring-core').pass, false, 'an empty tree is not an absent crate');
+});
+
+test('keyring paths (Security 12615): "absent" must name the crate asked for, and be the only thing there', () => {
+  const absent = (c) => `error: package ID specification \`${c}\` did not match any packages\n`;
+  // 12615.1: cargo's absent words about some OTHER name (a renamed or missing root) are not this crate's absence.
+  assert.deepEqual(pathVerdict(absent('affinidi-messaging-mediator'), 'keyring-core'), { pass: false, error: 'absent words for another crate' });
+  assert.deepEqual(pathVerdict(absent('keyring-core'), 'dbus-secret-service-keyring-store'), { pass: false, error: 'absent words for another crate' });
+  assert.deepEqual(pathVerdict(absent('dbus-secret-service-keyring-store'), 'dbus-secret-service-keyring-store'), { pass: true, absent: true });
+  // 12615.2 (Security's probe): a real tree with the absent sentence added to it is not absent.
+  assert.deepEqual(pathVerdict(INV_LEAN + absent('keyring-core'), 'keyring-core'), { pass: false, error: 'absent words beside a tree' });
+  assert.deepEqual(pathVerdict(absent('keyring-core') + INV_LEAN, 'keyring-core'), { pass: false, error: 'absent words beside a tree' });
+  // A tree for a different crate than the one asked for fails closed; no crate named fails closed.
+  assert.deepEqual(pathVerdict(INV_SETUP, 'keyring-core'), { pass: false, error: 'tree for another crate' });
+  assert.equal(pathVerdict(INV_LEAN).pass, false, 'no crate named');
 });
 
 test('features: the record hash does not depend on where the checkout sits', () => {

@@ -70,7 +70,10 @@ test('entrypoint 12491(b): refuses a D-Bus session or system bus handed in by th
     refused(run(r, { env: { DBUS_SYSTEM_BUS_ADDRESS: 'unix:path=/run/dbus/system_bus_socket' } }), 'D-Bus bus names on the host: DBUS_SYSTEM_BUS_ADDRESS');
     // An unrelated DBUS_ name is not a bus address: env -i drops it like any other platform name.
     const ok = run(r, { env: { DBUS_STARTER_BUS_TYPE: 'session' } });
-    assert.ok(!/refused: D-Bus/.test(ok.err), 'only the two bus-address names refuse');
+    assert.ok(!/refused: D-Bus/.test(ok.err), 'only the bus-address names refuse');
+    // Security 12640: the starter (activation) bus address refuses too; with the type beside it, the address is named.
+    refused(run(r, { env: { DBUS_STARTER_ADDRESS: 'unix:path=/run/dbus/system_bus_socket' } }), 'D-Bus bus names on the host: DBUS_STARTER_ADDRESS');
+    refused(run(r, { env: { DBUS_STARTER_BUS_TYPE: 'system', DBUS_STARTER_ADDRESS: 'unix:path=/run/dbus/system_bus_socket' } }), 'D-Bus bus names on the host: DBUS_STARTER_ADDRESS');
   } finally { r.done(); }
 });
 
