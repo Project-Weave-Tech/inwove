@@ -21,12 +21,15 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 export function parseInverted(text, crate) {
   const lines = String(text).split('\n').filter((l) => l.trim())
   if (!crate || !/^[\w-]+$/.test(crate)) return { error: 'no crate named' }
+  // Every "did not match" sentence in the output, by the crate it names (12734.2: `cargo tree -i <one crate>` prints
+  // at most one, so a sentence for any other crate means the output isn't what was asked, even beside the right one).
+  const named = [...String(text).matchAll(/package ID specification `([^`]*)` did not match any packages/g)].map((m) => m[1])
+  if (named.some((n) => n !== crate)) return { error: 'absent words for another crate' }
   const absentWords = new RegExp('package ID specification `' + escapeRe(crate) + '` did not match any packages')
   if (absentWords.test(text)) {
     if (lines.some((l) => TREE_LINE.test(l))) return { error: 'absent words beside a tree' }
     return { absent: true }
   }
-  if (/package ID specification `[\w-]+` did not match any packages/.test(text)) return { error: 'absent words for another crate' }
   if (!lines.length) return { error: 'empty tree' }
   const edges = new Map(), stack = []
   let target = null

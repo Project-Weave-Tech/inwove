@@ -162,6 +162,13 @@ test('keyring paths (Security 12615): "absent" must name the crate asked for, an
   // 12615.2 (Security's probe): a real tree with the absent sentence added to it is not absent.
   assert.deepEqual(pathVerdict(INV_LEAN + absent('keyring-core'), 'keyring-core'), { pass: false, error: 'absent words beside a tree' });
   assert.deepEqual(pathVerdict(absent('keyring-core') + INV_LEAN, 'keyring-core'), { pass: false, error: 'absent words beside a tree' });
+  // 12734.2: the asked crate's absent sentence PLUS a second one for another crate is not output for one crate: fail, either order.
+  assert.deepEqual(pathVerdict(absent('keyring-core') + absent('some-other-crate'), 'keyring-core'), { pass: false, error: 'absent words for another crate' });
+  assert.deepEqual(pathVerdict(absent('some-other-crate') + absent('keyring-core'), 'keyring-core'), { pass: false, error: 'absent words for another crate' });
+  assert.deepEqual(pathVerdict(absent('linux-keyring-core') + absent('keyring-core'), 'keyring-core'), { pass: false, error: 'absent words for another crate' });
+  assert.deepEqual(pathVerdict(absent('a.b') + absent('keyring-core'), 'keyring-core'), { pass: false, error: 'absent words for another crate' });
+  // The same sentence twice for the asked crate is still that crate's absence.
+  assert.deepEqual(pathVerdict(absent('keyring-core') + absent('keyring-core'), 'keyring-core'), { pass: true, absent: true });
   // A tree for a different crate than the one asked for fails closed; no crate named fails closed.
   assert.deepEqual(pathVerdict(INV_SETUP, 'keyring-core'), { pass: false, error: 'tree for another crate' });
   assert.equal(pathVerdict(INV_LEAN).pass, false, 'no crate named');
