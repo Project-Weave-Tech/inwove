@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // ref/09 §1: re-confirm the pins and licences of what is actually installed; fail if one moved or a licence changed.
 // An @openvtc package that is not Apache-2.0 or MIT fails (Railroad then takes it to Legal). Pinned source commits
-// are resolved to their full sha (recorded), and fail if they can't be. Usage: node check-pins.mjs <resultsdir>
-import { readFileSync } from 'node:fs'
+// are fetched by their full sha (no token) and must be ancestors of their ref (fetch-pinned.sh, Security 12036). Usage: node check-pins.mjs <resultsdir>
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { HERE, readJson, recorder } from './lib.mjs'
@@ -24,12 +25,17 @@ for (const [name, p] of Object.entries(pins)) {
     R.check(`${name} (crate, Cargo.lock)`, pkg?.version === p.version && pkg?.license === p.licence, pkg ? `version ${pkg.version}, licence ${pkg.license}` : `cargo metadata failed: ${meta.stderr?.slice(0, 200)}`)
   }
   if (p.repo && p.source && !process.argv.includes('--no-network-shas')) {
-    // Resolve the short pin to a full sha by fetching exactly that commit (GitHub serves a commit by its prefix only via the API, so ask the API).
-    const api = p.repo.replace('https://github.com/', 'https://api.github.com/repos/') + '/commits/' + p.source
-    const r = spawnSync('curl', ['-fsS', '-H', 'Accept: application/vnd.github.sha', api], { encoding: 'utf8', timeout: 60_000 })
-    const full = (r.stdout ?? '').trim()
-    shas[name] = full
-    R.check(`${name} source ${p.source}`, /^[0-9a-f]{40}$/.test(full) && full.startsWith(p.source), /^[0-9a-f]{40}$/.test(full) ? full : `could not resolve (curl exit ${r.status}): ${(r.stderr ?? '').trim().slice(0, 160)}`)
+    // Security 12036: compare, never resolve. git-fetch exactly the full sha written in pins.json, with no token, and
+    // prove upstream has it (an ancestor of the pin's ref, so a fork's "imposter commit" can't satisfy it). No
+    // api.github.com call and no fallback to one; a fetch error fails the check.
+    const dir = mkdtempSync(join(tmpdir(), `pin-${name}-`))
+    const r = spawnSync('bash', [join(HERE, 'fetch-pinned.sh'), p.repo, p.sha ?? '', p.ref ?? '', dir], { encoding: 'utf8', timeout: 300_000 })
+    let got = null
+    try { got = JSON.parse((r.stdout ?? '').trim().split('\n').at(-1)) } catch {}
+    rmSync(dir, { recursive: true, force: true })
+    shas[name] = got ?? { error: (r.stderr ?? '').trim().slice(0, 200) }
+    const ok = r.status === 0 && got?.sha === p.sha && got?.ancestor === true && /^[0-9a-f]{40}$/.test(p.sha ?? '') && p.sha.startsWith(p.source)
+    R.check(`${name} source ${p.source} (full sha, upstream's on ${p.ref})`, ok, got ? `${got.sha} on ${got.ref} @ ${got.ref_tip}, ancestor ${got.ancestor}` : `fetch failed (exit ${r.status}): ${(r.stderr ?? '').trim().slice(0, 160)}`)
   }
 }
 const tool = (c, a) => { const r = spawnSync(c, a, { encoding: 'utf8' }); return r.status === 0 ? (r.stdout || r.stderr).trim().split('\n')[0] : null }

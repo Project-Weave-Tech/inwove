@@ -1,5 +1,5 @@
 {
-  "_what": "Condition 16.2(b) lists, as Security wrote them in register L8 (bus 11984, 2026-11-15). Changes only by a Security read. Names only, never a value.",
+  "_what": "Condition 16.2(b): the committed record of a Security read at the pin (register L8; bus 11984, shaped by bus 12079). The job re-greps and compares; it never writes this file. Regenerated only at re-pin (`--write`), in its own commit, and green only once a Security block names that commit. Names only, never a value.",
   "pin": "34bbdea4717e3a8dd1fdb190ad9c2ad2b33a3316",
   "crates": [
     "crates/affinidi-messaging-mediator/src",
@@ -7,27 +7,160 @@
     "crates/affinidi-messaging-mediator/affinidi-messaging-mediator-config/src",
     "crates/affinidi-messaging-mediator/affinidi-messaging-mediator-processors/src"
   ],
-  "allow": [
-    "DATABASE_URL",
-    "MEDIATOR_FILE_BACKEND_PASSPHRASE_FILE",
-    "RUST_LOG",
-    "PATH",
-    "HOME"
-  ],
-  "deny": {
-    "flips": [
+  "floor": {
+    "_why": "The 11 always-present names (bus 12048/12079.1), pinned by hand: a regeneration cannot drop them.",
+    "allow": [
+      "DATABASE_URL",
+      "MEDIATOR_FILE_BACKEND_PASSPHRASE_FILE",
+      "RUST_LOG"
+    ],
+    "deny": [
       "MEDIATOR_ACL_MODE",
       "BLOCK_REMOTE_ADMIN_MSGS",
       "ENABLE_INTER_MEDIATOR_RELAY",
-      "PROCESSOR_FORWARDING_EXTERNAL"
-    ],
-    "adjacent": [
+      "PROCESSOR_FORWARDING_EXTERNAL",
       "GLOBAL_DEFAULT_ACL",
       "ADMIN_DID",
-      "MEDIATOR_SECRETS_BACKEND"
-    ],
-    "plain_passphrase": [
+      "MEDIATOR_SECRETS_BACKEND",
       "MEDIATOR_FILE_BACKEND_PASSPHRASE"
     ]
-  }
+  },
+  "allow": [
+    "DATABASE_URL",
+    "MEDIATOR_FILE_BACKEND_PASSPHRASE_FILE",
+    "RUST_LOG"
+  ],
+  "entrypoint_fixed": {
+    "_why": "Not read by the four crates; the entrypoint sets these at fixed values only if run D shows the binary needs them (Security 11984 §3). Not part of the compare.",
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "HOME": "the empty read-only working directory"
+  },
+  "deny": {
+    "ACCESS_LIST_LIMIT": "ungated",
+    "ADMIN_DID": "ungated",
+    "API_PREFIX": "ungated",
+    "AWS_REGION": "feature=aws",
+    "BLOCK_ANONYMOUS_OUTER_ENVELOPE": "ungated",
+    "BLOCK_REMOTE_ADMIN_MSGS": "ungated",
+    "CORS_ALLOW_ORIGIN": "ungated",
+    "DATABASE_FUNCTIONS_FILE": "ungated",
+    "DATABASE_TIMEOUT": "ungated",
+    "DID_RESOLVER_ADDRESS": "ungated",
+    "DID_RESOLVER_CACHE_CAPACITY": "ungated",
+    "DID_RESOLVER_CACHE_TTL": "ungated",
+    "DID_RESOLVER_NETWORK_LIMIT": "ungated",
+    "DID_RESOLVER_NETWORK_TIMEOUT": "ungated",
+    "DID_WEB_SELF_HOSTED": "ungated",
+    "ENABLE_INTER_MEDIATOR_RELAY": "ungated",
+    "FORCE_SESSION_DID_MATCH": "ungated",
+    "GLOBAL_DEFAULT_ACL": "ungated",
+    "JWT_ACCESS_EXPIRY": "ungated",
+    "JWT_REFRESH_EXPIRY": "ungated",
+    "LIMIT_ATTACHMENTS_MAX_COUNT": "ungated",
+    "LIMIT_CRYPTO_OPERATIONS_PER_MESSAGE": "ungated",
+    "LIMIT_DELETED_MESSAGES": "ungated",
+    "LIMIT_DELIVERED_EXPIRY_SECONDS": "ungated",
+    "LIMIT_DID_RATE_LIMIT_BURST": "ungated",
+    "LIMIT_DID_RATE_LIMIT_PER_SECOND": "ungated",
+    "LIMIT_FORWARD_TASK_QUEUE": "ungated",
+    "LIMIT_HTTP_SIZE": "ungated",
+    "LIMIT_LISTED_MESSAGES": "ungated",
+    "LIMIT_LOCAL_MAX_ACL": "ungated",
+    "LIMIT_MAX_WEBSOCKET_CONNECTIONS": "ungated",
+    "LIMIT_MAX_WEBSOCKET_CONNECTIONS_PER_DID": "ungated",
+    "LIMIT_MESSAGE_EXPIRY_SECONDS": "ungated",
+    "LIMIT_MESSAGE_SIZE": "ungated",
+    "LIMIT_PICKUP_ROUND_ROBIN": "ungated",
+    "LIMIT_PUBSUB_BUFFER": "ungated",
+    "LIMIT_QUEUED_RECEIVE_MESSAGES_HARD": "ungated",
+    "LIMIT_QUEUED_RECEIVE_MESSAGES_SOFT": "ungated",
+    "LIMIT_QUEUED_SEND_MESSAGES_HARD": "ungated",
+    "LIMIT_QUEUED_SEND_MESSAGES_PER_PEER": "ungated",
+    "LIMIT_QUEUED_SEND_MESSAGES_SOFT": "ungated",
+    "LIMIT_RATE_LIMIT_BURST": "ungated",
+    "LIMIT_RATE_LIMIT_PER_IP": "ungated",
+    "LIMIT_TO_KEYS_PER_DID": "ungated",
+    "LIMIT_TO_RECIPIENTS": "ungated",
+    "LIMIT_WS_SEND_BUFFER": "ungated",
+    "LIMIT_WS_SIZE": "ungated",
+    "LISTEN_ADDRESS": "ungated",
+    "LOCAL": "ungated",
+    "LOCAL_DIRECT_DELIVERY_ALLOWED": "ungated",
+    "LOCAL_DIRECT_DELIVERY_ALLOW_ANON": "ungated",
+    "LOCAL_ENDPOINTS": "ungated",
+    "LOG_JSON": "ungated",
+    "LOG_LEVEL": "ungated",
+    "MEDIATOR_ACL_MODE": "ungated",
+    "MEDIATOR_DID": "ungated",
+    "MEDIATOR_FILE_BACKEND_PASSPHRASE": "ungated",
+    "MEDIATOR_SECRETS_BACKEND": "ungated",
+    "MEDIATOR_SECRETS_CACHE_TTL": "ungated",
+    "OOB_INVITE_TTL": "ungated",
+    "PROCESSOR_FORWARDING_BATCH_SIZE": "ungated",
+    "PROCESSOR_FORWARDING_BLOCKED_DIDS": "ungated",
+    "PROCESSOR_FORWARDING_CONSUMER_GROUP": "ungated",
+    "PROCESSOR_FORWARDING_ENABLED": "ungated",
+    "PROCESSOR_FORWARDING_EXTERNAL": "ungated",
+    "PROCESSOR_FORWARDING_FUTURE_TIME_LIMIT": "ungated",
+    "PROCESSOR_FORWARDING_INITIAL_BACKOFF_MS": "ungated",
+    "PROCESSOR_FORWARDING_MAX_BACKOFF_MS": "ungated",
+    "PROCESSOR_FORWARDING_MAX_HOPS": "ungated",
+    "PROCESSOR_FORWARDING_MAX_RETRIES": "ungated",
+    "PROCESSOR_FORWARDING_RATE_WINDOW": "ungated",
+    "PROCESSOR_FORWARDING_RELAY_MODE": "ungated",
+    "PROCESSOR_FORWARDING_RELAY_TRUSTED_MEDIATORS": "ungated",
+    "PROCESSOR_FORWARDING_REPORT_ERRORS": "ungated",
+    "PROCESSOR_FORWARDING_WS_IDLE_TIMEOUT": "ungated",
+    "PROCESSOR_FORWARDING_WS_THRESHOLD": "ungated",
+    "PROCESSOR_MESSAGE_EXPIRY_CLEANUP_ENABLED": "ungated",
+    "PROCESSOR_SESSION_EXPIRY_CLEANUP_ENABLED": "ungated",
+    "SSL_CERTIFICATE_FILE": "ungated",
+    "SSL_KEY_FILE": "ungated",
+    "STORAGE_BACKEND": "ungated",
+    "STORAGE_DATA_DIR": "ungated",
+    "STORAGE_FJALL_BLOCK_CACHE": "ungated",
+    "STORAGE_FJALL_DURABILITY": "ungated",
+    "STORAGE_FJALL_MAX_JOURNAL": "ungated",
+    "STORAGE_FJALL_WRITE_BUFFER": "ungated",
+    "STREAMING_ENABLED": "ungated",
+    "STREAMING_UUID": "ungated",
+    "TRUST_TASK_VERIFICATION": "ungated",
+    "TRUST_XFF_CIDRS": "ungated",
+    "USE_SSL": "ungated",
+    "VAULT_ROLE_ID": "feature=secrets-vault",
+    "VAULT_SECRET_ID": "feature=secrets-vault",
+    "VAULT_TOKEN": "feature=secrets-vault"
+  },
+  "exceptions": [
+    {
+      "kind": "unresolved",
+      "at": "crates/affinidi-messaging-mediator/src/common/config/mod.rs:1238",
+      "read": "env::var_os(env_var)",
+      "callers": [
+        {
+          "at": "crates/affinidi-messaging-mediator/src/common/config/mod.rs:1255",
+          "name": "DATABASE_FUNCTIONS_FILE"
+        },
+        {
+          "at": "crates/affinidi-messaging-mediator/src/common/config/mod.rs:1261",
+          "name": "SSL_CERTIFICATE_FILE"
+        },
+        {
+          "at": "crates/affinidi-messaging-mediator/src/common/config/mod.rs:1268",
+          "name": "SSL_KEY_FILE"
+        }
+      ]
+    },
+    {
+      "kind": "prefix",
+      "at": "crates/affinidi-messaging-mediator/src/common/config/mod.rs:484",
+      "read": "env::vars()",
+      "prefix": "MEDIATOR_TAG_"
+    }
+  ],
+  "build_time": [
+    "CARGO_PKG_VERSION",
+    "OUT_DIR"
+  ],
+  "does_not_cover": "16.2(b) reads the four mediator crates the binary links, and nothing else. The crates they depend on read the environment too (logging, TLS roots, proxies, the Redis and AWS clients). Those reads are closed by the entrypoint's `env -i` with the allow list, and proven by the 16.2(c) /proc/<pid>/environ test, not by this grep. A green 16.2(b) means only: every name these four crates read was read by Security at this pin."
 }

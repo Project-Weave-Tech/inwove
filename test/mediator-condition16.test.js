@@ -3,7 +3,10 @@
 // real mediator at the pin.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readsOf, constsOf, stripTestModules, wrapperCalls, classify } from '../sandbox/tsp-tests/mediator-env-reads.mjs';
+import { readsOf, constsOf, stripTestModules, wrapperCalls, classify, closureCallers, derive, compare, rawCount, scan, planted, DOES_NOT_COVER } from '../sandbox/tsp-tests/mediator-env-reads.mjs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { verdict, normalise } from '../sandbox/tsp-tests/mediator-features.mjs';
 
 const lists = {
@@ -63,10 +66,98 @@ test('features: the lean tree passes; a vta feature edge, a vta crate or a secre
   assert.equal(verdict(lean + '├── vta-sdk v0.77.1\n').clean, false);
   assert.equal(verdict(lean + '├── affinidi-messaging-mediator feature "vta"\n').clean, false);
   assert.equal(verdict(lean + '│   ├── affinidi-messaging-mediator-common feature "secrets-aws"\n').clean, false);
+  assert.equal(verdict(lean + '├── affinidi-messaging-mediator feature "aws"\n').clean, false, 'aws gates AWS_REGION (12079.5)');
+  assert.equal(verdict(lean + '│   ├── aws-config v1.8.0\n').clean, false);
+  assert.equal(verdict(lean + '│   ├── rustls feature "aws-lc-rs"\n│   │   └── aws-lc-rs v1.13.0\n').clean, true, 'rustls crypto is not the AWS SDK');
   assert.equal(verdict('').clean, false, 'an empty tree is not a clean one');
 });
 
 test('features: the record hash does not depend on where the checkout sits', () => {
   const t = (p) => `affinidi-messaging-mediator v0.50.0 (${p}/crates/x)\n`;
   assert.equal(normalise(t('/a/med'), '/a/med'), normalise(t('/b/other'), '/b/other'));
+});
+
+// ── 16.2(b) at the pin (Security 12079): compare against a committed record, never a rebuild ──
+const SRC = [
+  'fn a() {',
+  '    env_override!(c.d, "DATABASE_URL");',
+  '    env_override!(c.a, "ADMIN_DID");',
+  '    env_override!(c.l, "LOG_LEVEL");',
+  '    let v = env!("CARGO_PKG_VERSION");',
+  '    for (k, _) in env::vars() { if k.get(..13) == Some("MEDIATOR_TAG_") {} }',
+  '}',
+  'fn r(c: &mut C) {',
+  '    let resolve = |label: &str, env_var: &str, raw: &str| -> String {',
+  '        if env::var_os(env_var).is_some() { return raw.to_string(); }',
+  '        raw.to_string()',
+  '    };',
+  '    c.f = resolve("functions_file", "DATABASE_FUNCTIONS_FILE", &c.f);',
+  '}',
+  '',
+].join('\n');
+
+function tree(src = SRC) {
+  const root = mkdtempSync(join(tmpdir(), 'c16-'));
+  mkdirSync(join(root, 'crate/src'), { recursive: true });
+  writeFileSync(join(root, 'crate/src/lib.rs'), src);
+  return root;
+}
+const record = () => ({
+  pin: 'x', crates: ['crate/src'],
+  floor: { allow: ['DATABASE_URL'], deny: ['ADMIN_DID'] },
+  allow: ['DATABASE_URL'],
+  deny: { ADMIN_DID: 'ungated', LOG_LEVEL: 'ungated', DATABASE_FUNCTIONS_FILE: 'ungated' },
+  exceptions: [
+    { kind: 'prefix', at: 'crate/src/lib.rs:6', read: 'env::vars()', prefix: 'MEDIATOR_TAG_' },
+    { kind: 'unresolved', at: 'crate/src/lib.rs:10', read: 'env::var_os(env_var)', callers: [{ at: 'crate/src/lib.rs:13', name: 'DATABASE_FUNCTIONS_FILE' }] },
+  ],
+  build_time: ['CARGO_PKG_VERSION'],
+  does_not_cover: DOES_NOT_COVER,
+});
+const run = (src, rec = record()) => { const root = tree(src); try { const s = scan(root, rec); return { s, p: compare(derive(s.reads), rec, s.recall) }; } finally { rmSync(root, { recursive: true, force: true }); } };
+
+test('16.2(b): the grep matching the committed record passes, with recall accounted', () => {
+  const { s, p } = run(SRC);
+  assert.deepEqual(p, []);
+  assert.equal(s.recall.raw_total, s.recall.accounted);
+});
+
+test('16.2(b): a closure-parameter read lists its call sites and the names they pass (12079.3)', () => {
+  const c = closureCallers(SRC, 10);
+  assert.equal(c.closure, 'resolve');
+  assert.deepEqual(c.callers.map((x) => x.name), ['DATABASE_FUNCTIONS_FILE']);
+});
+
+test('16.2(b): it fails in either direction: a new name, a gone name', () => {
+  assert.ok(run(SRC.replace('"LOG_LEVEL"', '"LOG_FORMAT"')).p.some((x) => x.includes('new name') && x.includes('LOG_FORMAT')));
+  assert.ok(run(SRC.replace('"LOG_LEVEL"', '"LOG_FORMAT"')).p.some((x) => x.includes('gone') && x.includes('LOG_LEVEL')));
+});
+
+test('16.2(b): a moved exception, a second prefix scan, a new caller name each fail', () => {
+  assert.ok(run('\n' + SRC).p.some((x) => x.startsWith('exception new, moved or changed')), 'moved by a line');
+  assert.ok(run(SRC.replace('fn r(', 'fn z() { for (k, _) in std::env::vars() { if k.starts_with("OTHER_") {} } }\nfn r(')).p.some((x) => /exception new.*prefix/.test(x)));
+  assert.ok(run(SRC.replace('&c.f);', '&c.f);\n    c.g = resolve("x", "SECRET_PATH", &c.g);')).p.some((x) => x.includes('exception new')));
+});
+
+test('16.2(b): the floor cannot be dropped, a deny name needs a gate, a new build-time read fails', () => {
+  const r1 = record(); delete r1.deny.ADMIN_DID; r1.allow = ['DATABASE_URL', 'ADMIN_DID'];
+  assert.ok(run(SRC, r1).p.some((x) => x.includes('floor name off the deny list: ADMIN_DID')));
+  const r2 = record(); r2.deny.LOG_LEVEL = 'unread';
+  assert.ok(run(SRC, r2).p.some((x) => x.includes('no gate written: LOG_LEVEL')));
+  assert.ok(run(SRC.replace('let v = env!("CARGO_PKG_VERSION");', 'let v = env!("CARGO_PKG_VERSION"); let w = option_env!("GITHUB_SHA");')).p.some((x) => x.includes('new build-time read') && x.includes('GITHUB_SHA')));
+});
+
+test('16.2(b): recall counts disagree when a read site is written in a shape the resolver misses (12079.7)', () => {
+  const c = rawCount('fn a() { std::env::var("A"); env::var_os(x); let _ = option_env!("B"); env!("C"); my_env!("D"); }');
+  assert.equal(c['env::var('], 1); assert.equal(c['env::var_os('], 1); assert.equal(c['option_env!('], 1); assert.equal(c['env!('], 1);
+});
+
+test('16.2(b): the planted instrument test catches all three plants (12079.6)', () => {
+  const root = tree();
+  const tmp = mkdtempSync(join(tmpdir(), 'c16p-'));
+  try {
+    const p = planted(root, record(), join(tmp, 'p'));
+    assert.deepEqual(p.caught, { plain_read: true, env_override: true, second_prefix_scan: true });
+    assert.equal(p.pass, true);
+  } finally { rmSync(root, { recursive: true, force: true }); rmSync(tmp, { recursive: true, force: true }); }
 });

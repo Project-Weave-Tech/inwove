@@ -1,8 +1,8 @@
 {
-  "_why": "ref/09 §1. The job's first step re-confirms these and fails if one moved without being updated here on purpose.",
-  "vti-tsp-js": { "npm": "@openvtc/vti-tsp-js", "version": "0.4.0", "licence": "Apache-2.0", "repo": "https://github.com/OpenVTC/vta-browser-plugin", "source": "a24e498f" },
+  "_why": "ref/09 §1. The job's first step re-confirms these and fails if one moved without being updated here on purpose. Each repo pin carries its full sha, written by hand, and the ref upstream holds it on (Security 12036): the check fetches the sha with no token and proves it is an ancestor of the ref.",
+  "vti-tsp-js": { "npm": "@openvtc/vti-tsp-js", "version": "0.4.0", "licence": "Apache-2.0", "repo": "https://github.com/OpenVTC/vta-browser-plugin", "source": "a24e498f", "sha": "a24e498ff52f92b43064f7d2763078b905bb0ae6", "ref": "main", "_ref_why": "the repo's tags (Banyan, Cypress, ...) are VTI releases, not one per package, so the default branch is the ref (Security 12036.2)" },
   "vti-didcomm-js": { "npm": "@openvtc/vti-didcomm-js", "version": "0.13.0", "licence": "Apache-2.0" },
   "vti-tsp-js-rev3": { "npm": "vti-tsp-js-rev3", "version": "0.3.0", "licence": "Apache-2.0", "_why": "@openvtc/vti-tsp-js 0.3.0 packs Rev 3: the real Rev 3 frame for tamper (f)" },
   "affinidi-tsp": { "crate": "affinidi-tsp", "version": "0.3.0", "licence": "Apache-2.0" },
-  "tsp-spec": { "repo": "https://github.com/trustoverip/tswg-tsp-specification", "source": "ccda6b33", "sha": "ccda6b33159d860f05c328eb436dabe83548b705", "_why": "Appendix A test vectors; the vectors job fetches exactly this sha" }
+  "tsp-spec": { "repo": "https://github.com/trustoverip/tswg-tsp-specification", "source": "ccda6b33", "sha": "ccda6b33159d860f05c328eb436dabe83548b705", "ref": "main", "_why": "Appendix A test vectors; the vectors job fetches exactly this sha" }
 }

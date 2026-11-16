@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Condition 16, tightening 1(a) (Security, bus 11984): check the RESOLVED feature set, not just the flags we pass.
 // Feature unification can switch a feature back on from inside the dependency graph, so the job records
-// `cargo tree -e features ...` and fails if `vta` or any `secrets-*` feature shows up anywhere in it.
+// `cargo tree -e features ...` and fails if `vta`, any `secrets-*` feature or `aws` (the gate on AWS_REGION, bus 12079.5)
+// shows up anywhere in it.
 //
 // `cargo tree` does not print the root crate's own features on its root line, so a default build (which has `vta`)
 // shows no `feature "vta"` line at all: what shows is the `vta-sdk` crate that feature pulls in. The check therefore
@@ -24,6 +25,10 @@ export function verdict(tree) {
   const add = (k) => hits.set(k, (hits.get(k) ?? 0) + 1);
   for (const m of tree.matchAll(/feature "(vta[^"]*|secrets-[^"]*)"/g)) add(`feature ${m[1]}`);
   for (const m of tree.matchAll(/(?:^|[\s│├└─])(vta[\w-]*) v\d/gm)) add(`crate ${m[1]}`);
+  // `aws` gates the mediator's AWS_REGION read (config/mod.rs, bus 12079.5): its sign is the feature edge or the AWS
+  // SDK crates it pulls in. (`aws-lc-rs` is rustls' crypto, not the SDK, and doesn't count.)
+  for (const m of tree.matchAll(/feature "(aws)"/g)) add(`feature ${m[1]}`);
+  for (const m of tree.matchAll(/(?:^|[\s│├└─])(aws-config|aws-sdk-[\w-]+) v\d/gm)) add(`crate ${m[1]}`);
   const lines = tree.split('\n').filter((l) => l.trim()).length;
   return { lines, hits: Object.fromEntries([...hits].sort()), clean: hits.size === 0 && lines > 0 };
 }

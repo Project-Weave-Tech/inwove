@@ -57,6 +57,7 @@ jobs:
     env:
       SPEC_REPO: https://github.com/trustoverip/tswg-tsp-specification
       SPEC_SHA: ccda6b33159d860f05c328eb436dabe83548b705
+      SPEC_REF: main
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -69,13 +70,9 @@ jobs:
       - run: rustup update stable --no-self-update && rustc --version
       - name: build the Rust peer (affinidi-tsp 0.3.0, locked)
         run: cargo build --locked --release --manifest-path "$WPI_DIR/rs/Cargo.toml"
-      - name: the spec at the pinned commit (fails if that exact commit can't be fetched)
-        run: |
-          git init -q "$RUNNER_TEMP/spec"
-          git -C "$RUNNER_TEMP/spec" fetch -q --depth 1 "$SPEC_REPO" "$SPEC_SHA"
-          git -C "$RUNNER_TEMP/spec" checkout -q FETCH_HEAD
-          test "$(git -C "$RUNNER_TEMP/spec" rev-parse HEAD)" = "$SPEC_SHA"
-          echo "spec at $(git -C "$RUNNER_TEMP/spec" rev-parse HEAD)"
+      - name: the spec at the pinned commit, upstream's (fails if that exact commit can't be fetched or isn't on SPEC_REF)
+        # Security 12036.3: a bare sha is also served from a fork in the same network, so it must be an ancestor of the ref.
+        run: bash "$WPI_DIR/fetch-pinned.sh" "$SPEC_REPO" "$SPEC_SHA" "$SPEC_REF" "$RUNNER_TEMP/spec" --checkout
       - name: vectors
         id: vectors
         continue-on-error: true
@@ -147,6 +144,7 @@ jobs:
     env:
       MED_REPO: https://github.com/affinidi/affinidi-messaging-mediator
       MED_SHA: 34bbdea4717e3a8dd1fdb190ad9c2ad2b33a3316
+      MED_REF: refs/tags/v0.50.0
       MED_FEATURES: didcomm,tsp,redis-backend,jemalloc
       REDIS_IMAGE: redis:7.4.6-alpine@sha256:3b73847e72874be07e6657b129a94761662b79bc0f679273757d4218573b2a98
       OUT: results/mediator-early
@@ -161,15 +159,13 @@ jobs:
         working-directory: sandbox/tsp-tests
       - name: packages the mediator build needs (the host Dockerfile's list)
         run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev libdbus-1-dev clang cmake
-      - name: the mediator at the pinned commit (fails if that exact commit can't be fetched)
+      - name: the mediator at the pinned commit, upstream's (fails if that exact commit can't be fetched or isn't on MED_REF)
+        # Security 12036.3: we build and run this code, so the sha must be an ancestor of the release tag, not only fetchable.
         run: |
-          git init -q "$RUNNER_TEMP/med"
-          git -C "$RUNNER_TEMP/med" fetch -q --depth 1 "$MED_REPO" "$MED_SHA"
-          git -C "$RUNNER_TEMP/med" checkout -q FETCH_HEAD
-          test "$(git -C "$RUNNER_TEMP/med" rev-parse HEAD)" = "$MED_SHA"
-          echo "mediator at $(git -C "$RUNNER_TEMP/med" rev-parse HEAD)"
+          mkdir -p "$OUT"
+          bash "$WPI_DIR/fetch-pinned.sh" "$MED_REPO" "$MED_SHA" "$MED_REF" "$RUNNER_TEMP/med" --checkout | tee "$OUT/pin.json"
           grep -q '^local_direct_delivery_allowed = ' "$RUNNER_TEMP/med/docker/test/conf/mediator.toml"
-      - name: the resolved feature set has no vta and no secrets-* (condition 16, 1a; the default build is the control)
+      - name: the resolved feature set has no vta, no secrets-* and no aws (condition 16, 1a; the default build is the control)
         # Security 11984: feature unification can switch a feature back on from inside the graph, so the resolved set
         # is checked, not the flags. The record's sha256 goes in L8 beside the binary pin. The default build must fail
         # the same check (it carries vta-sdk), or the check proves nothing.
@@ -178,18 +174,23 @@ jobs:
         working-directory: ${{ runner.temp }}/med
         run: |
           mkdir -p "$GITHUB_WORKSPACE/$OUT"
+          # 1(a)'s record: the exact command, its output and sha256 go in the artifact (features-lean.json + the tree).
           cargo tree -e features -p affinidi-messaging-mediator --no-default-features --features "$MED_FEATURES" --locked > "$RUNNER_TEMP/tree-lean.txt"
           cargo tree -e features -p affinidi-messaging-mediator --locked > "$RUNNER_TEMP/tree-default.txt"
           lean=0; node "$GITHUB_WORKSPACE/$WPI_DIR/mediator-features.mjs" "$RUNNER_TEMP/tree-lean.txt" "$RUNNER_TEMP/med" "$GITHUB_WORKSPACE/$OUT/features-lean.json" || lean=$?
           ctl=0; node "$GITHUB_WORKSPACE/$WPI_DIR/mediator-features.mjs" "$RUNNER_TEMP/tree-default.txt" "$RUNNER_TEMP/med" "$GITHUB_WORKSPACE/$OUT/features-control.json" --expect-fail || ctl=$?
+          cp "$RUNNER_TEMP/tree-lean.txt" "$GITHUB_WORKSPACE/$OUT/tree-lean.txt"
           test "$lean" -eq 0 && test "$ctl" -eq 0
-      - name: every environment name the mediator's own crates read is on the allow or deny list (condition 16.2(b))
-        # Security's wording in L8: an unlisted name, a prefix read (MEDIATOR_TAG_ ...) or a name the grep can't resolve
-        # fails the job. At this pin it is red (88 names on neither list, 1 prefix read, 1 unresolved): the lists are
-        # Security's to widen, never this job's. Dependencies' reads are closed by `env -i` + the /proc environ test.
+      - name: the environment names the mediator's own crates read match the committed Security read (condition 16.2(b))
+        # Security 12079: mediator-env-lists.json is a committed record of a Security read at the pin. This step re-greps
+        # and COMPARES; it never writes the file. Any difference fails either way (new or gone name, moved exception,
+        # second prefix scan, new build-time read, floor name off its list, pin mismatch, recall count disagreeing).
+        # --planted tests the instrument: three planted reads in a copied crate must all be caught. The record carries
+        # the lists file's sha256 and the pin for L8, and says what this does not cover (dependencies' reads: env -i +
+        # the 16.2(c) /proc environ test).
         id: envreads
         continue-on-error: true
-        run: node "$WPI_DIR/mediator-env-reads.mjs" "$RUNNER_TEMP/med" "$WPI_DIR/mediator-env-lists.json" "$OUT/env-reads.json"
+        run: node "$WPI_DIR/mediator-env-reads.mjs" "$RUNNER_TEMP/med" "$WPI_DIR/mediator-env-lists.json" "$OUT/env-reads.json" --planted "$RUNNER_TEMP/planted"
       - name: build the mediator (locked, the lean feature set, no `vta`)
         # Railroad 11973: the running mediator never holds the admin key, so the build has no `vta` (no boot-time
         # admin-credential load, no `rotate-admin`). The set is recorded in L8 beside the pin and the conf hash; a move
