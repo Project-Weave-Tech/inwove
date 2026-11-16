@@ -18,6 +18,13 @@
 #      any value of the admin credential that setup made (Security 12247.2: on the real host setup's stdout goes to
 #      Railway's log). The markers are the credential's own string values, read by `admin-out` to tmpfs before the
 #      delete; the scan must first find them in the credential itself (a scan that can't hit isn't evidence).
+#   9. Every private key of the admin DID, as one admin key (Security 12582.2(b)/(c)): admin-key-markers.mjs lists
+#      the admin DID document's keys (verificationMethod + every relationship), matches each public key to a private
+#      key the credential yields (the X25519 keyAgreement key is derived from the Ed25519 seed; none lives elsewhere),
+#      and writes markers for both in every encoding (multibase ± prefix, JWK d, base64, hex), plus the values of
+#      setup's own `admin-monitor.json` (the admin's secret beside the conf, admin_monitor_profile.rs:58-80). The scan
+#      counts only after it hits a planted copy of each. That file joins the surgical delete; at the end no file on
+#      the volume and no log line carries any marker, and the file is gone.
 #   8. admin-out custody (Security 12247.3): its <out> only under this job's /dev/shm dir; a results/ path is refused
 #      (tried, must exit 5); the file is removed right after the admin calls (none yet: they come with the DIDComm
 #      admin client) and before delete-admin; the job fails if it still exists at the end, and the artifact dir is
@@ -84,6 +91,9 @@ if [ -f "$VOL/mediator.toml" ]; then
   sed -i -e "s#^functions_file = \"\\(conf/\\)\\?#functions_file = \"$VOL/#" \
          -e "s#^log_json = .*#log_json = \"true\"#" -e "s#^log_level = .*#log_level = \"info\"#" "$VOL/mediator.toml"
 fi
+# names only: what setup left on the volume (admin-monitor.json is the admin's secret, Security 12582.2(c))
+vol_names_after_setup=$(cd "$VOL" && find . -type f -printf '%P\n' 2>/dev/null | LC_ALL=C sort | node -e 'console.log(JSON.stringify(require("fs").readFileSync(0,"utf8").split("\n").filter(Boolean)))')
+admin_profile_after_setup=$([ -e "$VOL/admin-monitor.json" ] && echo present || echo absent)
 backend_line=$(grep -E '^backend = "file://' "$VOL/mediator.toml" 2>/dev/null | head -1 | sed "s#$VOL#<volume>#" | tr -d '"' || true)
 
 # 2. the store as setup left it
@@ -97,15 +107,14 @@ ao_results_code=0; node "$STORE" admin-out "$VOL/secrets.json" "$SHM/p1" "$RESDI
 ADMIN_OUT="$SHM/admin.json"
 ao_code=0; node "$STORE" admin-out "$VOL/secrets.json" "$SHM/p1" "$ADMIN_OUT" > "$WORK/admin-out.json" 2>"$WORK/admin-out.err" || ao_code=$?
 MARKS="$SHM/admin-markers"
-( umask 077; node -e '
-// The private key value (AdminCredential.private_key_multibase, well_known.rs:111 at 34bbdea4), it without its
-// multibase prefix, and the credential JSON itself. Not the DID: that is public and may be logged.
-const fs = require("fs"); const out = [];
-let raw = ""; try { raw = fs.readFileSync(process.argv[1], "utf8"); } catch {}
-try { const k = String(JSON.parse(raw).private_key_multibase || ""); if (k.length >= 16) out.push(k, k.slice(1)); } catch {}
-const line = raw.trim(); if (line.length >= 16 && !line.includes("\n")) out.push(line);
-fs.writeFileSync(process.argv[2], [...new Set(out)].join("\n") + (out.length ? "\n" : ""));
-' "$ADMIN_OUT" "$MARKS" )
+# Every private key of the admin DID in every encoding, and the profile's own values (12582.2(b)); then a planted
+# copy of each must be hit, so a scan that can't hit isn't evidence.
+PLANT="$SHM/planted"
+keys_summary=$( (umask 077; node "$HERE/admin-key-markers.mjs" markers "$ADMIN_OUT" "$MARKS" "$PLANT" "$VOL/admin-monitor.json") 2>/dev/null || echo '{"ok":false}')
+planted_n=$(find "$PLANT" -type f 2>/dev/null | grep -c . || true)
+planted_hit=$( [ -s "$MARKS" ] && { grep -l -F -f "$MARKS" "$PLANT"/* 2>/dev/null | grep -c . || true; } || echo 0)
+vol_files_hit_before=$( [ -s "$MARKS" ] && { grep -r -l -F -f "$MARKS" "$VOL" 2>/dev/null | grep -c . || true; } || echo 0)
+rm -rf -- "$PLANT"
 admin_marks=$(grep -c . "$MARKS" || true)
 admin_self_hits=$(grep -c -F -f "$MARKS" "$ADMIN_OUT" 2>/dev/null || true)
 # (the DIDComm admin calls go here, reading $ADMIN_OUT)
@@ -144,6 +153,7 @@ start() {
 # 3. refuse while the credential is in the store; 4. the surgical delete; 5. green on the encrypted store
 start refuse-admin-credential "$SHM/p1"
 node "$STORE" delete-admin "$VOL/secrets.json" "$SHM/p1" > "$WORK/delete-admin.json" 2>"$WORK/delete-admin.err" || true
+rm -f -- "$VOL/admin-monitor.json"   # the second place the admin key lives (12582.2(c)): gone with the surgical delete
 start green-encrypted "$SHM/p1"
 # 6. (v) rotation in place, then old refused by the mediator, new starts
 node "$STORE" rekey "$VOL/secrets.json" "$SHM/p1" "$SHM/p2" > "$WORK/rekey.json" 2>"$WORK/rekey.err" || true
@@ -155,10 +165,13 @@ names_after=$(node "$STORE" names "$VOL/secrets.json" 2>/dev/null || echo '{}')
 leaks=$(cat "$WORK"/*.out "$WORK"/*.err | grep -c -F -e "$P1" -e "$P2" -e "$REDIS_MARK" || true)
 admin_leaks=$( [ "${admin_marks:-0}" -gt 0 ] && { cat "$WORK"/*.out "$WORK"/*.err | grep -c -F -f "$MARKS" || true; } || echo 0)
 admin_out_at_end=$([ -e "$ADMIN_OUT" ] && echo present || echo absent)
+vol_files_hit_after=$( [ -s "$MARKS" ] && { grep -r -l -F -f "$MARKS" "$VOL" 2>/dev/null | grep -c . || true; } || echo 0)
+admin_profile_at_end=$([ -e "$VOL/admin-monitor.json" ] && echo present || echo absent)
 results_named_admin=$(find "$RESDIR" \( -name 'admin.json' -o -name 'admin-out*' -o -name 'admin-markers' -o -name '*admin_credential*' \) 2>/dev/null | grep -c . || true)
 
 node -e '
-const fs = require("fs"); const [W, out, setupCode, backend, nb, na, o1, ow, leaks, aoRes, ao, marks, selfHits, removed, aLeaks, atEnd, resNamed] = process.argv.slice(1);
+const fs = require("fs"); const [W, out, setupCode, backend, nb, na, o1, ow, leaks, aoRes, ao, marks, selfHits, removed, aLeaks, atEnd, resNamed, ksum, plN, plHit, volBefore, volAfter, profSetup, profEnd, volNames] = process.argv.slice(1);
+let ks = {}; try { ks = JSON.parse(ksum); } catch {}
 const rd = (f) => { try { return JSON.parse(fs.readFileSync(`${W}/${f}`, "utf8")); } catch { return null; } };
 const before = JSON.parse(nb), after = JSON.parse(na);
 const cred = rd("refuse-admin-credential.json"), green = rd("green-encrypted.json"), del = rd("delete-admin.json");
@@ -175,12 +188,14 @@ const v = {
   rotation_v_new_starts: neu && neu.started && neu.environ_is_allow_list ? "PASS" : "FAIL",
   marker_15_iv: leaks === "0" ? "PASS" : `FAIL (${leaks} lines)`,
   marker_admin_credential_12247_2: ao === "0" && Number(marks) > 0 && Number(selfHits) > 0 && aLeaks === "0" ? "PASS" : `FAIL (admin-out ${ao}, ${marks} markers, self ${selfHits}, ${aLeaks} lines)`,
+  admin_keys_every_private_key_12582: ks.ok && ks.every_document_key_held && ["ed25519", "x25519"].every((k) => (ks.kinds || []).includes(k)) && Number(plN) > 0 && plHit === plN && volAfter === "0" && aLeaks === "0" && profEnd === "absent" ? "PASS" : `FAIL (keys ok ${!!ks.ok}, all held ${!!ks.every_document_key_held}, kinds ${(ks.kinds || []).join("+") || "none"}, planted ${plHit}/${plN}, volume files hit at end ${volAfter}, profile at end ${profEnd})`,
   admin_out_custody_12247_3: aoRes === "5" && removed === "true" && atEnd === "absent" && resNamed === "0" ? "PASS" : `FAIL (results path ${aoRes}, removed ${removed}, at end ${atEnd}, ${resNamed} named in results)`,
 };
 const res = {
   what: "setup job, backend half: mediator-setup → ?encrypt=1, 16.3(b) refuse, surgical delete, green on the encrypted store, (v) rotation (Security 11984)",
   conf_backend_line: backend, entries_before: before.entries || null, entries_after: after.entries || null,
   admin_out: rd("admin-out.json"), admin_credential_markers: Number(marks),
+  admin_keys: { did_method: ks.did_method || null, keys: (ks.keys || []).map((k) => ({ kind: k.kind, held_by_credential: k.held_by_credential, derived: k.derived })), every_document_key_held: !!ks.every_document_key_held, markers: ks.markers || 0, planted: Number(plN), planted_hit: Number(plHit), profile_values: ks.profile_values || 0, volume_files_hit_before_delete: Number(volBefore), volume_files_hit_at_end: Number(volAfter), admin_monitor_after_setup: profSetup, admin_monitor_at_end: profEnd, volume_names_after_setup: JSON.parse(volNames || "[]") },
   surgical_delete: del, rekey: rk, runs: [cred, green, old, neu].filter(Boolean), verdicts: v,
   not_covered: ["the pinned production conf (16.1 hash + four values)", "DIDComm admin calls + read-back-is-truth"],
 };
@@ -188,4 +203,5 @@ fs.writeFileSync(out, JSON.stringify(res, null, 2) + "\n");
 console.log(JSON.stringify(v));
 process.exit(Object.values(v).every((x) => x === "PASS") ? 0 : 1);
 ' "$WORK" "$OUT" "$setup_code" "$backend_line" "$names_before" "$names_after" "$opens_p1" "$opens_wrong" "$leaks" \
-  "$ao_results_code" "$ao_code" "${admin_marks:-0}" "${admin_self_hits:-0}" "$admin_out_removed_before_delete" "$admin_leaks" "$admin_out_at_end" "$results_named_admin"
+  "$ao_results_code" "$ao_code" "${admin_marks:-0}" "${admin_self_hits:-0}" "$admin_out_removed_before_delete" "$admin_leaks" "$admin_out_at_end" "$results_named_admin" \
+  "$keys_summary" "${planted_n:-0}" "${planted_hit:-0}" "${vol_files_hit_before:-0}" "${vol_files_hit_after:-0}" "$admin_profile_after_setup" "$admin_profile_at_end" "$vol_names_after_setup"

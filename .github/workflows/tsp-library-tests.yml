@@ -301,6 +301,11 @@ jobs:
             args+=("setup:$c=$f")
           done
           node "$GITHUB_WORKSPACE/$WPI_DIR/mediator-keyring-paths.mjs" "$GITHUB_WORKSPACE/$OUT/keyring-paths.json" "${args[@]}"
+      - name: every private key of the admin DID, as one admin key (Security 12582.2 b/c; units, made-up keys)
+        id: adminkeys
+        continue-on-error: true
+        working-directory: sandbox/tsp-tests
+        run: node --test admin-key-markers.test.mjs
       - name: the setup job's backend half (mediator-setup → ?encrypt=1, 16.3(b) refuse, surgical delete, green on the encrypted store, (v) rotation)
         # Security 11984 §2(v) + 16.3, Railroad note ii. The setup binary is never beside the mediator binary (1b).
         id: setuprun
@@ -317,8 +322,8 @@ jobs:
           path: results/mediator-early
           retention-days: 30
       - name: fail if any step failed
-        if: always() && (steps.feats.outcome == 'failure' || steps.envreads.outcome == 'failure' || steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.expectred.outcome != 'success' || steps.dcself.outcome == 'failure' || steps.aclclosedd.outcome == 'failure' || steps.entrypoint.outcome == 'failure' || steps.setupbuild.outcome == 'failure' || steps.setupfeats.outcome == 'failure' || steps.keyringpaths.outcome == 'failure' || steps.setuprun.outcome == 'failure')
-        run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed over tsp (red by design) ${{ steps.aclclosed.outcome }}, admin over TSP refused (expected) ${{ steps.expectred.outcome }}, didcomm selftest ${{ steps.dcself.outcome }}, acl closed over didcomm ${{ steps.aclclosedd.outcome }}, entrypoint ${{ steps.entrypoint.outcome }}, setup build ${{ steps.setupbuild.outcome }}, setup features ${{ steps.setupfeats.outcome }}, keyring paths ${{ steps.keyringpaths.outcome }}, setup run ${{ steps.setuprun.outcome }}" && exit 1
+        if: always() && (steps.feats.outcome == 'failure' || steps.envreads.outcome == 'failure' || steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.expectred.outcome != 'success' || steps.dcself.outcome == 'failure' || steps.aclclosedd.outcome == 'failure' || steps.entrypoint.outcome == 'failure' || steps.setupbuild.outcome == 'failure' || steps.setupfeats.outcome == 'failure' || steps.keyringpaths.outcome == 'failure' || steps.adminkeys.outcome == 'failure' || steps.setuprun.outcome == 'failure')
+        run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed over tsp (red by design) ${{ steps.aclclosed.outcome }}, admin over TSP refused (expected) ${{ steps.expectred.outcome }}, didcomm selftest ${{ steps.dcself.outcome }}, acl closed over didcomm ${{ steps.aclclosedd.outcome }}, entrypoint ${{ steps.entrypoint.outcome }}, setup build ${{ steps.setupbuild.outcome }}, setup features ${{ steps.setupfeats.outcome }}, keyring paths ${{ steps.keyringpaths.outcome }}, admin keys units ${{ steps.adminkeys.outcome }}, setup run ${{ steps.setuprun.outcome }}" && exit 1
 
   report:
     name: report (one markdown report; fails while a line is missing)
