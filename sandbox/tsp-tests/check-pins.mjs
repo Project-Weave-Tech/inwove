@@ -32,7 +32,9 @@ for (const [name, p] of Object.entries(pins)) {
     const r = spawnSync('bash', [join(HERE, 'fetch-pinned.sh'), p.repo, p.sha ?? '', p.ref ?? '', dir], { encoding: 'utf8', timeout: 300_000 })
     let got = null
     try { got = JSON.parse((r.stdout ?? '').trim().split('\n').at(-1)) } catch {}
-    rmSync(dir, { recursive: true, force: true })
+    // run 43869868962: a git process still writing under .git/objects made the remove race (ENOTEMPTY) and crashed the
+    // step, which then read as "a pin moved". Retry the remove; a remove that still fails is not a pin result.
+    try { rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }) } catch (e) { console.error(`pins: temp clone not removed (${e.code})`) }
     shas[name] = got ?? { error: (r.stderr ?? '').trim().slice(0, 200) }
     const ok = r.status === 0 && got?.sha === p.sha && got?.ancestor === true && /^[0-9a-f]{40}$/.test(p.sha ?? '') && p.sha.startsWith(p.source)
     R.check(`${name} source ${p.source} (full sha, upstream's on ${p.ref})`, ok, got ? `${got.sha} on ${got.ref} @ ${got.ref_tip}, ancestor ${got.ancestor}` : `fetch failed (exit ${r.status}): ${(r.stderr ?? '').trim().slice(0, 160)}`)
