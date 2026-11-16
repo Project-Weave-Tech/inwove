@@ -8,6 +8,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { verdict, normalise, rootFeatures } from '../sandbox/tsp-tests/mediator-features.mjs';
+import { pathVerdict } from '../sandbox/tsp-tests/mediator-keyring-paths.mjs';
 
 const lists = {
   allow: ['DATABASE_URL', 'RUST_LOG'],
@@ -97,7 +98,7 @@ test('features (Security 12391.1): in setup mode only vta-sdk is expected; any o
   assert.equal(v(tree + '│   ├── vta-secrets v0.1.0\n').clean, false, 'a new vta-* backend crate goes red');
   assert.deepEqual(v(tree + '│   ├── vta-secrets v0.1.0\n').hits, { 'crate vta-secrets': 1 });
   assert.equal(v(tree + '├── vta v0.1.0\n').clean, false);
-  assert.equal(verdict(tree.replace('vta-sdk', 'vta-sdk-extra')).clean, false);
+  assert.equal(v(tree.replace('vta-sdk', 'vta-sdk-extra')).clean, false, 'setup mode: only exactly vta-sdk is expected');
 });
 
 test('features (Security 12391.2): secret-store backend crates fail in both modes; the named non-store crates pass', () => {
@@ -115,6 +116,41 @@ test('features (Security 12391.2): secret-store backend crates fail in both mode
   }
   assert.equal(verdict(lean + '│   ├── affinidi-messaging-mediator-common feature "secrets-keyring"\n').clean, false);
   assert.deepEqual(verdict(lean + '│   ├── aws-sdk-secretsmanager v1.0.0\n').hits, { 'crate aws-sdk-secretsmanager': 1 }, 'counted once');
+});
+
+test('features (Security w-1116-0355 d): any keyutils crate fails in both modes, today\'s trees have none', () => {
+  const lean = 'affinidi-messaging-mediator v0.50.0 (/w/med/crates/x)\n├── keyring-core v1.0.1\n├── tokio v1.0.0\n';
+  const setup = lean.replace('affinidi-messaging-mediator v0.50.0', 'affinidi-messaging-mediator-setup v0.50.0') + '├── vta-sdk v0.77.1\n';
+  for (const [name, t, o] of [['lean', lean, {}], ['setup', setup, { setup: true, root: [] }]]) {
+    assert.equal(verdict(t, o).clean, true, `${name}: no keyutils crate, clean`);
+    for (const c of ['linux-keyutils v0.2.5', 'linux-keyutils-keyring-store v1.0.0', 'keyutils v0.4.0', 'some-keyutils-store v0.1.0']) {
+      assert.equal(verdict(t + `│   ├── ${c}\n`, o).clean, false, `${name}: ${c}`);
+    }
+  }
+});
+
+// Made-up `cargo tree -i <crate> -e normal` text, the shapes seen at 34bbdea4 (lean and setup).
+const INV_LEAN = 'keyring-core v1.0.1\n├── affinidi-tdk-common v0.7.0\n│   └── affinidi-messaging-sdk v0.45.0\n│       └── affinidi-messaging-mediator v0.50.0 (/w/med)\n'
+  + '└── dbus-secret-service-keyring-store v1.0.1\n    └── affinidi-tdk-common v0.7.0 (*)\n';
+const INV_SETUP = 'dbus-secret-service-keyring-store v1.0.1\n└── affinidi-tdk-common v0.7.0\n    ├── affinidi-meeting-place v0.5.0\n    │   └── affinidi-tdk v0.36.0\n'
+  + '    │       └── vta-sdk v0.77.1\n    │           └── affinidi-messaging-mediator-setup v0.50.0 (/w/setup)\n    ├── affinidi-tdk v0.36.0 (*)\n    └── affinidi-tdk v0.37.0\n'
+  + '        └── affinidi-messaging-mediator-setup v0.50.0 (/w/setup)\n';
+test('keyring paths (Security 12491 a): the exception holds only while every path runs through affinidi-tdk-common', () => {
+  assert.equal(pathVerdict(INV_LEAN).pass, true, 'lean at the pin');
+  assert.equal(pathVerdict(INV_SETUP).pass, true, 'setup at the pin');
+  // mediator-common pulls the store directly (a future pin): red, by the forbidden crate and by the bypass.
+  const viaCommon = INV_LEAN + '└── affinidi-messaging-mediator-common v0.50.0\n    └── affinidi-messaging-mediator v0.50.0 (/w/med)\n';
+  const v = pathVerdict(viaCommon.replace('└── dbus-secret-service-keyring-store', '├── dbus-secret-service-keyring-store'));
+  assert.equal(v.pass, false); assert.equal(v.forbidden_in_tree, true); assert.equal(v.paths_bypassing.length, 1);
+  // Any other crate reaching the root without tdk-common: red, and the path is named.
+  const bypass = 'keyring-core v1.0.1\n├── affinidi-tdk-common v0.7.0\n│   └── affinidi-messaging-mediator v0.50.0 (/w/med)\n└── some-new-crate v0.1.0\n    └── affinidi-messaging-mediator v0.50.0 (/w/med)\n';
+  assert.deepEqual(pathVerdict(bypass).paths_bypassing, ['keyring-core <- some-new-crate <- affinidi-messaging-mediator']);
+  // The target straight on the root (no tdk-common at all): red.
+  assert.equal(pathVerdict('keyring-core v1.0.1\n└── affinidi-messaging-mediator v0.50.0 (/w/med)\n').pass, false);
+  // Absent from the build: nothing to land, passes and says so. Anything unreadable fails closed.
+  assert.deepEqual(pathVerdict('error: package ID specification `keyring-core` did not match any packages\n'), { pass: true, absent: true });
+  assert.equal(pathVerdict('error: failed to download from crates.io\n').pass, false);
+  assert.equal(pathVerdict('').pass, false, 'an empty tree is not an absent crate');
 });
 
 test('features: the record hash does not depend on where the checkout sits', () => {

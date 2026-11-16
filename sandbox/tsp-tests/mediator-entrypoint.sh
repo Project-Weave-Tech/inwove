@@ -120,6 +120,10 @@ for d in /usr/local/bin /usr/bin /bin "$(dirname "$bin")"; do [ -e "$d/mediator-
 # 12079.2
 host_matching '^MEDIATOR_TAG_'
 [ "${#MATCH[@]}" -eq 0 ] || refuse "MEDIATOR_TAG_* present on the host: $(say_names "${MATCH[@]}")"
+# Security 12491(b): no D-Bus bus handed in. The client keyring linked at the pin (affinidi-tdk-common's default,
+# dbus-secret-service-keyring-store) writes over D-Bus; with no bus a reach we missed fails instead of storing.
+host_matching '^DBUS_(SESSION|SYSTEM)_BUS_ADDRESS$'
+[ "${#MATCH[@]}" -eq 0 ] || refuse "D-Bus bus names on the host: $(say_names "${MATCH[@]}")"
 # 3: the deny side of the record
 while IFS= read -r n; do
   [ -n "$n" ] || continue

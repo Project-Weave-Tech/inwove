@@ -63,6 +63,17 @@ test('entrypoint: refuses the plain passphrase, any MEDIATOR_TAG_*, and a deny-l
   } finally { r.done(); }
 });
 
+test('entrypoint 12491(b): refuses a D-Bus session or system bus handed in by the host, by name', { skip: !haveTmpfs && 'no tmpfs' }, () => {
+  const r = rig();
+  try {
+    refused(run(r, { env: { DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus' } }), 'D-Bus bus names on the host: DBUS_SESSION_BUS_ADDRESS');
+    refused(run(r, { env: { DBUS_SYSTEM_BUS_ADDRESS: 'unix:path=/run/dbus/system_bus_socket' } }), 'D-Bus bus names on the host: DBUS_SYSTEM_BUS_ADDRESS');
+    // An unrelated DBUS_ name is not a bus address: env -i drops it like any other platform name.
+    const ok = run(r, { env: { DBUS_STARTER_BUS_TYPE: 'session' } });
+    assert.ok(!/refused: D-Bus/.test(ok.err), 'only the two bus-address names refuse');
+  } finally { r.done(); }
+});
+
 test('entrypoint: a missing required value fails loudly', { skip: !haveTmpfs && 'no tmpfs' }, () => {
   const r = rig();
   try {

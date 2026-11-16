@@ -270,6 +270,24 @@ jobs:
           c=0; node "$GITHUB_WORKSPACE/$WPI_DIR/mediator-features.mjs" "$RUNNER_TEMP/tree-setup-default.txt" "$RUNNER_TEMP/med" "$GITHUB_WORKSPACE/$OUT/features-setup-control.json" --setup "$RUNNER_TEMP/root-setup-default.txt" --expect-fail || c=$?
           sed "s#$RUNNER_TEMP/med#<checkout>#g" "$RUNNER_TEMP/tree-setup.txt" > "$GITHUB_WORKSPACE/$OUT/tree-setup.txt"
           test "$s" -eq 0 && test "$c" -eq 0
+      - name: the client-keyring exception is bound to its path (Security 12491 a; every path through affinidi-tdk-common, none via mediator-common)
+        # mediator-features.mjs lets keyring-core and dbus-secret-service-keyring-store through by name. This step
+        # proves why, on the real trees: `cargo tree -i` of each, lean and setup, and every path to the root must pass
+        # through affinidi-tdk-common. A crate absent from a build passes (cargo's own "did not match"); a failed or
+        # empty tree fails closed. Units in test/mediator-condition16.test.js.
+        id: keyringpaths
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/med
+        run: |
+          set -uo pipefail
+          args=()
+          for c in keyring-core dbus-secret-service-keyring-store; do
+            f="$RUNNER_TEMP/inv-lean-$c.txt"; cargo tree -i "$c" -e normal -p affinidi-messaging-mediator --no-default-features --features "$MED_FEATURES" --locked > "$f" 2> "$f.err" || cp "$f.err" "$f"
+            args+=("lean:$c=$f")
+            f="$RUNNER_TEMP/inv-setup-$c.txt"; cargo tree -i "$c" -e normal -p affinidi-messaging-mediator-setup --no-default-features --locked > "$f" 2> "$f.err" || cp "$f.err" "$f"
+            args+=("setup:$c=$f")
+          done
+          node "$GITHUB_WORKSPACE/$WPI_DIR/mediator-keyring-paths.mjs" "$GITHUB_WORKSPACE/$OUT/keyring-paths.json" "${args[@]}"
       - name: the setup job's backend half (mediator-setup → ?encrypt=1, 16.3(b) refuse, surgical delete, green on the encrypted store, (v) rotation)
         # Security 11984 §2(v) + 16.3, Railroad note ii. The setup binary is never beside the mediator binary (1b).
         id: setuprun
@@ -286,8 +304,8 @@ jobs:
           path: results/mediator-early
           retention-days: 30
       - name: fail if any step failed
-        if: always() && (steps.feats.outcome == 'failure' || steps.envreads.outcome == 'failure' || steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.aclclosed.outcome == 'failure' || steps.dcself.outcome == 'failure' || steps.aclclosedd.outcome == 'failure' || steps.entrypoint.outcome == 'failure' || steps.setupbuild.outcome == 'failure' || steps.setupfeats.outcome == 'failure' || steps.setuprun.outcome == 'failure')
-        run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed ${{ steps.aclclosed.outcome }}, didcomm selftest ${{ steps.dcself.outcome }}, acl closed over didcomm ${{ steps.aclclosedd.outcome }}, entrypoint ${{ steps.entrypoint.outcome }}, setup build ${{ steps.setupbuild.outcome }}, setup features ${{ steps.setupfeats.outcome }}, setup run ${{ steps.setuprun.outcome }}" && exit 1
+        if: always() && (steps.feats.outcome == 'failure' || steps.envreads.outcome == 'failure' || steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.aclclosed.outcome == 'failure' || steps.dcself.outcome == 'failure' || steps.aclclosedd.outcome == 'failure' || steps.entrypoint.outcome == 'failure' || steps.setupbuild.outcome == 'failure' || steps.setupfeats.outcome == 'failure' || steps.keyringpaths.outcome == 'failure' || steps.setuprun.outcome == 'failure')
+        run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed ${{ steps.aclclosed.outcome }}, didcomm selftest ${{ steps.dcself.outcome }}, acl closed over didcomm ${{ steps.aclclosedd.outcome }}, entrypoint ${{ steps.entrypoint.outcome }}, setup build ${{ steps.setupbuild.outcome }}, setup features ${{ steps.setupfeats.outcome }}, keyring paths ${{ steps.keyringpaths.outcome }}, setup run ${{ steps.setuprun.outcome }}" && exit 1
 
   report:
     name: report (one markdown report; fails while a line is missing)

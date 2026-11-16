@@ -60,6 +60,9 @@ export function crateHit(name, { setup = false } = {}) {
   // `aws` gates the mediator's AWS_REGION read (config/mod.rs, bus 12079.5): its sign is the feature edge or the AWS
   // SDK crates it pulls in. (`aws-lc-rs` is rustls' crypto, not the SDK, and doesn't count.)
   if (/^(?:aws-config|aws-sdk-[\w-]+)$/.test(name)) return true;
+  // Security w-1116-0355 (d): the Linux kernel keyring needs no D-Bus, so any keyutils crate is a store that could land
+  // a write even with no bus. None is in the lean or setup tree at 34bbdea4; one arriving is red, never excused by name.
+  if (/keyutils/i.test(name)) return true;
   if (SECRET_NAMED_OK.has(name)) return false;
   return BACKEND_CRATES.test(name) || /secret/i.test(name);
 }
