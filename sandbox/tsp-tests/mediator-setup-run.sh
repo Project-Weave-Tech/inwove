@@ -91,7 +91,7 @@ start() {
   local wd="$WORK/work-$label"; mkdir -p "$wd"; chmod 555 "$wd"
   env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$WORK" PORT=8080 RAILWAY_ENVIRONMENT=test \
     DATABASE_URL="redis://:${REDIS_MARK}@127.0.0.1:${RPORT}/" ENKARA_MEDIATOR_BACKEND_PASSPHRASE="$(cat "$pf")" \
-    bash "$EP" --bin "$BIN" --volume "$VOL" --tmpfs "$SHM" --workdir "$wd" --deny-file "$DENY" \
+    /bin/bash -p "$EP" --bin "$BIN" --volume "$VOL" --tmpfs "$SHM" --workdir "$wd" --deny-file "$DENY" \
     -- --config "$VOL/mediator.toml" >"$WORK/$label.out" 2>"$WORK/$label.err" & MPID=$!
   local started=false
   for _ in $(seq 200); do

@@ -1,4 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
+# 12180 (Security): this script never trusts the shell the host hands it. It runs as `/bin/bash -p <script>` (the
+# image's exec-form ENTRYPOINT, and this shebang): no BASH_ENV/ENV, no imported functions, SHELLOPTS/BASHOPTS/CDPATH/
+# GLOBIGNORE ignored. Its first statement sets PATH, every tool it calls resolves under /usr/bin:/bin, the host's own
+# exported names are un-exported before any tool runs, and the mediator is started with /usr/bin/env -i by path, so a
+# host PATH is only ever a name on the dropped line. Host names are read from /proc/$$/environ (the kernel's copy of
+# what the host passed), never from `compgen -e`, which under -p doesn't list a BASH_FUNC_x%% name.
 # Condition 16.4 (Security 11984 §2-3, 12079.2): the mediator's entrypoint. It refuses to start, loudly and by name
 # (never a value), when the host carries something the mediator must not see; otherwise it writes the backend
 # passphrase to a tmpfs file and `exec env -i` the mediator with ONLY the allow list, so nothing is inherited.
@@ -30,7 +36,26 @@
 #     its file is absent (file_encrypted.rs open → init_new), so a lost volume must stop the start, never be replaced
 # Host names on no list (the platform's own, e.g. its PORT) are not refused: `env -i` drops them, and one start line
 # on stderr says which, by NAME only and never a value (12144.3c, charter §9: drift shows in the log, not nowhere).
+PATH=/usr/bin:/bin; export PATH
 set -uo pipefail
+refuse() { echo "refused: $1" >&2; exit 78; }
+# 12180 (iv): every name the host passed, from the kernel's copy, builtins only (no tool has run yet).
+HOST_NAMES=()
+mapfile -d '' -t _host_env < "/proc/$$/environ" || refuse "cannot read the host environment"
+for _kv in "${_host_env[@]}"; do HOST_NAMES+=("${_kv%%=*}"); done
+unset _host_env _kv
+host_has() { local n; for n in "${HOST_NAMES[@]}"; do [ "$n" = "$1" ] && return 0; done; return 1; }
+host_matching() { local n; for n in "${HOST_NAMES[@]}"; do [[ "$n" =~ $1 ]] && printf '%s\n' "$n"; done; return 0; }
+# 12180 (iii): the names that change what a shell or the loader does, refused by name before any tool runs. Under
+# -p bash ignores the shell ones already; the loader reads LD_* before this line, so the refusal is the tripwire
+# and a read-only image is the guard. A platform that sets one on its own is a finding about the image (Security
+# 12204.2c), never a reason to shorten this list.
+_shell="$(host_matching '^(BASH_ENV|ENV|SHELLOPTS|BASHOPTS)$|^BASH_FUNC_|^LD_')"
+[ -z "$_shell" ] || refuse "host names that change the shell or the loader: $(echo $_shell)"
+# The host's exported names stay shell variables here but are no longer handed to the tools this script runs.
+for _n in "${HOST_NAMES[@]}"; do [[ "$_n" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && [ "$_n" != PATH ] && export -n "$_n"; done
+unset _n _shell
+export LC_ALL=C
 PASSPHRASE_SOURCE=ENKARA_MEDIATOR_BACKEND_PASSPHRASE
 PINNED_RUST_LOG='info,affinidi_messaging_mediator::common::config=warn'   # condition 15's pinned filter (line D)
 ALLOW=(DATABASE_URL MEDIATOR_FILE_BACKEND_PASSPHRASE_FILE RUST_LOG)          # the record's allow side (L8)
@@ -39,7 +64,6 @@ FLOOR_DENY=(MEDIATOR_ACL_MODE BLOCK_REMOTE_ADMIN_MSGS ENABLE_INTER_MEDIATOR_RELA
             GLOBAL_DEFAULT_ACL ADMIN_DID MEDIATOR_SECRETS_BACKEND MEDIATOR_FILE_BACKEND_PASSPHRASE)
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
-refuse() { echo "refused: $1" >&2; exit 78; }
 bin= volume= tmpfs= workdir= denyfile= pathhome=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -58,19 +82,21 @@ want="$(tr -d ' \n' < "$HERE/mediator-deny.sha256")"; got="$(sha256sum < "$denyf
 [ -n "$want" ] && [ "$got" = "$want" ] || refuse "the deny file's sha256 is not the record's"
 
 # 1(b)
-if command -v mediator-setup > /dev/null 2>&1 || [ -e "$(dirname "$bin")/mediator-setup" ]; then refuse "mediator-setup is in the image"; fi
+# (searched where a start could find it: the mediator's own PATH and beside the binary; the image check searches the
+# whole filesystem, Railroad 12195.1d)
+for d in /usr/local/bin /usr/bin /bin "$(dirname "$bin")"; do [ -e "$d/mediator-setup" ] && refuse "mediator-setup is in the image"; done
 # 2(i)
-[ -z "${MEDIATOR_FILE_BACKEND_PASSPHRASE+x}" ] || refuse "MEDIATOR_FILE_BACKEND_PASSPHRASE is set on the host (use the _FILE road only)"
+! host_has MEDIATOR_FILE_BACKEND_PASSPHRASE || refuse "MEDIATOR_FILE_BACKEND_PASSPHRASE is set on the host (use the _FILE road only)"
 # 12079.2
-tags="$(compgen -e | grep '^MEDIATOR_TAG_' || true)"
+tags="$(host_matching '^MEDIATOR_TAG_')"
 [ -z "$tags" ] || refuse "MEDIATOR_TAG_* present on the host: $(echo $tags)"
 # 3: the deny side of the record
 while IFS= read -r n; do
   [ -n "$n" ] || continue
-  [ -z "${!n+x}" ] || refuse "$n is set on the host (deny list)"
+  ! host_has "$n" || refuse "$n is set on the host (deny list)"
 done < "$denyfile"
 # 12144.2: the families the mediator and its clients read, beyond the allow list
-fam="$(compgen -e | grep -E '^(MEDIATOR_|VAULT_|AWS_)' | grep -vxF -f <(printf '%s\n' "${ALLOW[@]}") || true)"
+fam="$(host_matching '^(MEDIATOR_|VAULT_|AWS_)' | grep -vxF -f <(printf '%s\n' "${ALLOW[@]}") || true)"
 [ -z "$fam" ] || refuse "host names in the MEDIATOR_/VAULT_/AWS_ families not on the allow list: $(echo $fam)"
 # 16.3(b): the admin credential is absent from the backend's own storage; the store is there and is ours
 store="$volume/secrets.json"
@@ -103,7 +129,8 @@ case "$mode" in 400|0) ;; *) refuse "the passphrase file's mode is $mode, wider 
 cd "$workdir" || refuse "cannot enter the working directory"
 keep=(DATABASE_URL="$DATABASE_URL" MEDIATOR_FILE_BACKEND_PASSPHRASE_FILE="$pf" RUST_LOG="$PINNED_RUST_LOG")
 [ "$pathhome" = 1 ] && keep+=(PATH=/usr/local/bin:/usr/bin:/bin HOME="$workdir")
-# 12144.3c: what `env -i` drops, names only (the shell's own PWD/OLDPWD/SHLVL/_ aside; DATABASE_URL is passed on)
-dropped="$(compgen -e | grep -vxE '(DATABASE_URL|PWD|OLDPWD|SHLVL|_)' | LC_ALL=C sort || true)"
+# 12144.3c: what `env -i` drops, names only. From /proc (12180 iv) it is every name the host passed but DATABASE_URL,
+# the one passed on, so the line is the complete host-name list binding 3(d)'s daily compare reads.
+dropped="$(printf '%s\n' "${HOST_NAMES[@]}" | grep -vx 'DATABASE_URL' | sort -u || true)"
 echo "entrypoint: env -i dropped $(printf '%s' "$dropped" | grep -c . || true) host names: $(echo $dropped)" >&2
-exec env -i "${keep[@]}" "$bin" "$@"
+exec /usr/bin/env -i "${keep[@]}" "$bin" "$@"

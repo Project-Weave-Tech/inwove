@@ -31,7 +31,7 @@ function rig() {
 }
 const baseEnv = { PATH: '/usr/bin:/bin', DATABASE_URL: 'redis://test-only', ENKARA_MEDIATOR_BACKEND_PASSPHRASE: 'test-only-marker' };
 function run(r, { env = {}, tmpfs = r.shm, volume = r.volume, workdir = r.workdir, deny = r.deny, extra = [] } = {}) {
-  const res = spawnSync('bash', [EP, '--bin', r.med, '--volume', volume, '--tmpfs', tmpfs, '--workdir', workdir, '--deny-file', deny, ...extra, '--', '-c', 'mediator.toml'],
+  const res = spawnSync('/bin/bash', ['-p', EP, '--bin', r.med, '--volume', volume, '--tmpfs', tmpfs, '--workdir', workdir, '--deny-file', deny, ...extra, '--', '-c', 'mediator.toml'],
     { encoding: 'utf8', env: { ...baseEnv, ...env } });
   return { code: res.status, out: res.stdout, err: res.stderr };
 }
@@ -169,4 +169,75 @@ test('entrypoint: 16.3(b) refuses a store that names mediator_admin_credential, 
     symlinkSync(join(r.disk, 'real.json'), store);
     refused(run(r), 'the secret store is a symlink');
   } finally { r.done(); }
+});
+
+// 12180 (Security): the entrypoint must not trust its own shell. Proven on 1aafa86 with a fake `env` first on PATH,
+// BASH_ENV and exported functions; these hold the fix.
+function fakeBin(r) {
+  const fb = join(r.disk, 'fakebin'); mkdirSync(fb);
+  // a fake env that drops -i and execs the rest; fakes of the check tools that always "pass"
+  writeFileSync(join(fb, 'env'), '#!/bin/sh\n[ "$1" = -i ] && shift\nexec /usr/bin/env "$@"\n');
+  writeFileSync(join(fb, 'sha256sum'), `#!/bin/sh\necho "${BAKED}  -"\n`);
+  writeFileSync(join(fb, 'grep'), '#!/bin/sh\nexit 0\n');
+  writeFileSync(join(fb, 'stat'), '#!/bin/sh\necho tmpfs\n');
+  for (const f of ['env', 'sha256sum', 'grep', 'stat']) chmodSync(join(fb, f), 0o755);
+  return fb;
+}
+
+test('entrypoint 12180: a fake env (and fake check tools) first on the host PATH changes nothing', { skip: !haveTmpfs && 'no tmpfs' }, () => {
+  const r = rig();
+  try {
+    const fb = fakeBin(r);
+    const x = run(r, { env: { PATH: `${fb}:/usr/bin:/bin`, WPI_HOST_EXTRA: 'planted-value-7f3', RUST_LOG: 'trace' } });
+    assert.equal(x.code, 0, x.err);
+    const names = x.out.split('\n').filter((l) => l.startsWith('name ')).map((l) => l.slice(5)).filter((n) => n !== 'PWD');
+    assert.deepEqual(names, ['DATABASE_URL', 'MEDIATOR_FILE_BACKEND_PASSPHRASE_FILE', 'RUST_LOG']);
+    assert.match(x.err, /env -i dropped .*\bPATH\b/);
+    // the fake tools would pass a cut deny file; the real ones refuse it
+    const cut = join(r.disk, 'cut.txt'); writeFileSync(cut, denyFileText(RECORD).replace('LOG_LEVEL\n', ''));
+    refused(run(r, { env: { PATH: `${fb}:/usr/bin:/bin` }, deny: cut }), "deny file's sha256 is not the record's");
+  } finally { r.done(); }
+});
+
+test('entrypoint 12180: refuses BASH_ENV, ENV, SHELLOPTS, BASHOPTS, any BASH_FUNC_* and any LD_* by name', { skip: !haveTmpfs && 'no tmpfs' }, () => {
+  const r = rig();
+  try {
+    const hook = join(r.disk, 'hook.sh'); writeFileSync(hook, 'echo HOOKED >&2\n');
+    for (const n of ['BASH_ENV', 'ENV']) {
+      const x = run(r, { env: { [n]: hook } });
+      refused(x, `change the shell or the loader: ${n}`);
+      assert.doesNotMatch(x.err, /HOOKED/);
+    }
+    refused(run(r, { env: { SHELLOPTS: 'xtrace' } }), 'change the shell or the loader: SHELLOPTS');
+    refused(run(r, { env: { BASHOPTS: 'extglob' } }), 'change the shell or the loader: BASHOPTS');
+    // an exported function standing in for sha256sum, with a cut deny file: refused by name, never "passed"
+    const cut = join(r.disk, 'cut.txt'); writeFileSync(cut, denyFileText(RECORD).replace('LOG_LEVEL\n', ''));
+    const fn = run(r, { env: { 'BASH_FUNC_sha256sum%%': `() { echo "${BAKED}  -"; }` }, deny: cut });
+    refused(fn, 'change the shell or the loader: BASH_FUNC_sha256sum%%');
+    refused(run(r, { env: { 'BASH_FUNC_grep%%': '() { return 0; }' } }), 'BASH_FUNC_grep%%');
+    refused(run(r, { env: { LD_PRELOAD: '' } }), 'change the shell or the loader: LD_PRELOAD');
+    refused(run(r, { env: { LD_LIBRARY_PATH: '/nowhere' } }), 'LD_LIBRARY_PATH');
+  } finally { r.done(); }
+});
+
+test('entrypoint 12180: run without -p, a BASH_ENV still never reaches a start (refused by name)', { skip: !haveTmpfs && 'no tmpfs' }, () => {
+  // the shebang and the image's exec-form ENTRYPOINT carry -p; this is the belt if someone starts it as `bash <script>`
+  const r = rig();
+  try {
+    const res = spawnSync('bash', [EP, '--bin', r.med, '--volume', r.volume, '--tmpfs', r.shm, '--workdir', r.workdir, '--deny-file', r.deny, '--', '-c', 'x'],
+      { encoding: 'utf8', env: { ...baseEnv, BASH_ENV: '/dev/null' } });
+    assert.equal(res.status, 78, res.stderr);
+    assert.match(res.stderr, /refused: .*BASH_ENV/);
+  } finally { r.done(); }
+});
+
+test('entrypoint 12180: the script starts as bash -p, sets PATH first, and calls env -i by absolute path', () => {
+  const lines = readFileSync(EP, 'utf8').split('\n');
+  assert.equal(lines[0], '#!/bin/bash -p');
+  const firstStatement = lines.slice(1).find((l) => l.trim() && !l.trim().startsWith('#'));
+  assert.equal(firstStatement, 'PATH=/usr/bin:/bin; export PATH');
+  const execs = lines.filter((l) => /^\s*exec\b/.test(l));
+  assert.equal(execs.length, 1);
+  assert.match(execs[0], /^exec \/usr\/bin\/env -i /);
+  assert.ok(!lines.some((l) => !l.trim().startsWith('#') && /compgen -e/.test(l)), 'host names come from /proc, not compgen -e');
 });
