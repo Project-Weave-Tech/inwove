@@ -40,18 +40,13 @@ const LAYER_TYPES = {
 export const layerBlob = (chain, i) => path.join(chain, 'layers', `${i}.blob`);
 export const layerTar = (chain, i) => path.join(chain, 'layers', `${i}.tar`);
 
-// Steps 1-2 on bytes already read: manifest + config raw buffers, pins, and per layer {blob: Buffer|null}. Pure, so
-// the units can feed it made-up chains. decompress(buf, gzip) → Buffer of the tar (sync; fine for units and for the
-// verdict, the CLI streams instead). Returns {ok, checks, layers: [{i, digest, compressed, size, media_type,
-// diff_id}], counts}.
-export function layerVerdict({ manifestRaw, configRaw, pins, blobs, decompressedSha }) {
+// Step 2 on bytes already read, for ANY image (Security 12430 (c): the registry base side and every `docker save` read
+// share this one function, not a copy). manifest + config: parsed objects; blobs: per layer Buffer|null;
+// decompressedSha(buf, gzip, i) → hex | null. Each layer: compressed sha256 + size = the manifest's entry, media type
+// one of the manifest's own tar(+gzip) types, count = rootfs.diff_ids count, decompressed sha256 = diff_ids[i] in order.
+export function checkLayers({ manifest, config, blobs, decompressedSha }) {
   const checks = {};
   const P = (b) => (b ? 'PASS' : 'FAIL');
-  let manifest = null, config = null;
-  try { manifest = JSON.parse(manifestRaw.toString('utf8')); } catch {}
-  try { config = JSON.parse(configRaw.toString('utf8')); } catch {}
-  checks.manifest_is_the_pin = P(!!manifestRaw && `sha256:${sha(manifestRaw)}` === pins.base_manifest_digest);
-  checks.config_is_the_pin = P(!!configRaw && `sha256:${sha(configRaw)}` === pins.base_config_digest && manifest?.config?.digest === pins.base_config_digest);
   const types = LAYER_TYPES[manifest?.mediaType] || null;
   checks.manifest_type_known = P(!!types);
   const ls = Array.isArray(manifest?.layers) ? manifest.layers : [];
@@ -74,22 +69,74 @@ export function layerVerdict({ manifestRaw, configRaw, pins, blobs, decompressed
     return v;
   });
   checks.every_layer_checks = P(layers.length > 0 && layers.every((l) => l.compressed === 'PASS' && l.size === 'PASS' && l.media_type === 'PASS' && l.diff_id === 'PASS'));
+  return { checks, layers, gzip: layers.map((l, i) => (types ? types[ls[i]?.mediaType] === true : false)), counts: { layers: ls.length, diff_ids: diffIds.length, blobs: blobs.filter(Boolean).length } };
+}
+
+// Whether layer i of a manifest is gzip (true), plain tar (false), or not one of its own types (undefined).
+export const layerGzip = (manifest, i) => LAYER_TYPES[manifest?.mediaType]?.[manifest?.layers?.[i]?.mediaType];
+
+// Steps 1-2 for the registry base: the pins, then checkLayers. Pure, so the units can feed it made-up chains.
+// Returns {ok, checks, layers: [{i, digest, compressed, size, media_type, diff_id}], counts}.
+export function layerVerdict({ manifestRaw, configRaw, pins, blobs, decompressedSha }) {
+  const P = (b) => (b ? 'PASS' : 'FAIL');
+  let manifest = null, config = null;
+  try { manifest = JSON.parse(manifestRaw.toString('utf8')); } catch {}
+  try { config = JSON.parse(configRaw.toString('utf8')); } catch {}
+  const pinChecks = {
+    manifest_is_the_pin: P(!!manifestRaw && `sha256:${sha(manifestRaw)}` === pins.base_manifest_digest),
+    config_is_the_pin: P(!!configRaw && `sha256:${sha(configRaw)}` === pins.base_config_digest && manifest?.config?.digest === pins.base_config_digest),
+  };
+  const c = checkLayers({ manifest, config, blobs, decompressedSha });
+  const checks = { ...pinChecks, ...c.checks };
   const ok = Object.values(checks).every((x) => x === 'PASS');
-  return { ok, checks, layers, gzip: layers.map((l, i) => (types ? types[ls[i]?.mediaType] === true : false)), counts: { layers: ls.length, diff_ids: diffIds.length, blobs: blobs.filter(Boolean).length } };
+  return { ok, ...c, checks };
 }
 
 // Step 3: apply layer tars, in order, into a tree. tars: file paths. Returns {tree: Map path → entry, red: [...],
-// whiteouts, opaque}. A whiteout of a path laid down earlier in the same layer is red (a malformed layer), and so is a
-// whiteout or entry whose parent is a symlink or a non-directory.
-export function applyLayers(tars) {
+// whiteouts, opaque, layer_red, per_layer}. A whiteout of a path laid down earlier in the same layer is red (a malformed
+// layer), and so is a whiteout or entry whose parent is a symlink or a non-directory.
+//
+// opts (Security 12430 (e), for a `docker save` read): bytes a later layer deletes still ship in the image, so from
+// layer `addedFrom` on (the first layer past the pinned base prefix) the ADDED layers are judged one by one, not only
+// the applied tree:
+//   - a non-directory an added layer laid down, then overwritten or deleted (whiteout, opaque dir, or a directory
+//     written over it) in a later added layer = red; so is an added directory re-stated with another mode, owner or
+//     xattrs, or deleted;
+//   - a whiteout in an added layer may delete only a BASE path (one the base prefix laid down; a base directory an
+//     added layer merely re-states stays one), and only one named in opts.whiteouts (exact; a listed one that never comes is red too, so a stale list
+//     never passes quietly); an opaque dir only a base dir named in opts.opaque, the same way;
+// opts.keepSource: each file entry keeps {layer, offset} (where its bytes sit in that layer's tar) so the image checks
+// can read the applied tree straight from the layers, never through a container.
+export function applyLayers(tars, opts = {}) {
+  const addedFrom = Number.isInteger(opts.addedFrom) ? opts.addedFrom : Infinity;
+  const allowWh = new Set((opts.whiteouts || []).map((x) => String(x).replace(/^\/+/, '')));
+  const allowOpq = new Set((opts.opaque || []).map((x) => String(x).replace(/^\/+/, '')));
   const tree = new Map();
   const red = [];
+  const layerRed = [];
+  const perLayer = [];
+  const seenWh = new Set(), seenOpq = new Set();
+  // path → {layer, type, mode, uid, gid, xattrs} for what an ADDED layer wrote (implicit parents excluded)
+  const addedBy = new Map();
   let whiteouts = 0, opaque = 0;
+  // what the base prefix laid down, taken when the first added layer starts: a base directory an added layer
+  // re-states (every COPY layer re-states its parents) stays a base directory
+  let basePaths = new Set();
   const delTree = (p, keep = null) => {
     for (const k of [...tree.keys()]) if ((k === p || k.startsWith(`${p}/`)) && !(keep && keep.has(k))) tree.delete(k);
   };
+  const under = (k, d) => d === '' || k === d || k.startsWith(`${d}/`);
+  // An added layer li deletes everything at or under d (strictly under, for an opaque dir): any of it an earlier added
+  // layer wrote is red.
+  const addedGone = (li, d, why, at, strict = false) => {
+    for (const [k, w] of addedBy) if (w.layer < li && (strict ? k !== d && under(k, d) : under(k, d))) layerRed.push({ kind: why, ...at, added_in_layer: w.layer, gone: `/${k}`.slice(0, 200) });
+  };
   tars.forEach((file, li) => {
     const thisLayer = new Set();
+    const added = li >= addedFrom;
+    if (li === addedFrom) basePaths = new Set([...tree].filter(([, e]) => !e.implicit).map(([k]) => k));
+    const pl = { layer: li, added, files: 0, dirs: 0, links: 0, hardlinks: 0, other: 0, whiteouts: 0, opaque: 0 };
+    perLayer.push(pl);
     const anomalies = tarWalk(file, (e) => {
       const at = { layer: li, path: String(e.name).slice(0, 200) };
       const c = components(e.name);
@@ -107,23 +154,41 @@ export function applyLayers(tars) {
       const base = parts[parts.length - 1];
       const dir = parts.slice(0, -1).join('/');
       if (base === '.wh..wh..opq') {
-        opaque += 1;
+        opaque += 1; pl.opaque += 1;
         const d = dir;
+        if (added) {
+          seenOpq.add(d);
+          const t = tree.get(d);
+          if (!t || t.type !== 'dir' || !basePaths.has(d)) layerRed.push({ kind: 'opaque_dir_not_a_base_dir', ...at });
+          else if (!allowOpq.has(d)) layerRed.push({ kind: 'opaque_dir_not_listed', ...at });
+          addedGone(li, d, 'added_then_opaqued', at, true);
+          for (const k of [...addedBy.keys()]) if (k !== d && under(k, d)) addedBy.delete(k);
+        }
         for (const k of [...tree.keys()]) if (d === '' ? true : k.startsWith(`${d}/`)) if (!thisLayer.has(k)) tree.delete(k);
         return;
       }
       if (base.startsWith('.wh.')) {
-        whiteouts += 1;
+        whiteouts += 1; pl.whiteouts += 1;
         const target = [dir, base.slice(4)].filter(Boolean).join('/');
         if (!base.slice(4) || base.slice(4) === '..' || base.slice(4) === '.') { red.push({ kind: 'whiteout_bad_name', ...at }); return; }
         if (thisLayer.has(target)) { red.push({ kind: 'whiteout_of_same_layer_entry', ...at }); return; }
+        if (added) {
+          seenWh.add(target);
+          const before = layerRed.length;
+          addedGone(li, target, 'added_then_whited_out', at);
+          if (layerRed.length === before) {
+            if (!tree.has(target)) layerRed.push({ kind: 'whiteout_of_nothing', ...at });
+            else if (!allowWh.has(target)) layerRed.push({ kind: 'whiteout_not_listed', ...at });
+          }
+          for (const k of [...addedBy.keys()]) if (under(k, target)) addedBy.delete(k);
+        }
         delTree(target);
         return;
       }
       const p = parts.join('/');
       const entry = { type: e.type, mode: e.mode, uid: e.uid, gid: e.gid };
       if (e.xattrs) entry.xattrs = e.xattrs;
-      if (e.type === 'file') { entry.size = e.size; entry.sha256 = e.sha256; }
+      if (e.type === 'file') { entry.size = e.size; entry.sha256 = e.sha256; if (opts.keepSource) entry.src = { layer: li, offset: e.offset }; }
       if (e.type === 'link') entry.linkname = e.linkname;
       if (e.type === 'hardlink') {
         const lc = components(e.linkname);
@@ -136,6 +201,24 @@ export function applyLayers(tars) {
         const t = tree.get(tp);
         if (!t || (t.type !== 'file' && t.type !== 'hardlink')) { red.push({ kind: 'hardlink_target_not_a_file_in_the_tree', ...at }); return; }
         entry.linkname = tp; entry.size = t.size; entry.sha256 = t.sha256;
+        if (opts.keepSource && t.src) entry.src = t.src;
+      }
+      pl[{ file: 'files', dir: 'dirs', link: 'links', hardlink: 'hardlinks' }[e.type] || 'other'] += 1;
+      if (added) {
+        const w = addedBy.get(p);
+        if (w && w.layer < li) {
+          if (w.type !== 'dir' || entry.type !== 'dir') layerRed.push({ kind: 'added_then_overwritten', ...at, added_in_layer: w.layer });
+          else if (w.mode !== entry.mode || w.uid !== entry.uid || w.gid !== entry.gid || JSON.stringify(w.xattrs || {}) !== JSON.stringify(entry.xattrs || {}))
+            layerRed.push({ kind: 'added_dir_restated_differently', ...at, added_in_layer: w.layer });
+        }
+        if (w && w.type === 'dir' && entry.type !== 'dir') {
+          addedGone(li, p, 'added_then_overwritten', at, true);
+          for (const k of [...addedBy.keys()]) if (k !== p && under(k, p)) addedBy.delete(k);
+        }
+        // a base directory re-stated as a directory carries no bytes of its own (its mode and owner are judged on the
+        // applied tree); every other entry an added layer writes is tracked
+        const old0 = tree.get(p);
+        if (!(entry.type === 'dir' && basePaths.has(p) && old0?.type === 'dir' && !w)) addedBy.set(p, { layer: li, type: entry.type, mode: entry.mode, uid: entry.uid, gid: entry.gid, xattrs: entry.xattrs });
       }
       const old = tree.get(p);
       if (old && old.type === 'dir' && entry.type !== 'dir') delTree(p);
@@ -144,11 +227,34 @@ export function applyLayers(tars) {
     });
     for (const a of anomalies) red.push({ ...a, layer: li });
   });
-  return { tree, red, whiteouts, opaque };
+  if (addedFrom !== Infinity) {
+    for (const w of allowWh) if (!seenWh.has(w)) layerRed.push({ kind: 'listed_whiteout_not_seen', path: `/${w}` });
+    for (const d of allowOpq) if (!seenOpq.has(d)) layerRed.push({ kind: 'listed_opaque_dir_not_seen', path: `/${d}` });
+  }
+  return { tree, red, whiteouts, opaque, layer_red: layerRed, per_layer: perLayer, whiteouts_seen: [...seenWh].map((x) => `/${x}`).sort() };
+}
+
+// Every regular file each ADDED layer's own tar carries (Security 12430 (e): the content searches read these, so bytes a
+// later layer deletes or overwrites are still searched). Returns [{layer, rel, size, offset}] in stream order; hard
+// links and symlinks carry no bytes of their own. Effective names (pax/GNU); a red name is skipped here (apply reds it).
+export function addedLayerFiles(tars, addedFrom) {
+  const out = [];
+  tars.forEach((file, li) => {
+    if (li < addedFrom) return;
+    tarWalk(file, (e) => {
+      if (e.type !== 'file') return;
+      const c = components(e.name);
+      if (c.red || !c.parts.length) return;
+      const base = c.parts[c.parts.length - 1];
+      if (base.startsWith('.wh.')) return;
+      out.push({ layer: li, rel: c.parts.join('/'), size: e.size, offset: e.offset });
+    });
+  });
+  return out;
 }
 
 // Gunzip (or copy) a blob to a tar file, hashing the tar bytes; returns the hex sha256, or null on a bad stream.
-async function decompressToFile(blobFile, gz, outFile) {
+export async function decompressToFile(blobFile, gz, outFile) {
   const h = crypto.createHash('sha256');
   const tap = new Transform({ transform(c, _e, cb) { h.update(c); cb(null, c); } });
   try {
@@ -167,10 +273,11 @@ async function main([chain, pinsFile, treeOut, verdictOut]) {
   const blobs = Array.from({ length: n }, (_, i) => rd(layerBlob(chain, i)));
   // the decompressed hashes, streamed to disk first (the verdict is sync and pure)
   const shas = [];
+  let m = null;
+  try { m = JSON.parse(manifestRaw.toString('utf8')); } catch {}
   for (let i = 0; i < n; i++) {
-    let gz = null;
-    try { const m = JSON.parse(manifestRaw.toString('utf8')); gz = LAYER_TYPES[m.mediaType]?.[m.layers[i].mediaType]; } catch {}
-    shas[i] = blobs[i] && gz !== undefined && gz !== null ? await decompressToFile(layerBlob(chain, i), gz, layerTar(chain, i)) : null;
+    const gz = layerGzip(m, i);
+    shas[i] = blobs[i] && gz !== undefined ? await decompressToFile(layerBlob(chain, i), gz, layerTar(chain, i)) : null;
   }
   const v = layerVerdict({ manifestRaw, configRaw, pins, blobs, decompressedSha: (_b, _gz, i) => shas[i] });
   let applied = null;

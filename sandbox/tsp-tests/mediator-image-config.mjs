@@ -101,6 +101,8 @@ export function fromDigest(dockerfileText) {
 export const BLOB_FIELDS = ['Env', 'Entrypoint', 'Cmd', 'User', 'WorkingDir', 'ExposedPorts', 'Healthcheck', 'OnBuild', 'Volumes'];
 const STR_FIELDS = ['User', 'WorkingDir'];
 const blobNorm = (k, v) => (STR_FIELDS.includes(k) ? (v ?? '') : (v === undefined ? null : v));
+// The BLOB_FIELDS whose values differ between a config blob's `config` and an inspect Config (absent and null alike).
+export const configFieldsDiffer = (blobConfig, inspectConfig) => BLOB_FIELDS.filter((k) => J(blobNorm(k, (blobConfig ?? {})[k])) !== J(blobNorm(k, (inspectConfig ?? {})[k])));
 
 // The registry chain (Security 12197.2 a-c). chain: {index, manifest, config} as Buffers (any may be missing);
 // indexPin: the FROM line's digest; inspectConfig: base inspect's Config; inspectLayers: base inspect's RootFS.Layers

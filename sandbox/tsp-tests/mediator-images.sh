@@ -13,10 +13,15 @@
 #   rekey:   the image check (mediator-image-check.mjs rekey) on the shipped tool; (Security 11869.4) the base diff
 #            against the pinned base (mediator-base-diff.mjs, added set rekey-added.json), whose base side (Security
 #            12327) is built from the pinned layers (mediator-base-layers.mjs) with the local pull cross-checked
-#            against it; in the image, with no network and
+#            against it exactly; in the image, with no network and
 #            a read-only root: `rekey` refuses while mediator_admin_credential is in the store, the removed
 #            subcommands answer "usage" (exit 2), and after the credential is gone `rekey` re-seals (old no longer
 #            opens, new does, same entries).
+# Security 12430: every image (service, rekey, the local base pull, the plants) is read from its own `docker save`
+# (mediator-image-save.mjs), never through a container: `docker export` is gone from this step. One image for
+# linux/amd64 in each save, every blob by its digest, each layer checked by the same function as the registry base,
+# the base prefix exact, the added layers judged one by one and searched file by file. The saves and their layer tars
+# live only in this step's scratch dir, are deleted at its end and absence-checked; never an artifact.
 set -uo pipefail
 BIN="$1"; OUT="$2"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,24 +47,12 @@ cp "$HERE/mediator-rekey-entrypoint.sh" "$R/rekey-entrypoint.sh" || fail "no rek
 cp -r "$HERE/node_modules/@noble/hashes" "$R/node_modules/@noble/" || fail "no @noble/hashes (npm ci first)"
 docker build -q --label "org.opencontainers.image.revision=$COMMIT" -f "$HERE/mediator-rekey.Dockerfile" -t "$REK" "$R" > "$W/rek.id" || fail "rekey image build"
 
-# --- each image's whole filesystem, as docker export writes it (device nodes left out; nothing is followed)
-rootfs() {
-  local img="$1" dir="$2" cid
-  mkdir -p "$dir"; cid="$(docker create "$img")" || return 1
-  docker export "$cid" | tar -x -C "$dir" --no-same-owner --exclude='dev/*' --exclude='proc/*' --exclude='sys/*'; local rc=$?
-  docker rm -f "$cid" > /dev/null
-  chmod -R u+rX "$dir" 2> /dev/null || true
-  return $rc
-}
-rootfs "$SVC" "$W/svc-root" || fail "service export"
-rootfs "$REK" "$W/rek-root" || fail "rekey export"
-# --- Security 11869.4: the base-diff line. Both the rekey image and the base it is built FROM, as export streams (tar
-# headers keep the image's own mode and owner), judged file by file against the added set (rekey-added.json).
+# --- Security 11869.4: the base-diff line; 12430: both sides read from saved layers.
 BASE_REF="$(sed -n 's/^FROM \([^ ]*\).*/\1/p' "$HERE/mediator-rekey.Dockerfile" | head -1)"
 [[ "$BASE_REF" == *@sha256:* ]] || fail "the rekey Dockerfile's base is not pinned by digest"
-tarof() { local img="$1" out="$2" cid; cid="$(docker create "$img")" || return 1; docker export "$cid" > "$out"; local rc=$?; docker rm -f "$cid" > /dev/null; return $rc; }
-tarof "$REK" "$W/rek.tar" || fail "rekey export (tar)"
-tarof "$BASE_REF" "$W/base.tar" || fail "base export (tar)"
+SVC_BASE_REF="$(sed -n 's/^FROM \([^ ]*\).*/\1/p' "$HERE/mediator-service.Dockerfile" | head -1)"
+[[ "$SVC_BASE_REF" == *@sha256:* ]] || fail "the service Dockerfile's base is not pinned by digest"
+CONFIG_PIN="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).base_config_digest)' "$HERE/rekey-config.json")"
 docker image inspect "$SVC" > "$W/svc-inspect.json" && docker image inspect "$REK" > "$W/rek-inspect.json" || fail "inspect"
 # Security 11935 (a): the base half of the rekey config record is read from the pinned base itself, pulled by digest
 # for linux/amd64, never typed by hand (mediator-image-config.mjs; hand half rekey-config.json).
@@ -68,12 +61,58 @@ docker pull -q --platform linux/amd64 "$BASE_REF" > /dev/null && docker image in
 # its config blob), raw, so the config record checks every hash itself and ties inspect's read to the pinned blob. A
 # failed fetch is not fatal here: the record reads the missing blob as FAIL, never as a pass.
 node "$HERE/mediator-base-fetch.mjs" "$BASE_REF" "$W/base-chain" || echo "mediator-images: base registry chain not fully fetched (the config record and the base layers go red)" >&2
+# Security 12430 (d): the service image is not built FROM the rekey pin, so its base gets its own chain, tied by hash to
+# its own FROM digest (its layers are judged from the service image's own save).
+node "$HERE/mediator-base-fetch.mjs" "$SVC_BASE_REF" "$W/svc-base-chain" --no-layers || echo "mediator-images: service base chain not fetched (the service save read goes red)" >&2
 # Security 12327 + 12358: the base diff's base side is built from the layers the pinned manifest names, each checked
 # (compressed digest + size, media type, count, decompressed digest = the blob's diff_ids[i]) and applied in order
 # (whiteouts, opaque dirs, effective pax/GNU names; an escape or a write through a symlink is red). The tree is written
 # only when all of it passes, so a failed fetch or check leaves no tree and the base diff is red.
 bl=0; node "$HERE/mediator-base-layers.mjs" "$W/base-chain" "$HERE/rekey-config.json" "$W/base-tree.json" "$ODIR/rekey-base-layers.json" || bl=$?
-rm -rf "$W/base-chain/layers"
+rm -rf "${W:?}/base-chain/layers"
+
+# --- Security 12430: each image read from its own save. saveread <label> <delete list> <image> <chain> <from digest> [flags]
+# writes $W/trees/<label>-tree.json (the applied tree + added-layer files; bytes read back from the layer tars),
+# $W/<label>-config.json (the saved config blob) and $ODIR/<label>-save.json (the verdict). The layout goes as soon as it
+# is read; the layer tars stay in $W/save until the end of the step.
+SAVES="${W:?}/save"; TREES="${W:?}/trees"; mkdir -p "$SAVES" "$TREES"
+saveread() {
+  local label="$1" kind="$2" img="$3" chain="$4" from="$5"; shift 5
+  local L="${SAVES:?}/$label"; mkdir -p "$L/layout"
+  docker save --platform linux/amd64 "$img" -o "$L/save.tar" || { echo "mediator-images: $label save failed" >&2; return 1; }
+  tar -x -C "$L/layout" --no-same-owner -f "$L/save.tar"; local rc=$?; rm -f "$L/save.tar"; [ $rc = 0 ] || return 1
+  node "$HERE/mediator-image-save.mjs" --name "$kind" --layout "$L/layout" --work "$L/layers" --base-chain "$chain" --from-digest "$from" \
+    --out-tree "$TREES/$label-tree.json" --out-config "$W/$label-config.json" --out "$ODIR/$label-save.json" "$@"; rc=$?
+  rm -rf "${L:?}/layout"
+  return $rc
+}
+BASE_DIGEST="${BASE_REF##*@}"; SVC_BASE_DIGEST="${SVC_BASE_REF##*@}"
+ss=0; saveread service service "$SVC" "$W/svc-base-chain" "$SVC_BASE_DIGEST" --inspect "$W/svc-inspect.json" || ss=$?
+rs=0; saveread rekey rekey "$REK" "$W/base-chain" "$BASE_DIGEST" --config-pin "$CONFIG_PIN" --inspect "$W/rek-inspect.json" || rs=$?
+# 12430 (f): the local base pull, saved: its layers = the registry's by digest; its tree = the registry tree, exactly
+lb=0; saveread localbase base "$BASE_REF" "$W/base-chain" "$BASE_DIGEST" --config-pin "$CONFIG_PIN" --same-layers-as-chain --inspect "$W/base-inspect.json" || lb=$?
+
+# --- Security 12430 (g): the save read's own plants, each a throwaway image FROM the rekey image, each red first.
+#   four:      a 22-byte payload at /etc/hosts, /etc/hostname, /etc/resolv.conf and /.dockerenv: the base diff red on
+#              each path by name (an export showed the runtime's placeholders there instead);
+#   tool:      a renamed copy of the full store tool added in one layer and deleted in the next: the added-layer rule
+#              red (added then whited out) AND the added-layer content search hits it in its own layer;
+#   whiteout:  a harmless file added under /opt/rekey and deleted in the next layer: the added-layer rule red;
+#   overwrite: a file added, then overwritten with other bytes in the next layer: the added-layer rule red. (Another
+#              SIZE on purpose: the store's layer differ compares size + mtime, so same-size bytes copied in the same
+#              second give an empty layer, which the rule rightly passes since nothing was shipped.)
+PD="${W:?}/plants"; mkdir -p "$PD"
+head -c 22 /dev/zero | tr '\0' 'p' > "$PD/payload"; [ "$(wc -c < "$PD/payload")" = 22 ] || fail "plant payload"
+cp "$HERE/mediator-store.mjs" "$PD/notes.txt"; printf 'one\n' > "$PD/one"; printf 'two, longer\n' > "$PD/two"
+printf 'FROM %s\nCOPY payload /etc/hosts\nCOPY payload /etc/hostname\nCOPY payload /etc/resolv.conf\nCOPY payload /.dockerenv\n' "$REK" > "$PD/four.Dockerfile"
+printf 'FROM %s\nUSER 0\nCOPY notes.txt /usr/share/plant/notes.txt\nRUN rm /usr/share/plant/notes.txt\n' "$REK" > "$PD/tool.Dockerfile"
+printf 'FROM %s\nUSER 0\nCOPY one /opt/rekey/plant-one\nRUN rm /opt/rekey/plant-one\n' "$REK" > "$PD/whiteout.Dockerfile"
+printf 'FROM %s\nCOPY one /opt/rekey/plant-one\nCOPY two /opt/rekey/plant-one\n' "$REK" > "$PD/overwrite.Dockerfile"
+PLANTS=(four tool whiteout overwrite)
+for k in "${PLANTS[@]}"; do
+  docker build -q -f "$PD/$k.Dockerfile" -t "wpi-plant-$k:test" "$PD" > /dev/null || fail "plant $k build"
+  saveread "plant-$k" plant "wpi-plant-$k:test" "$W/base-chain" "$BASE_DIGEST" --config-pin "$CONFIG_PIN" > "$W/plant-$k.out"
+done
 
 # --- the planted tree: every search must hit each of these first
 PL="$W/planted"; mkdir -p "$PL/usr/lib/node" "$PL/usr/local/bin" "$PL/usr/bin" "$PL/run/dbus" "$PL/run/user/10001" "$PL/opt"
@@ -83,12 +122,18 @@ cp "$HERE/mediator-store.mjs" "$PL/opt/mediator-store.mjs"
 gzip -9nc "$HERE/mediator-store.mjs" > "$PL/usr/lib/node/renamed-tool.bin"
 : > "$PL/usr/local/bin/mediator-setup"; : > "$PL/usr/bin/dbus-daemon"; : > "$PL/run/dbus/system_bus_socket"; : > "$PL/run/user/10001/bus"
 
-svc=0; node "$HERE/mediator-image-check.mjs" service "$W/svc-root" "$W/svc-inspect.json" "$PL" "$ODIR/service-image.json" || svc=$?
-# The base side is the registry-built tree; the local pull's export is the 12327.4 cross-check against it.
-bd=0; node "$HERE/mediator-base-diff.mjs" "$W/rek.tar" "$W/base-tree.json" "$W/base.tar" "$HERE/rekey-added.json" "$PL" "$HERE/mediator-store.mjs" "$ODIR/rekey-base-diff.json" || bd=$?
-rm -f "$W/rek.tar" "$W/base.tar" "$W/base-tree.json"
-cfg=0; node "$HERE/mediator-image-config.mjs" "$W/rek-inspect.json" "$W/base-inspect.json" "$HERE/rekey-config.json" "$HERE/mediator-rekey.Dockerfile" "$W/base-chain" "$ODIR/rekey-config-record.json" || cfg=$?
-rek=0; node "$HERE/mediator-image-check.mjs" rekey "$W/rek-root" "$W/rek-inspect.json" /opt/rekey/mediator-store.mjs "$ODIR/rekey-image.json" "$PL" || rek=$?
+svc=0; node "$HERE/mediator-image-check.mjs" service "save:$TREES/service-tree.json" "$W/service-config.json" "$PL" "$ODIR/service-image.json" || svc=$?
+# The base side is the registry-built tree; the local pull's saved tree is the 12430 (f) cross-check against it.
+bd=0; node "$HERE/mediator-base-diff.mjs" "$TREES/rekey-tree.json" "$W/base-tree.json" "$TREES/localbase-tree.json" "$HERE/rekey-added.json" "$PL" "$HERE/mediator-store.mjs" "$ODIR/rekey-base-diff.json" || bd=$?
+# The config record reads the rekey image's SAVED config blob (12430 (b)); inspect is compared to it in the save read.
+cfg=0; node "$HERE/mediator-image-config.mjs" "$W/rekey-config.json" "$W/base-inspect.json" "$HERE/rekey-config.json" "$HERE/mediator-rekey.Dockerfile" "$W/base-chain" "$ODIR/rekey-config-record.json" || cfg=$?
+rek=0; node "$HERE/mediator-image-check.mjs" rekey "save:$TREES/rekey-tree.json" "$W/rekey-config.json" /opt/rekey/mediator-store.mjs "$ODIR/rekey-image.json" "$PL" || rek=$?
+# The plants: the four-path one through the base diff, the tool one through the rekey image check's added-layer search.
+node "$HERE/mediator-base-diff.mjs" "$TREES/plant-four-tree.json" "$W/base-tree.json" "$TREES/localbase-tree.json" "$HERE/rekey-added.json" "$PL" "$HERE/mediator-store.mjs" "$ODIR/plant-four-base-diff.json" > /dev/null 2>&1
+node "$HERE/mediator-image-check.mjs" rekey "save:$TREES/plant-tool-tree.json" "$W/plant-tool-config.json" /opt/rekey/mediator-store.mjs "$ODIR/plant-tool-image.json" "$PL" > /dev/null 2>&1
+# 12430 (h): the saves, their layer tars, the plants' context and the trees that point into the tars go now; absence checked.
+rm -rf "${SAVES:?}" "${TREES:?}" "${PD:?}"; for k in "${PLANTS[@]}"; do docker image rm -f "wpi-plant-$k:test" > /dev/null 2>&1; done
+saves_gone=true; for d in "$SAVES" "$TREES" "$PD"; do [ -e "$d" ] && saves_gone=false; done
 
 # --- the service binary in its image: libraries resolve, it runs
 ldd_out="$(docker run --rm --network none --entrypoint /usr/bin/ldd "$SVC" /opt/mediator/mediator 2>&1)"; ldd_rc=$?
@@ -156,10 +201,36 @@ o_old=0; e="$(rrun opens /data/secrets.json /run/pp/old 2>&1 > /dev/null)" || o_
 o_new=0; e="$(rrun opens /data/secrets.json /run/pp/new 2>&1 > /dev/null)" || o_new=$?; note opens-new "$o_new" "$e"
 rm -rf "$PP"; [ -e "$PP" ] && fail "passphrase dir still there"
 
+# --- 12430 (g): each plant red for its own reason, every other save line still PASS (names, kinds and paths only)
+node - "$ODIR" "$W/plants.json" <<'JS'
+const fs = require('fs'); const [odir, out] = process.argv.slice(2);
+const rd = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
+const others = (v, but) => !!v && Object.entries(v.checks).every(([k, x]) => but.includes(k) || x === 'PASS');
+const layerRed = (v, kind, gone) => !!v && !v.ok && v.checks.added_layers_clean === 'FAIL' && others(v, ['added_layers_clean'])
+  && v.added_layer_red.some((r) => r.kind === kind && (r.gone === gone || `/${r.path}` === gone));
+const four = rd(odir + '/plant-four-save.json'), fourBd = rd(odir + '/plant-four-base-diff.json');
+const tool = rd(odir + '/plant-tool-save.json'), toolImg = rd(odir + '/plant-tool-image.json');
+const wh = rd(odir + '/plant-whiteout-save.json'), ov = rd(odir + '/plant-overwrite-save.json');
+const FOUR = ['/etc/hosts', '/etc/hostname', '/etc/resolv.conf', '/.dockerenv'];
+const TOOL = '/usr/share/plant/notes.txt', ONE = '/opt/rekey/plant-one';
+const per = {
+  four_paths_red_by_name: !!four && four.ok && !!fourBd && fourBd.checks.rekey_matches_base_plus_added_set === 'FAIL' && FOUR.every((p) => fourBd.red_paths.includes(p)),
+  tool_added_then_deleted_red: layerRed(tool, 'added_then_whited_out', TOOL),
+  tool_found_in_its_own_layer: !!toolImg && toolImg.checks.added_layers_no_file_carries_the_removed_words === 'FAIL' && (toolImg.added_layer_removed_word_hits || []).some((h) => h.path === TOOL),
+  whiteout_of_an_added_path_red: layerRed(wh, 'added_then_whited_out', ONE),
+  overwrite_of_an_added_file_red: layerRed(ov, 'added_then_overwritten', ONE),
+};
+const rec = { bites: Object.values(per).every(Boolean), per,
+  four_red_paths: fourBd ? fourBd.red_paths.filter((p) => FOUR.includes(p)) : null,
+  layer_red: Object.fromEntries([['tool', tool], ['whiteout', wh], ['overwrite', ov]].map(([k, v]) => [k, v ? v.added_layer_red.map((r) => ({ kind: r.kind, layer: r.layer, gone: r.gone ?? `/${r.path}` })) : null])) };
+fs.writeFileSync(out, JSON.stringify(rec));
+JS
+
 node - "$OUT" "$ODIR" "$W" <<EOF
 const fs = require('fs'); const [out, odir, w] = process.argv.slice(2);
 const rd = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
 const svc = rd(odir + '/service-image.json'), rek = rd(odir + '/rekey-image.json'), ship = rd(w + '/ship.json'), bdiff = rd(odir + '/rekey-base-diff.json'), blay = rd(odir + '/rekey-base-layers.json');
+const svs = rd(odir + '/service-save.json'), rks = rd(odir + '/rekey-save.json'), lbs = rd(odir + '/localbase-save.json'), plants = rd(w + '/plants.json');
 const removed = JSON.parse('{${removed[*]}}'.replace(/ /g, ','));
 let r2 = null; try { r2 = JSON.parse(\`$r2_out\`); } catch {}
 const P = (b) => (b ? 'PASS' : 'FAIL');
@@ -169,7 +240,12 @@ const lines = {
   service_mediator_help_runs: P($help === 0),
   service_keyring_probe: '$probe_v' || 'FAIL',
   service_entrypoint_first_line_is_the_keyring_probe: '$ep_v' || 'FAIL',
+  service_saved_layers: P($ss === 0 && svs && svs.ok),
   rekey_image_check: P(rek && rek.ok),
+  rekey_saved_layers: P($rs === 0 && rks && rks.ok),
+  local_base_saved_layers_are_the_registry_layers: P($lb === 0 && lbs && lbs.ok),
+  save_read_instrument_bites: P(plants && plants.bites),
+  saves_removed: P('$saves_gone' === 'true'),
   rekey_base_layers: P($bl === 0 && blay && blay.ok),
   rekey_base_diff: P($bd === 0 && bdiff && bdiff.ok),
   rekey_refuses_while_admin_credential_present: P($r1 !== 0 && $r1_names_cred),
@@ -197,10 +273,15 @@ console.log(JSON.stringify({ shipped_tool_sha256: rec.shipped_tool_sha256, ship_
 // Security 11869.4: the base diff's verdict, and what the image added (path, sha256, mode, owner), once, for the pin
 // Security 12327.6: per-layer digest verdicts and counts only
 console.log(JSON.stringify({ rekey_base_layers: blay && { ok: blay.ok, checks: blay.checks, layers: blay.layers, counts: blay.counts, apply_red: blay.apply_red } }));
-console.log(JSON.stringify({ rekey_base_diff: bdiff && { ok: bdiff.ok, checks: bdiff.checks, instrument: bdiff.instrument, changed: bdiff.changed, added_file_not_in_set: bdiff.added_file_not_in_set, added_dir_outside: bdiff.added_dir_outside, added_not_a_file: bdiff.added_not_a_file, added_setuid: bdiff.added_setuid, added_set_missing: bdiff.added_set_missing, container_init_bad: bdiff.container_init_bad, deleted_base_entries: bdiff.deleted_base_entries, anomalies: bdiff.anomalies } }));
-// Security 12327.4: the local pull against the registry-built tree; and the container's own entries, for the pin
-console.log(JSON.stringify({ rekey_base_cross_check: bdiff && { checks: bdiff.checks && { local_base_equals_registry_tree: bdiff.checks.local_base_equals_registry_tree, cross_check_bites: bdiff.checks.cross_check_bites }, only_local: bdiff.cross_check.only_local, only_registry: bdiff.cross_check.only_registry, differ: bdiff.cross_check.differ, init_bad: bdiff.cross_check.init_bad, entries: { rekey: bdiff.rek_entries, local_base: bdiff.local_base_entries, registry: bdiff.registry_entries } } }));
-console.log(JSON.stringify({ container_init_read: bdiff && bdiff.runtime_entries_read, container_init_pinned: bdiff && bdiff.checks.container_init_pinned }));
+console.log(JSON.stringify({ rekey_base_diff: bdiff && { ok: bdiff.ok, checks: bdiff.checks, instrument: bdiff.instrument, changed: bdiff.changed, red_paths: bdiff.red_paths, added_file_not_in_set: bdiff.added_file_not_in_set, added_dir_outside: bdiff.added_dir_outside, added_not_a_file: bdiff.added_not_a_file, added_setuid: bdiff.added_setuid, added_set_missing: bdiff.added_set_missing, deleted_base_entries: bdiff.deleted_base_entries } }));
+// Security 12430 (f): the local pull's saved tree against the registry-built tree, zero exceptions
+console.log(JSON.stringify({ rekey_base_cross_check: bdiff && { checks: bdiff.checks && { local_base_equals_registry_tree: bdiff.checks.local_base_equals_registry_tree, cross_check_bites: bdiff.checks.cross_check_bites }, only_local: bdiff.cross_check.only_local, only_registry: bdiff.cross_check.only_registry, differ: bdiff.cross_check.differ, entries: { rekey: bdiff.rek_entries, local_base: bdiff.local_base_entries, registry: bdiff.registry_entries } } }));
+// Security 12430 (b)-(e), (g): each save read, per layer (counts per kind), the added-layer reds, the plants
+const sv = (v) => v && { ok: v.ok, checks: v.checks, image: v.image, attestations: (v.attestations_in_save || []).length, base_chain: v.base_chain, per_layer: v.per_layer, counts: v.counts, added_layer_red: v.added_layer_red, apply_red: v.apply_red, whiteouts_seen: v.added_layer_whiteouts_seen, inspect_differ: v.inspect_vs_saved_config_differ, save_bad: v.save_bad };
+console.log(JSON.stringify({ service_save: sv(svs) }));
+console.log(JSON.stringify({ rekey_save: sv(rks) }));
+console.log(JSON.stringify({ local_base_save: sv(lbs) }));
+console.log(JSON.stringify({ save_read_plants: plants, service_added_layer_hits: svc && svc.added_layer_hits, rekey_added_layer_hits: rek && { removed_words: rek.added_layer_removed_word_hits, archives: rek.added_layer_archive_hits, files: rek.added_layer_files } }));
 console.log(JSON.stringify({ rekey_added_read: bdiff && bdiff.added_read }));
 // Security 11935 (a), (e), 12197.2 (c), 12232.1: the base's manifest and config digests read from the registry chain
 // (for the L8 pins), inspect's Id as evidence only, and the base half beside the verdict

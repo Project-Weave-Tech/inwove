@@ -7,8 +7,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import crypto from 'node:crypto';
 import { gzipSync, gunzipSync } from 'node:zlib';
-import { layerVerdict, applyLayers } from '../sandbox/tsp-tests/mediator-base-layers.mjs';
-import { tarWalk, tarList, crossCheck, crossCheckBites, baseDiff, containerInitList, runtimeEntriesRead } from '../sandbox/tsp-tests/mediator-base-diff.mjs';
+import { layerVerdict, applyLayers, checkLayers, addedLayerFiles } from '../sandbox/tsp-tests/mediator-base-layers.mjs';
+import { tarWalk, tarList, crossCheck, crossCheckBites, baseDiff, redPaths } from '../sandbox/tsp-tests/mediator-base-diff.mjs';
+import { selectImage, treeView, layerView } from '../sandbox/tsp-tests/mediator-image-save.mjs';
 
 const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
 const dirs = [];
@@ -171,59 +172,154 @@ test('pax/GNU: a global header with path or linkpath, an orphan header, two of o
   assert.ok(tarList(tarFile([{ type: 'g', pax: { path: 'etc' } }, { name: 'a', body: 'a' }])).anomalies.length > 0);
 });
 
-// Security 12327.4: the local pull checked against the registry tree, not trusted
+// Security 12327.4 + 12430 (f): the local pull checked against the registry tree, not trusted, with ZERO exceptions
 const REG = () => applyLayers([tarFile([{ name: 'etc/', type: '5' }, { name: 'etc/hostname', body: 'made-up-host\n' }, { name: 'etc/a', body: 'a' }, { name: 'usr/', type: '5' }, { name: 'usr/x', body: 'x' }])]).tree;
-const LOCAL = (over = []) => tarList(tarFile([{ name: 'etc/', type: '5' }, { name: 'etc/hostname', body: '', mode: 0o755 }, { name: 'etc/a', body: 'a' }, { name: 'etc/hosts', body: '', mode: 0o755 }, { name: 'usr/', type: '5' }, { name: 'usr/x', body: 'x' }, ...over]));
-const EMPTY = sha('');
-const INIT = { container_init: [
-  { path: '/etc/hostname', type: 'file', mode: 0o755, uid: 0, gid: 0, size: 0, sha256: EMPTY, in_layer: true },
-  { path: '/etc/hosts', type: 'file', mode: 0o755, uid: 0, gid: 0, size: 0, sha256: EMPTY, in_layer: false },
-] };
+const SAME = () => applyLayers([tarFile([{ name: 'etc/', type: '5' }, { name: 'etc/hostname', body: 'made-up-host\n' }, { name: 'etc/a', body: 'a' }, { name: 'usr/', type: '5' }, { name: 'usr/x', body: 'x' }])]).tree;
 
-test('cross-check: while container_init is VERIFY, the runtime entries are red and printed in full for the pin', () => {
-  const reg = REG(), loc = LOCAL();
-  assert.equal(containerInitList({ container_init: 'VERIFY' }), null);
-  const c = crossCheck(loc, reg, null);
+test('cross-check (12430 f): the same tree passes; the runtime\'s placeholders are no longer an allowed difference; one changed file is red; the instrument bites', () => {
+  const reg = REG();
+  assert.equal(crossCheck(SAME(), reg).ok, true);
+  // what an export used to show: an empty 0755 /etc/hostname and an /etc/hosts in no layer. Both red now, by name.
+  const runtime = tarList(tarFile([{ name: 'etc/', type: '5' }, { name: 'etc/hostname', body: '', mode: 0o755 }, { name: 'etc/a', body: 'a' }, { name: 'etc/hosts', body: '', mode: 0o755 }, { name: 'usr/', type: '5' }, { name: 'usr/x', body: 'x' }]));
+  const c = crossCheck(runtime, reg);
   assert.equal(c.ok, false);
   assert.deepEqual(c.only_local, [{ path: '/etc/hosts', type: 'file' }]);
   assert.deepEqual(c.differ, [{ path: '/etc/hostname', why: ['mode', 'bytes'] }]);
-  const read = runtimeEntriesRead(loc, loc, reg);
-  assert.deepEqual(read.map((x) => [x.path, x.in_layer, x.same_in_both_exports]), [['/etc/hostname', true, true], ['/etc/hosts', false, true]]);
+  const changed = new Map(SAME()); changed.set('etc/a', { ...changed.get('etc/a'), sha256: sha('A') });
+  assert.deepEqual(crossCheck(changed, reg).differ, [{ path: '/etc/a', why: ['bytes'] }]);
+  assert.equal(crossCheckBites(SAME(), reg).bites, true);
 });
 
-test('cross-check: the pinned list passes exactly as pinned; local base.tar with one file changed is red; the instrument bites', () => {
-  const reg = REG(), init = containerInitList(INIT);
-  assert.equal(crossCheck(LOCAL(), reg, init).ok, true);
-  const changed = tarList(tarFile([{ name: 'etc/', type: '5' }, { name: 'etc/hostname', body: '', mode: 0o755 }, { name: 'etc/a', body: 'A' }, { name: 'etc/hosts', body: '', mode: 0o755 }, { name: 'usr/', type: '5' }, { name: 'usr/x', body: 'x' }]));
-  const c = crossCheck(changed, reg, init);
-  assert.equal(c.ok, false); assert.deepEqual(c.differ, [{ path: '/etc/a', why: ['bytes'] }]);
-  assert.equal(crossCheckBites(LOCAL(), reg, init).bites, true);
-  // a listed entry other than its pin (mode, bytes), or one whose in_layer is wrong, is red
-  const wrongMode = containerInitList({ container_init: [{ ...INIT.container_init[0], mode: 0o644 }, INIT.container_init[1]] });
-  assert.equal(crossCheck(LOCAL(), reg, wrongMode).ok, false);
-  const wrongLayer = containerInitList({ container_init: [INIT.container_init[0], { ...INIT.container_init[1], in_layer: true }] });
-  assert.ok(crossCheck(LOCAL(), reg, wrongLayer).init_bad.some((b) => b.why.includes('not_in_a_registry_layer')));
-  // a glob, a relative path or a missing field is refused outright
-  for (const bad of [[{ ...INIT.container_init[1], path: '/etc/*' }], [{ ...INIT.container_init[1], path: 'etc/hosts' }], [{ path: '/etc/hosts', type: 'file' }]])
-    assert.throws(() => containerInitList({ container_init: bad }));
-});
-
-test('base diff on the registry tree: a pinned container_init entry passes only when the rekey export, the pin and the local base export agree', () => {
-  const reg = REG(), init = containerInitList(INIT), loc = LOCAL();
-  const rek = LOCAL([{ name: 'opt/', type: '5' }, { name: 'opt/rekey/', type: '5' }, { name: 'opt/rekey/t.mjs', body: 'tool', mode: 0o444 }]);
+test('base diff on saved trees (12430 a): bytes at /etc/hosts, /etc/hostname, /etc/resolv.conf, /.dockerenv are red by name', () => {
+  const base = applyLayers([tarFile([{ name: 'etc/', type: '5' }, { name: 'etc/hostname', body: '' }, { name: 'etc/resolv.conf', body: '' }])]).tree;
   const added = new Map([['opt/rekey/t.mjs', sha('tool')]]);
-  const v = baseDiff(rek, reg, added, init, loc);
-  assert.equal(v.ok, false, 'opt/ is an added dir outside /opt/rekey');
-  assert.deepEqual(v.added_dir_outside, ['/opt']);
-  const regOpt = new Map(reg); regOpt.set('opt', { type: 'dir', mode: 0o755, uid: 0, gid: 0 });
-  const ok = baseDiff(rek, regOpt, added, init, loc);
-  assert.equal(ok.ok, true, JSON.stringify(ok));
-  assert.deepEqual(ok.container_init_seen, ['/etc/hostname', '/etc/hosts']);
-  // the rekey export with bytes at a listed path (the runtime would hide them; if the export ever shows them) is red
-  const planted = LOCAL([{ name: 'opt/', type: '5' }, { name: 'opt/rekey/', type: '5' }, { name: 'opt/rekey/t.mjs', body: 'tool', mode: 0o444 }]);
-  planted.set('etc/hosts', { ...planted.get('etc/hosts'), size: 4, sha256: sha('tool') });
-  const p = baseDiff(planted, regOpt, added, init, loc);
-  assert.equal(p.ok, false); assert.ok(p.container_init_bad.some((b) => b.path === '/etc/hosts'));
-  // without the pin (VERIFY), the runtime entries are red as before
-  assert.equal(baseDiff(rek, regOpt, added, null, loc).ok, false);
+  const rekeyLayers = [{ name: 'opt/', type: '5' }, { name: 'opt/rekey/', type: '5' }, { name: 'opt/rekey/t.mjs', body: 'tool', mode: 0o444 }];
+  const baseOpt = new Map(base); baseOpt.set('opt', { type: 'dir', mode: 0o755, uid: 0, gid: 0 });
+  const lower = tarFile([{ name: 'etc/', type: '5' }, { name: 'etc/hostname', body: '' }, { name: 'etc/resolv.conf', body: '' }]);
+  const ok = applyLayers([lower, tarFile(rekeyLayers)]).tree;
+  assert.equal(baseDiff(ok, baseOpt, added).ok, true);
+  const P22 = 'p'.repeat(22);
+  const plant = applyLayers([lower, tarFile(rekeyLayers), tarFile([{ name: 'etc/', type: '5' }, { name: 'etc/hosts', body: P22 }, { name: 'etc/hostname', body: P22 }, { name: 'etc/resolv.conf', body: P22 }, { name: '.dockerenv', body: P22 }])]).tree;
+  const v = baseDiff(plant, baseOpt, added);
+  assert.equal(v.ok, false);
+  for (const p of ['/etc/hosts', '/etc/hostname', '/etc/resolv.conf', '/.dockerenv']) assert.ok(redPaths(v).includes(p), p);
+});
+
+// Security 12430 (e): the added layers, one by one
+const ADD = (o = {}) => ({ addedFrom: 1, whiteouts: ['/var/log/apt'], ...o });
+const BASE_L = () => tarFile([{ name: 'var/', type: '5' }, { name: 'var/log/', type: '5' }, { name: 'var/log/apt/', type: '5' }, { name: 'var/log/apt/eipp.log.xz', body: 'xz' }, { name: 'usr/', type: '5' }, { name: 'usr/x', body: 'x' }]);
+const WH_APT = () => tarFile([{ name: 'var/', type: '5' }, { name: 'var/log/', type: '5' }, { name: 'var/log/.wh.apt', body: '' }]);
+
+test('added layers: a listed base whiteout passes; an added file deleted, overwritten or opaqued away later is red; the base layers are never judged this way', () => {
+  const clean = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/a', body: 'a' }])], ADD());
+  assert.deepEqual(clean.layer_red, []); assert.deepEqual(clean.whiteouts_seen, ['/var/log/apt']);
+  const kinds = (a) => a.layer_red.map((r) => r.kind);
+  const del = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/a', body: 'a' }]), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/.wh.a', body: '' }])], ADD());
+  assert.deepEqual(kinds(del), ['added_then_whited_out']); assert.equal(del.layer_red[0].gone, '/opt/a');
+  const dirDel = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/d/', type: '5' }, { name: 'opt/d/a', body: 'a' }]), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/.wh.d', body: '' }])], ADD());
+  assert.ok(dirDel.layer_red.some((r) => r.kind === 'added_then_whited_out' && r.gone === '/opt/d/a'));
+  const over = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/a', body: 'a' }]), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/a', body: 'b' }])], ADD());
+  assert.deepEqual(kinds(over), ['added_then_overwritten']);
+  // the same bytes again still count: the earlier layer's copy ships either way
+  const same = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/a', body: 'a' }]), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/a', body: 'a' }])], ADD());
+  assert.deepEqual(kinds(same), ['added_then_overwritten']);
+  const dirOver = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/d/', type: '5' }, { name: 'opt/d/a', body: 'a' }]), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/d', body: 'f' }])], ADD());
+  assert.ok(dirOver.layer_red.some((r) => r.kind === 'added_then_overwritten' && r.gone === '/opt/d/a'));
+  const opq = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'usr/', type: '5' }, { name: 'usr/y', body: 'y' }]), tarFile([{ name: 'usr/', type: '5' }, { name: 'usr/.wh..wh..opq', body: '' }])], ADD());
+  assert.ok(kinds(opq).includes('added_then_opaqued')); assert.ok(kinds(opq).includes('opaque_dir_not_listed'));
+  const restated = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/d/', type: '5', mode: 0o755 }]), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/d/', type: '5', mode: 0o777 }])], ADD());
+  assert.deepEqual(kinds(restated), ['added_dir_restated_differently']);
+  // re-stating a directory the same way (every COPY layer does) is not red
+  const restatedSame = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/a', body: 'a' }]), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/b', body: 'b' }])], ADD());
+  assert.deepEqual(restatedSame.layer_red, []);
+  // without addedFrom (the registry base side) none of this applies
+  assert.deepEqual(applyLayers([BASE_L(), tarFile([{ name: 'usr/', type: '5' }, { name: 'usr/.wh.x', body: '' }])]).layer_red, []);
+});
+
+test('added layers: a whiteout of an unlisted base path, of nothing, and a listed whiteout that never comes are red; an opaque dir only as a listed base dir', () => {
+  const kinds = (a) => a.layer_red.map((r) => r.kind);
+  const unlisted = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'usr/', type: '5' }, { name: 'usr/.wh.x', body: '' }])], ADD());
+  assert.deepEqual(kinds(unlisted), ['whiteout_not_listed']);
+  const nothing = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'usr/', type: '5' }, { name: 'usr/.wh.none', body: '' }])], ADD());
+  assert.deepEqual(kinds(nothing), ['whiteout_of_nothing']);
+  const stale = applyLayers([BASE_L(), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/a', body: 'a' }])], ADD());
+  assert.deepEqual(kinds(stale), ['listed_whiteout_not_seen']);
+  const listedOpq = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'usr/', type: '5' }, { name: 'usr/.wh..wh..opq', body: '' }])], ADD({ opaque: ['/usr'] }));
+  assert.deepEqual(listedOpq.layer_red, []);
+  const addedOpq = applyLayers([BASE_L(), WH_APT(), tarFile([{ name: 'opt/', type: '5' }]), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/.wh..wh..opq', body: '' }])], ADD({ opaque: ['/opt'] }));
+  assert.ok(kinds(addedOpq).includes('opaque_dir_not_a_base_dir'));
+});
+
+test('added layer files (12430 e): a file a later layer deletes is still listed, with where its bytes sit; the base layers are not', () => {
+  const lt = [BASE_L(), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/a', body: 'secret-bytes' }]), tarFile([{ name: 'opt/', type: '5' }, { name: 'opt/.wh.a', body: '' }])];
+  const files = addedLayerFiles(lt, 1);
+  assert.deepEqual(files.map((f) => [f.layer, f.rel, f.size]), [[1, 'opt/a', 12]]);
+  const v = layerView(files, lt);
+  assert.equal(v.read(v.entries[0]).toString(), 'secret-bytes');
+  // the applied tree no longer holds it, but the view over the tree reads the rest straight from the layers
+  const a = applyLayers(lt, { addedFrom: 1, keepSource: true });
+  const tv = treeView(a.tree, lt);
+  assert.equal(tv.isFile('opt/a'), false);
+  assert.equal(tv.readRel('usr/x').toString(), 'x');
+  assert.equal(tv.head(tv.entries.find((e) => e.rel === 'var/log/apt/eipp.log.xz'), 1).toString(), 'x');
+});
+
+// Security 12430 (b): exactly one image for linux/amd64 in the save, every blob by its digest
+function layout({ images = [{ arch: 'amd64' }], attest = false, nested = false, tamper = null } = {}) {
+  const blobs = new Map();
+  const put = (obj) => { const b = Buffer.isBuffer(obj) ? obj : Buffer.from(JSON.stringify(obj)); const d = `sha256:${sha(b)}`; blobs.set(d, b); return { digest: d, size: b.length }; };
+  const descs = images.map((im) => {
+    const cfg = put({ architecture: im.configArch ?? im.arch, os: 'linux', rootfs: { type: 'layers', diff_ids: [] }, config: {} });
+    const m = put({ schemaVersion: 2, mediaType: OCI, config: { mediaType: 'application/vnd.oci.image.config.v1+json', ...cfg }, layers: [{ mediaType: GZ, digest: `sha256:${'0'.repeat(64)}`, size: 1 }] });
+    return { mediaType: OCI, ...m, ...(im.noPlatform ? {} : { platform: { architecture: im.arch, os: 'linux' } }) };
+  });
+  if (attest) {
+    const cfg = put({ architecture: 'unknown', os: 'unknown' });
+    const m = put({ schemaVersion: 2, mediaType: OCI, config: cfg, layers: [{ mediaType: 'application/vnd.in-toto+json', digest: `sha256:${'1'.repeat(64)}`, size: 1 }] });
+    descs.push({ mediaType: OCI, ...m, annotations: { 'vnd.docker.reference.type': 'attestation-manifest' } });
+  }
+  let top = descs;
+  if (nested) { const ix = put({ schemaVersion: 2, mediaType: 'application/vnd.oci.image.index.v1+json', manifests: descs }); top = [{ mediaType: 'application/vnd.oci.image.index.v1+json', ...ix }]; }
+  if (tamper) { const d = descs[0].digest; blobs.set(d, Buffer.concat([blobs.get(d), Buffer.from(' ')])); }
+  const index = Buffer.from(JSON.stringify({ schemaVersion: 2, mediaType: 'application/vnd.oci.image.index.v1+json', manifests: top }));
+  return selectImage((d) => blobs.get(d) ?? null, index);
+}
+
+test('save read (12430 b): one amd64 image passes (nested index and an attestation too); two, none, a platform disagreement or a blob not its digest are red', () => {
+  const ok = layout();
+  assert.equal(ok.image !== null, true); assert.deepEqual(Object.values(ok.checks), ['PASS', 'PASS', 'PASS', 'PASS']);
+  const withAttest = layout({ attest: true, nested: true });
+  assert.ok(withAttest.image); assert.equal(withAttest.attestations.length, 1);
+  assert.equal(layout({ images: [{ arch: 'amd64' }, { arch: 'amd64' }] }).checks.save_exactly_one_image, 'FAIL');
+  assert.equal(layout({ images: [{ arch: 'amd64' }, { arch: 'arm64' }] }).checks.save_exactly_one_image, 'FAIL');
+  assert.equal(layout({ images: [] }).checks.save_exactly_one_image, 'FAIL');
+  assert.equal(layout({ images: [{ arch: 'arm64' }] }).checks.save_image_is_linux_amd64, 'FAIL');
+  // the index names amd64 but the config blob is another platform's image
+  assert.equal(layout({ images: [{ arch: 'amd64', configArch: 'arm64' }] }).checks.save_image_is_linux_amd64, 'FAIL');
+  const t = layout({ tamper: true });
+  assert.equal(t.checks.save_blobs_match_their_digests, 'FAIL'); assert.equal(t.image, null);
+});
+
+test('checkLayers is the one function both sides use (12430 c): the save read and the registry verdict agree layer by layer', () => {
+  const c = chain([L1, L2]);
+  const fromSave = checkLayers({ manifest: JSON.parse(c.manifestRaw), config: JSON.parse(c.configRaw), blobs: c.blobs, decompressedSha: unzipSha });
+  assert.deepEqual(fromSave.layers, verdict(c).layers);
+  const swapped = checkLayers({ manifest: JSON.parse(c.manifestRaw), config: JSON.parse(c.configRaw), blobs: [c.blobs[1], c.blobs[0]], decompressedSha: unzipSha });
+  assert.equal(swapped.checks.every_layer_checks, 'FAIL');
+});
+
+test('added-layer search (12430 e): the removed words and an archive in a file a later layer deletes are found, by layer', async () => {
+  const { searches, archives, REKEY_IMAGE_WORDS } = await import('../sandbox/tsp-tests/mediator-image-check.mjs');
+  const gz = gzipSync(Buffer.from('anything'));
+  const lt = [BASE_L(), tarFile([{ name: 'usr/', type: '5' }, { name: 'usr/share/', type: '5' }, { name: 'usr/share/notes.txt', body: 'delete-admin admin-out seal-test encrypt-test' }]),
+    tarFile([{ name: 'usr/', type: '5' }, { name: 'usr/share/', type: '5' }, { name: 'usr/share/.wh.notes.txt', body: '' }])];
+  const v = layerView(addedLayerFiles(lt, 1), lt);
+  const s = searches(v, null, REKEY_IMAGE_WORDS);
+  assert.deepEqual(s.store_words, [{ path: '/usr/share/notes.txt', layer: 1, words: REKEY_IMAGE_WORDS }]);
+  // the applied tree alone would have missed it
+  const a = applyLayers(lt, { addedFrom: 1, keepSource: true });
+  assert.deepEqual(searches(treeView(a.tree, lt), null, REKEY_IMAGE_WORDS).store_words, []);
+  const f = join(tmp(), 'gz.tar'); writeFileSync(f, Buffer.concat([tarBytes([{ name: 'opt/', type: '5' }], { end: false }), header('opt/blob', '0', 0o644, gz.length), pad(gz), Buffer.alloc(1024)]));
+  const lt2 = [BASE_L(), f];
+  assert.deepEqual(archives(layerView(addedLayerFiles(lt2, 1), lt2)).map((h) => [h.path, h.layer, h.kinds]), [['/opt/blob', 1, ['gzip']]]);
 });

@@ -12,7 +12,8 @@
 // bytes is caught by the verdict, not trusted here. Anonymous pull token only; the token is never printed or written.
 // A failed fetch writes what it got and exits 1; the verdict then reads the missing file as red, never as a pass.
 //
-//   mediator-base-fetch.mjs <name[:tag]@sha256:<index digest>> <out dir>
+//   mediator-base-fetch.mjs <name[:tag]@sha256:<index digest>> <out dir> [--no-layers]
+// (--no-layers: the chain only, for a base whose layers are judged from the image's own save, Security 12430 (d))
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -32,7 +33,7 @@ export function amd64Descriptor(index) {
   return hits.length === 1 ? hits[0] : null;
 }
 
-async function main([ref, out]) {
+async function main([ref, out, flag]) {
   if (!out) { console.error('usage: mediator-base-fetch.mjs <name[:tag]@sha256:…> <out dir>'); return 2; }
   const r = parseRef(ref);
   if (!r) { console.error('mediator-base-fetch: the base is not a Docker Hub name pinned by digest'); return 1; }
@@ -63,6 +64,7 @@ async function main([ref, out]) {
     // its file is missing and the layer verdict reads it as red.
     const layers = JSON.parse(manifest.toString('utf8'))?.layers;
     if (!Array.isArray(layers) || !layers.length) throw new Error('the manifest names no layers');
+    if (flag === '--no-layers') { console.log(JSON.stringify({ fetched: true, layers_skipped: layers.length, ...say })); return 0; }
     fs.mkdirSync(path.join(out, 'layers'), { recursive: true });
     say.layers = 0; say.layer_bytes = 0;
     for (const [i, l] of layers.entries()) {

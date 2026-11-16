@@ -2,8 +2,9 @@
 // The rekey image's base-diff line (Security 11869.4). A list of encodings can't close the gap: the full store tool as
 // base64, hex, raw deflate, brotli under any name, a gzip one byte in, a tar member, the source reversed — each passes
 // every content and archive line. So the rekey image is judged against the pinned base image it is built FROM, file by
-// file, on both images' `docker export` streams (read here as tar, so mode and owner are the image's own, not what an
-// extract on the runner would leave):
+// file. Security 12430 (a): both sides are read from the images' own layers (`docker save`, applied by
+// mediator-image-save.mjs), never through a container: a container's export shows the runtime's own /etc/hosts,
+// /etc/hostname, /etc/resolv.conf and /.dockerenv, whatever the image holds there.
 //
 //   - every regular file is either byte-identical to the base's file at that path, with the same mode and owner, or in
 //     the ADDED SET (rekey-added.json): the shipped tool at the L8 pin plus each @noble/hashes file at its pinned sha;
@@ -16,13 +17,14 @@
 //   - a base directory whose mode or owner changed is red (directories are compared like files, bar bytes);
 //   - deleted base entries are fine, and listed.
 // Security 12327 + 12358: the base side is the tree built from the pinned layers (mediator-base-layers.mjs), never the
-// local pull; the local pull's export is cross-checked against that tree entry for entry (its own instrument plants one
-// changed file). Names are read after pax/GNU headers; a doubled, orphan or global-path header is red. The container's
-// own setup entries are allowed only as rekey-added.json's exact `container_init` list (STOP while "VERIFY").
+// local pull; the local pull's saved tree is cross-checked against that tree entry for entry with ZERO exceptions
+// (12430 (f); its own instrument plants one changed file). Names are read after pax/GNU headers; a doubled, orphan or
+// global-path header is red.
 // The line must first go red on the planted tree plus a base64 copy of the full tool (instrument bites), or it can't
 // pass. Names, paths, shas and verdicts only; no file's bytes are printed.
 //
-//   mediator-base-diff.mjs <rekey export tar> <registry tree.json> <local base export tar> <added.json> <planted dir> <full tool source> <out.json>
+//   mediator-base-diff.mjs <rekey tree.json> <registry tree.json> <local base tree.json> <added.json> <planted dir> <full tool source> <out.json>
+// (each tree.json as mediator-image-save.mjs / mediator-base-layers.mjs write it)
 // Exit 0 only when instrument_bites and rekey_matches_base_plus_added_set are both PASS.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -113,7 +115,7 @@ export function tarWalk(file, onEntry) {
         gid: p.gid !== undefined ? Number(p.gid) : octal(hdr.subarray(116, 124)),
       };
       if (Object.keys(xattrs).length) e.xattrs = xattrs;
-      if (e.type === 'file') { const h = sha(); readBody(size, (c) => h.update(c)); e.size = size; e.sha256 = h.digest('hex'); }
+      if (e.type === 'file') { e.offset = pos; const h = sha(); readBody(size, (c) => h.update(c)); e.size = size; e.sha256 = h.digest('hex'); }
       else { if (size) readBody(size, () => {}); if (e.type === 'link' || e.type === 'hardlink') e.linkname = linkname; }
       onEntry(e);
       pax = null; xattrs = {}; longName = null; longLink = null;
@@ -202,83 +204,25 @@ export function entryDiff(e, b) {
   return why;
 }
 
-// The container's own setup entries (WPI-BUILD's question to Security, w-1116-1443 and w-1116-1526): `docker create`
-// lays entries into the container's root that are not the image's. Some are in no layer (/.dockerenv, /etc/hosts,
-// /etc/mtab, /dev/console, …); some REPLACE a layer's file (/etc/hostname, /etc/resolv.conf come back empty, 0755), so
-// the export shows the runtime's placeholder, not the image's bytes. rekey-added.json's `container_init` is the exact
-// list, [{path, type, mode, uid, gid, size?, sha256?, linkname?, in_layer}], every field pinned by Security from a
-// run's print; until then it is "VERIFY" and the line reads STOP. Never globbed. Returns Map path → pinned entry, or
-// null while unpinned, or throws on a malformed list.
-export function containerInitList(j) {
-  const c = j?.container_init;
-  if (c === undefined || c === 'VERIFY') return null;
-  const okE = (x) => typeof x?.path === 'string' && x.path.startsWith('/') && !/[*?[\]]/.test(x.path) && ['file', 'dir', 'link', 'other'].includes(x.type)
-    && Number.isInteger(x.mode) && Number.isInteger(x.uid) && Number.isInteger(x.gid) && typeof x.in_layer === 'boolean'
-    && (x.type !== 'file' || (Number.isInteger(x.size) && /^[0-9a-f]{64}$/.test(String(x.sha256)))) && (x.type !== 'link' || typeof x.linkname === 'string');
-  if (!Array.isArray(c) || c.some((x) => !okE(x)))
-    throw new Error('container_init must be "VERIFY" or a list of {path (absolute, no glob), type, mode, uid, gid, size + sha256 (files), linkname (links), in_layer}');
-  return new Map(c.map((x) => [norm(x.path), { ...x, path: undefined }]));
-}
-
-// One listed entry as an export holds it, against its pin and against where it may sit (in a layer or not).
-const initWhy = (e, pin, inRegistry, side) => {
-  const why = [];
-  if (!e) return [`not_in_the_${side}`];
-  why.push(...entryDiff(e, pin).map((w) => `${side}_${w}_not_the_pinned_one`));
-  if (inRegistry !== pin.in_layer) why.push(pin.in_layer ? 'not_in_a_registry_layer' : 'in_a_registry_layer');
-  return why;
-};
-
-// The setup entries as they are: where the local base export and the registry tree disagree (missing from the tree,
-// or other than it) and the rekey export holds the same entry as the local one. Full entries (no content beyond a
-// sha256), for Security to pin from (printed while the list is "VERIFY").
-export function runtimeEntriesRead(rek, localBase, registry) {
-  const out = [];
-  for (const [p, e] of localBase) {
-    const r = registry.get(p);
-    if (r && !entryDiff(e, r).length) continue;
-    const k = rek.get(p);
-    const x = { path: `/${p}`, type: kindOf(e), mode: e.mode, uid: e.uid, gid: e.gid, in_layer: !!r, same_in_both_exports: !!k && entryDiff(k, e).length === 0 };
-    if (kindOf(e) === 'file') { x.size = e.size; x.sha256 = e.sha256; }
-    if (e.type === 'link') x.linkname = e.linkname;
-    out.push(x);
-  }
-  return out.sort((a, b) => (a.path < b.path ? -1 : 1));
-}
-
-// The 12327.4 cross-check (widens change C): the local pull's export walk must equal the registry-built tree entry for
-// entry. Listed container_init entries are the only allowed difference, and only exactly as pinned.
-export function crossCheck(local, registry, init) {
-  const only_local = [], only_registry = [], differ = [], init_bad = [];
+// The 12327.4 cross-check, exact (Security 12430 (f)): the local pull's saved tree must equal the registry-built tree
+// entry for entry, zero exceptions (no container is read, so there are no runtime entries to allow).
+export function crossCheck(local, registry) {
+  const only_local = [], only_registry = [], differ = [];
   for (const [p, e] of local) {
     const r = registry.get(p);
-    if (init && init.has(p)) { const why = initWhy(e, init.get(p), !!r, 'local_base_export'); if (why.length) init_bad.push({ path: `/${p}`, why }); continue; }
     if (!r) { only_local.push({ path: `/${p}`, type: kindOf(e) }); continue; }
     const why = entryDiff(e, r);
     if (why.length) differ.push({ path: `/${p}`, why });
   }
   for (const p of registry.keys()) if (!local.has(p)) only_registry.push(`/${p}`);
-  if (init) for (const p of init.keys()) if (!local.has(p)) init_bad.push({ path: `/${p}`, why: ['not_in_the_local_base_export'] });
-  return { ok: !only_local.length && !only_registry.length && !differ.length && !init_bad.length, only_local, only_registry: only_registry.sort(), differ, init_bad };
+  return { ok: !only_local.length && !only_registry.length && !differ.length, only_local, only_registry: only_registry.sort(), differ };
 }
 
-// rek, base: Maps from tarList (base may be the registry-built tree). added: Map path → sha256. init: the pinned
-// container_init Map (or null), local: the local base export's Map, needed when init is given. Returns the hits by
-// kind, and ok.
-export function baseDiff(rek, base, added, init = null, local = null) {
+// rek, base: Maps (applied trees, or tarList). added: Map path → sha256. Returns the hits by kind, and ok.
+export function baseDiff(rek, base, added) {
   const xattr = [], changed = [], addedFile = [], addedDir = [], addedOther = [], suid = [], missing = [], deleted = [];
-  const initBad = [], initSeen = [];
   for (const [p, e] of rek) {
     const b = base.get(p);
-    if (init && init.has(p)) {
-      const pin = init.get(p);
-      const why = initWhy(e, pin, !!b, 'rekey_export');
-      const l = local?.get(p);
-      if (!l) why.push('not_in_the_local_base_export');
-      else why.push(...entryDiff(e, l).map((w) => `${w}_differs_from_the_local_base_export`));
-      if (why.length) initBad.push({ path: `/${p}`, why }); else initSeen.push(`/${p}`);
-      continue;
-    }
     const xn = xattrDiff(e, b);
     if (xn.length) xattr.push({ path: `/${p}`, names: xn });
     if (b) {
@@ -291,18 +235,23 @@ export function baseDiff(rek, base, added, init = null, local = null) {
     if (e.mode & SUID) suid.push(`/${p}`);
     if (!underAddedRoot(p) || added.get(p) !== e.sha256) addedFile.push({ path: `/${p}`, sha256: e.sha256, in_added_set: added.has(p) });
   }
-  if (init) for (const p of init.keys()) if (!rek.has(p)) initBad.push({ path: `/${p}`, why: ['not_in_the_rekey_export'] });
   for (const p of added.keys()) { const e = rek.get(p); if (!e || e.type !== 'file') missing.push(`/${p}`); }
-  for (const p of base.keys()) if (!rek.has(p) && !(init && init.has(p))) deleted.push(`/${p}`);
-  const ok = !changed.length && !addedFile.length && !addedDir.length && !addedOther.length && !suid.length && !missing.length && !xattr.length && !initBad.length;
+  for (const p of base.keys()) if (!rek.has(p)) deleted.push(`/${p}`);
+  const ok = !changed.length && !addedFile.length && !addedDir.length && !addedOther.length && !suid.length && !missing.length && !xattr.length;
   return { ok, changed, added_file_not_in_set: addedFile, added_dir_outside: addedDir, added_not_a_file: addedOther,
-    xattr_changed: xattr, added_setuid: suid, added_set_missing: missing, container_init_bad: initBad, container_init_seen: initSeen.sort(), deleted_base_entries: deleted.sort() };
+    xattr_changed: xattr, added_setuid: suid, added_set_missing: missing, deleted_base_entries: deleted.sort() };
+}
+
+// Every path a base diff calls red, by kind (for the plants: "red by name").
+export function redPaths(v) {
+  return [...new Set([...v.changed.map((h) => h.path), ...v.added_file_not_in_set.map((h) => h.path), ...v.added_dir_outside,
+    ...v.added_not_a_file.map((h) => h.path), ...v.xattr_changed.map((h) => h.path), ...v.added_setuid, ...v.added_set_missing])].sort();
 }
 
 // The registry-built tree, as mediator-base-layers.mjs writes it: {entries: [[path, entry], …]}.
 export function treeFromJson(j) {
   if (!Array.isArray(j?.entries)) throw new Error('registry tree: no entries');
-  return new Map(j.entries);
+  return new Map(j.entries.map(([p, e]) => { const { src: _s, ...rest } = e; return [p, rest]; }));
 }
 
 // The instrument: the rekey listing plus the planted tree and a base64 copy of the full tool at usr/share/<name>.
@@ -323,46 +272,40 @@ export function instrument(rek, base, added, plantedDir, toolSource) {
 }
 
 // The cross-check's own instrument: the local walk with one file's bytes changed must come back red on that path.
-export function crossCheckBites(local, registry, init) {
-  const f = [...local].find(([p, e]) => e.type === 'file' && registry.has(p) && !(init && init.has(p)));
+export function crossCheckBites(local, registry) {
+  const f = [...local].find(([p, e]) => e.type === 'file' && registry.has(p));
   if (!f) return { bites: false, why: 'no file in both walks' };
   const planted = new Map(local); planted.set(f[0], { ...f[1], sha256: '0'.repeat(64) });
-  const v = crossCheck(planted, registry, init);
+  const v = crossCheck(planted, registry);
   return { bites: !v.ok && v.differ.some((d) => d.path === `/${f[0]}` && d.why.includes('bytes')) };
 }
 
 if (process.argv[1]?.endsWith('mediator-base-diff.mjs')) {
-  const [rekTar, treeJson, localTar, addedJson, planted, tool, out] = process.argv.slice(2);
+  const [rekTree, treeJson, localTree, addedJson, planted, tool, out] = process.argv.slice(2);
   try {
-    if (!out) { console.error('usage: mediator-base-diff.mjs <rekey tar> <registry tree.json> <local base tar> <added.json> <planted dir> <full tool> <out.json>'); process.exit(2); }
-    // Security 12327: the base side is the tree built from the pinned layers (mediator-base-layers.mjs); a missing tree
-    // (the layer checks failed, or the fetch did) throws here, so the line is red, never a pass on the local pull.
-    const base = treeFromJson(JSON.parse(fs.readFileSync(treeJson, 'utf8')));
-    const rek = tarList(rekTar), local = tarList(localTar);
-    const addedJ = JSON.parse(fs.readFileSync(addedJson, 'utf8'));
-    const added = addedSet(addedJ);
-    const init = containerInitList(addedJ);
+    if (!out) { console.error('usage: mediator-base-diff.mjs <rekey tree.json> <registry tree.json> <local base tree.json> <added.json> <planted dir> <full tool> <out.json>'); process.exit(2); }
+    // Security 12327: the base side is the tree built from the pinned layers (mediator-base-layers.mjs); 12430: the rekey
+    // side and the local pull are the trees their own saved layers apply to (mediator-image-save.mjs). A missing tree
+    // (a layer check failed, or the fetch or the save did) throws here, so the line is red, never a pass.
+    const rd = (f) => treeFromJson(JSON.parse(fs.readFileSync(f, 'utf8')));
+    const base = rd(treeJson), rek = rd(rekTree), local = rd(localTree);
+    const added = addedSet(JSON.parse(fs.readFileSync(addedJson, 'utf8')));
     const ins = instrument(rek, base, added, planted, fs.readFileSync(tool));
-    const v = baseDiff(rek, base, added, init, local);
-    const cc = crossCheck(local, base, init);
-    const ccb = crossCheckBites(local, base, init);
-    const anomalies = { rekey_export: rek.anomalies, local_base_export: local.anomalies };
+    const v = baseDiff(rek, base, added);
+    const cc = crossCheck(local, base);
+    const ccb = crossCheckBites(local, base);
     // What the image actually holds under /opt/rekey, printed once for Security to pin (the noble files' shas).
-    const added_read = [...rek].filter(([p, e]) => e.type === 'file' && !base.has(p) && !(init && init.has(p))).map(([p, e]) => ({ path: `/${p}`, sha256: e.sha256, mode: e.mode.toString(8), owner: `${e.uid}:${e.gid}` })).sort((a, b) => (a.path < b.path ? -1 : 1));
+    const added_read = [...rek].filter(([p, e]) => e.type === 'file' && !base.has(p)).map(([p, e]) => ({ path: `/${p}`, sha256: e.sha256, mode: e.mode.toString(8), owner: `${e.uid}:${e.gid}` })).sort((a, b) => (a.path < b.path ? -1 : 1));
     const checks = {
       instrument_bites: ins.bites ? 'PASS' : 'FAIL',
       rekey_matches_base_plus_added_set: v.ok ? 'PASS' : 'FAIL',
       local_base_equals_registry_tree: cc.ok ? 'PASS' : 'FAIL',
       cross_check_bites: ccb.bites ? 'PASS' : 'FAIL',
-      exports_well_formed: !rek.anomalies.length && !local.anomalies.length ? 'PASS' : 'FAIL',
-      // WPI-BUILD's (i)-(iv) to Security: the list is pinned from a run's print; until then STOP, never a pass
-      container_init_pinned: init === null ? 'STOP' : (v.container_init_bad.length || cc.init_bad.length ? 'FAIL' : 'PASS'),
     };
     const ok = Object.values(checks).every((x) => x === 'PASS');
-    const runtime_entries_read = runtimeEntriesRead(rek, local, base);
-    fs.writeFileSync(out, `${JSON.stringify({ what: 'rekey image base diff against the registry-built base (Security 11869.4, 12327, 12358)', ok, checks, instrument: ins, cross_check: cc, cross_check_instrument: ccb, anomalies, runtime_entries_read, ...v, added_read, rek_entries: rek.size, local_base_entries: local.size, registry_entries: base.size }, null, 2)}\n`);
-    console.log(JSON.stringify({ ok, checks, changed: v.changed.length, added_file_not_in_set: v.added_file_not_in_set, added_dir_outside: v.added_dir_outside, added_not_a_file: v.added_not_a_file, added_setuid: v.added_setuid, xattr_changed: v.xattr_changed, added_set_missing: v.added_set_missing, container_init_bad: v.container_init_bad, deleted: v.deleted_base_entries.length,
-      cross_check: { only_local: cc.only_local, only_registry: cc.only_registry.length, init_bad: cc.init_bad, differ: cc.differ.slice(0, 50), differ_count: cc.differ.length }, anomalies, runtime_entries_read }));
+    fs.writeFileSync(out, `${JSON.stringify({ what: 'rekey image base diff against the registry-built base, both read from saved layers (Security 11869.4, 12327, 12358, 12430)', ok, checks, instrument: ins, cross_check: cc, cross_check_instrument: ccb, ...v, red_paths: redPaths(v), added_read, rek_entries: rek.size, local_base_entries: local.size, registry_entries: base.size }, null, 2)}\n`);
+    console.log(JSON.stringify({ ok, checks, changed: v.changed.length, red_paths: redPaths(v), added_file_not_in_set: v.added_file_not_in_set, added_dir_outside: v.added_dir_outside, added_not_a_file: v.added_not_a_file, added_setuid: v.added_setuid, xattr_changed: v.xattr_changed, added_set_missing: v.added_set_missing, deleted: v.deleted_base_entries.length,
+      cross_check: { only_local: cc.only_local, only_registry: cc.only_registry.length, differ: cc.differ.slice(0, 50), differ_count: cc.differ.length } }));
     process.exit(ok ? 0 : 1);
   } catch (e) { console.error(`mediator-base-diff: ${e.message}`); process.exit(1); }
 }

@@ -63,7 +63,7 @@ the host only when every step below holds on the new pin, in one job run, and Se
     any new archive hit, and bring both to SECURITY: the set is re-pinned or widened only by a Security block, never in
     place. A new base where the file is gone keeps the line red-safe (an absent allowed path allows nothing).
 13. **The rekey image's base diff** (Security 11869.4): `mediator-base-diff.mjs` walks the rekey image and the pinned
-    base (both `docker export` streams); every regular file is byte-identical to the base's, same mode and owner, or in
+    base (both read from their own saved layers, Security 12430; never `docker export`); every regular file is byte-identical to the base's, same mode and owner, or in
     `rekey-added.json` (the shipped tool at the L8 pin, each `@noble/hashes` file at its sha); added directories only
     under `/opt/rekey`. At a base re-pin, or when `@noble/hashes` or the shipped tool moves, the job prints
     `rekey_added_read`; the new shas come to SECURITY and are re-pinned only by a Security block, never in place.
@@ -71,8 +71,14 @@ the host only when every step below holds on the new pin, in one job run, and Se
     `mediator-base-fetch.mjs` fetches every layer the pinned amd64 manifest names; `mediator-base-layers.mjs` checks each
     (compressed sha256 + size, media type, count = `diff_ids`, decompressed sha256 = `diff_ids[i]`) and applies them in
     order (whiteouts, opaque dirs, effective pax/GNU names; an escape or a write through a symlink is red). The local
-    pull's export must equal that tree entry for entry, bar `rekey-added.json`'s exact `container_init` list. At a base
-    re-pin the job prints `rekey_base_layers` (per-layer verdicts + counts) and `container_init_read`; a new list comes
-    to SECURITY and is pinned only by a Security block. Open with Security (WPI-BUILD w-1116-1526): `docker export`
-    shows the runtime's placeholders at `/etc/hosts`, `/etc/hostname`, `/etc/resolv.conf`, `/.dockerenv`, whatever the
-    image holds there; until the read moves off the export, those paths are not judged by bytes.
+    pull's saved tree must equal that tree entry for entry, zero exceptions. At a base re-pin the job prints
+    `rekey_base_layers` (per-layer verdicts + counts).
+15. **Every image is read from its own layers** (Security 12430): `mediator-image-save.mjs` reads each `docker save`
+    (one linux/amd64 image, every blob by its digest; layers by `checkLayers`, the same function as item 14; the first
+    `diff_ids` = the pinned base's, the service image's against its own FROM chain), judges the ADDED layers one by one
+    (nothing added then deleted or overwritten; whiteouts and opaque dirs only of base paths named in
+    `ADDED_LAYER_DELETES`, exact both ways: the rekey image `/var/log/apt`, the service image none) and searches every
+    file in every added layer's own tar. The config record reads the saved config blob; inspect is evidence and must
+    agree. At a base re-pin, or when a Dockerfile adds or removes a delete, the job prints `rekey_save` /
+    `service_save` (`whiteouts_seen`, `added_layer_red`); a new delete comes to SECURITY and is listed only by a
+    Security block, never in place. The plants (`save_read_plants`) must stay red first.
