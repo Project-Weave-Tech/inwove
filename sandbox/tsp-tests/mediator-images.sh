@@ -62,6 +62,10 @@ docker image inspect "$SVC" > "$W/svc-inspect.json" && docker image inspect "$RE
 # Security 11935 (a): the base half of the rekey config record is read from the pinned base itself, pulled by digest
 # for linux/amd64, never typed by hand (mediator-image-config.mjs; hand half rekey-config.json).
 docker pull -q --platform linux/amd64 "$BASE_REF" > /dev/null && docker image inspect "$BASE_REF" > "$W/base-inspect.json" || fail "base inspect"
+# Security 12197.2 + 12232.1: the registry chain the pin names (index by the FROM digest, the one linux/amd64 manifest,
+# its config blob), raw, so the config record checks every hash itself and ties inspect's read to the pinned blob. A
+# failed fetch is not fatal here: the record reads the missing blob as FAIL, never as a pass.
+node "$HERE/mediator-base-fetch.mjs" "$BASE_REF" "$W/base-chain" || echo "mediator-images: base registry chain not fully fetched (the config record goes red)" >&2
 
 # --- the planted tree: every search must hit each of these first
 PL="$W/planted"; mkdir -p "$PL/usr/lib/node" "$PL/usr/local/bin" "$PL/usr/bin" "$PL/run/dbus" "$PL/run/user/10001" "$PL/opt"
@@ -74,7 +78,7 @@ gzip -9nc "$HERE/mediator-store.mjs" > "$PL/usr/lib/node/renamed-tool.bin"
 svc=0; node "$HERE/mediator-image-check.mjs" service "$W/svc-root" "$W/svc-inspect.json" "$PL" "$ODIR/service-image.json" || svc=$?
 bd=0; node "$HERE/mediator-base-diff.mjs" "$W/rek.tar" "$W/base.tar" "$HERE/rekey-added.json" "$PL" "$HERE/mediator-store.mjs" "$ODIR/rekey-base-diff.json" || bd=$?
 rm -f "$W/rek.tar" "$W/base.tar"
-cfg=0; node "$HERE/mediator-image-config.mjs" "$W/rek-inspect.json" "$W/base-inspect.json" "$HERE/rekey-config.json" "$HERE/mediator-rekey.Dockerfile" "$ODIR/rekey-config-record.json" || cfg=$?
+cfg=0; node "$HERE/mediator-image-config.mjs" "$W/rek-inspect.json" "$W/base-inspect.json" "$HERE/rekey-config.json" "$HERE/mediator-rekey.Dockerfile" "$W/base-chain" "$ODIR/rekey-config-record.json" || cfg=$?
 rek=0; node "$HERE/mediator-image-check.mjs" rekey "$W/rek-root" "$W/rek-inspect.json" /opt/rekey/mediator-store.mjs "$ODIR/rekey-image.json" "$PL" || rek=$?
 
 # --- the service binary in its image: libraries resolve, it runs
@@ -183,8 +187,9 @@ console.log(JSON.stringify({ shipped_tool_sha256: rec.shipped_tool_sha256, ship_
 // Security 11869.4: the base diff's verdict, and what the image added (path, sha256, mode, owner), once, for the pin
 console.log(JSON.stringify({ rekey_base_diff: bdiff && { ok: bdiff.ok, checks: bdiff.checks, instrument: bdiff.instrument, changed: bdiff.changed, added_file_not_in_set: bdiff.added_file_not_in_set, added_dir_outside: bdiff.added_dir_outside, added_not_a_file: bdiff.added_not_a_file, added_setuid: bdiff.added_setuid, added_set_missing: bdiff.added_set_missing, deleted_base_entries: bdiff.deleted_base_entries } }));
 console.log(JSON.stringify({ rekey_added_read: bdiff && bdiff.added_read }));
-// Security 11935 (a), (e): the base config digest read (for the L8 pin) and the base half beside the verdict
+// Security 11935 (a), (e), 12197.2 (c), 12232.1: the base's manifest and config digests read from the registry chain
+// (for the L8 pins), inspect's Id as evidence only, and the base half beside the verdict
 const crec = rd(odir + '/rekey-config-record.json');
-console.log(JSON.stringify({ rekey_config_record: crec && { ok: crec.ok, checks: crec.checks, base_config_digest_read: crec.base_config_digest_read, base_platform: crec.base_platform, base_half: crec.base_half, details: crec.details } }));
+console.log(JSON.stringify({ rekey_config_record: crec && { ok: crec.ok, checks: crec.checks, base_manifest_digest_read: crec.base_manifest_digest_read, base_config_digest_read: crec.base_config_digest_read, base_inspect_id: crec.base_inspect_id, base_platform: crec.base_platform, base_half: crec.base_half, details: crec.details } }));
 process.exit(Object.values(lines).some((v) => v === 'FAIL') ? 1 : 0);
 EOF

@@ -4,10 +4,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { configVerdict, instrument } from '../sandbox/tsp-tests/mediator-image-config.mjs';
+import { configVerdict, instrument, makeChain, chainVerdict, BLOB_FIELDS } from '../sandbox/tsp-tests/mediator-image-config.mjs';
+import { parseRef, amd64Descriptor } from '../sandbox/tsp-tests/mediator-base-fetch.mjs';
 
 const DIR = new URL('../sandbox/tsp-tests/', import.meta.url).pathname;
 const ID = 'sha256:' + 'ab'.repeat(32);
@@ -15,25 +16,101 @@ const ENV = ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 const EP = ['/bin/bash', '-p', '/opt/rekey/rekey-entrypoint.sh'];
 const baseRec = (over = {}, top = {}) => [{ Id: ID, Architecture: 'amd64', Os: 'linux', Config: { Env: [...ENV], Entrypoint: ['docker-entrypoint.sh'], Cmd: ['node'], User: '', WorkingDir: '', ...over }, ...top }];
 const rekeyRec = (over = {}) => [{ Config: { Env: [...ENV], Entrypoint: EP, Cmd: null, User: '1000:1000', WorkingDir: '', ...over } }];
-const HAND = { base_config_digest: 'VERIFY', user: '1000:1000', entrypoint: EP, cmd: null, env: {} };
-const DF = ['# a comment', 'FROM node:22-bookworm-slim@sha256:e9f5', 'USER 1000:1000', `ENTRYPOINT ${JSON.stringify(EP)}`, ''].join('\n');
-const run = (o = {}) => configVerdict(o.rekey ?? rekeyRec(), o.base ?? baseRec(), o.hand ?? HAND, o.df ?? DF);
+const HAND = { base_manifest_digest: 'VERIFY', base_config_digest: 'VERIFY', user: '1000:1000', entrypoint: EP, cmd: null, env: {} };
+// The registry chain is made from the base record's own Config unless a test hands one in; the FROM line names its index.
+const DFT = (idx) => ['# a comment', `FROM node:22-bookworm-slim@${idx}`, 'USER 1000:1000', `ENTRYPOINT ${JSON.stringify(EP)}`, ''].join('\n');
+const C0 = makeChain(baseRec()[0].Config);
+const DF = DFT(C0.indexDigest);
+const run = (o = {}) => {
+  const base = o.base ?? baseRec();
+  const c = o.chain ?? makeChain(base[0].Config);
+  const df = (o.df ?? DF).replace(C0.indexDigest, c.indexDigest);
+  return configVerdict(o.rekey ?? rekeyRec(), base, o.hand ?? HAND, df, c.chain);
+};
+const PINNED = { ...HAND, base_manifest_digest: C0.manifestDigest, base_config_digest: C0.configDigest };
 const lines = (v) => Object.fromEntries(Object.entries(v.checks).filter(([, x]) => x !== 'PASS'));
 
-test('config: a clean pair passes every line except the digest pin, which is STOP while VERIFY and carries the read Id', () => {
+test('config: a clean pair passes every line except the two digest pins, STOP while VERIFY, carrying the chain\'s digests (never inspect\'s Id)', () => {
   const v = run();
-  assert.deepEqual(lines(v), { base_config_digest_pinned: 'STOP' });
+  assert.deepEqual(lines(v), { base_manifest_digest_pinned: 'STOP', base_config_digest_pinned: 'STOP' });
   assert.equal(v.ok, false);
-  assert.equal(v.base_config_digest_read, ID);
+  assert.equal(v.base_manifest_digest_read, C0.manifestDigest);
+  assert.equal(v.base_config_digest_read, C0.configDigest);
+  assert.equal(v.base_inspect_id, ID, 'inspect Id is printed as evidence only');
   assert.deepEqual(v.base_platform, { Architecture: 'amd64', Os: 'linux' });
   assert.deepEqual(v.base_half, { Env: ENV, Entrypoint: ['docker-entrypoint.sh'], Cmd: ['node'], User: '', WorkingDir: '' });
 });
 
-test('config: the pin equal to the read Id passes every line; a different pin is FAIL', () => {
-  const v = run({ hand: { ...HAND, base_config_digest: ID } });
+test('config: pins equal to the chain\'s digests pass every line; a different pin, or the inspect Id as the config pin, is FAIL', () => {
+  const v = run({ hand: PINNED });
   assert.deepEqual(lines(v), {});
   assert.equal(v.ok, true);
-  assert.equal(run({ hand: { ...HAND, base_config_digest: 'sha256:other' } }).checks.base_config_digest_pinned, 'FAIL');
+  assert.equal(run({ hand: { ...PINNED, base_config_digest: 'sha256:other' } }).checks.base_config_digest_pinned, 'FAIL');
+  assert.equal(run({ hand: { ...PINNED, base_config_digest: ID } }).checks.base_config_digest_pinned, 'FAIL');
+  assert.equal(run({ hand: { ...PINNED, base_manifest_digest: C0.indexDigest } }).checks.base_manifest_digest_pinned, 'FAIL');
+  assert.deepEqual(v.hand_keys, ['cmd', 'entrypoint', 'env', 'user'], 'the pins are not hand-half config lines');
+});
+
+// Security 12197.2 (a)-(b), Railroad 12183.1: every hash in the chain is checked here, and inspect is tied to the blob.
+test('chain: index bytes that are not the FROM pin, or a missing index, are red', () => {
+  const c = makeChain(baseRec()[0].Config);
+  const other = makeChain({ ...baseRec()[0].Config, Cmd: ['x'] });
+  assert.equal(chainVerdict(c.chain, other.indexDigest, baseRec()[0].Config).checks.base_index_is_the_from_pin, 'FAIL');
+  assert.equal(chainVerdict({ ...c.chain, index: null }, c.indexDigest, baseRec()[0].Config).checks.base_index_is_the_from_pin, 'FAIL');
+  assert.equal(chainVerdict(c.chain, null, baseRec()[0].Config).checks.base_index_is_the_from_pin, 'FAIL');
+  // a Dockerfile whose FROM line carries no digest has no pin to check against
+  assert.equal(run({ df: DF.replace(/@sha256:[0-9a-f]+/, '') }).checks.base_index_is_the_from_pin, 'FAIL');
+});
+
+test('chain: no linux/amd64 manifest, two of them, or only a variant one, is red', () => {
+  assert.equal(amd64Descriptor({ manifests: [{ platform: { os: 'linux', architecture: 'arm64' } }] }), null);
+  assert.equal(amd64Descriptor({ manifests: [{ platform: { os: 'linux', architecture: 'amd64', variant: 'v3' } }] }), null);
+  const two = makeChain(baseRec()[0].Config, { extraManifests: [{ digest: 'sha256:' + 'cd'.repeat(32), platform: { os: 'linux', architecture: 'amd64' } }] });
+  const v = chainVerdict(two.chain, two.indexDigest, baseRec()[0].Config);
+  assert.equal(v.checks.base_one_linux_amd64_manifest_matches_its_descriptor, 'FAIL');
+  assert.equal(v.config_digest_read, null);
+  // attestation manifests (platform unknown/unknown) beside the one amd64 manifest are fine
+  const att = makeChain(baseRec()[0].Config, { extraManifests: [{ digest: 'sha256:' + 'ef'.repeat(32), platform: { os: 'unknown', architecture: 'unknown' } }] });
+  assert.deepEqual(Object.values(chainVerdict(att.chain, att.indexDigest, baseRec()[0].Config).checks), ['PASS', 'PASS', 'PASS', 'PASS']);
+});
+
+test('chain: a manifest or config blob whose bytes differ from what names it is red', () => {
+  const c = makeChain(baseRec()[0].Config);
+  const flip = (b) => { const x = Buffer.from(b); x[x.length - 2] ^= 1; return x; };
+  const m = chainVerdict({ ...c.chain, manifest: flip(c.chain.manifest) }, c.indexDigest, baseRec()[0].Config);
+  assert.equal(m.checks.base_one_linux_amd64_manifest_matches_its_descriptor, 'FAIL');
+  const b = chainVerdict({ ...c.chain, config: flip(c.chain.config) }, c.indexDigest, baseRec()[0].Config);
+  assert.equal(b.checks.base_config_blob_matches_the_manifest, 'FAIL');
+  assert.equal(b.checks.base_inspect_equals_the_config_blob, 'FAIL', 'no blob, no tie');
+  const none = chainVerdict({ ...c.chain, config: null }, c.indexDigest, baseRec()[0].Config);
+  assert.equal(none.checks.base_config_blob_matches_the_manifest, 'FAIL');
+  const arm = makeChain(baseRec()[0].Config, { arch: 'arm64' });
+  assert.equal(chainVerdict(arm.chain, arm.indexDigest, baseRec()[0].Config).checks.base_config_blob_matches_the_manifest, 'FAIL');
+});
+
+test('chain: inspect that differs from the pinned blob in any one field is red, naming the field; absent and null read alike', () => {
+  const blobCfg = { ...baseRec()[0].Config };
+  const c = makeChain(blobCfg);
+  const diff = { Env: [...ENV, 'X=1'], Entrypoint: ['x'], Cmd: [], User: 'root', WorkingDir: '/w', ExposedPorts: { '80/tcp': {} },
+    Healthcheck: { Test: ['NONE'] }, OnBuild: ['RUN x'], Volumes: { '/v': {} } };
+  assert.deepEqual(Object.keys(diff).sort(), [...BLOB_FIELDS].sort());
+  for (const [k, val] of Object.entries(diff)) {
+    const v = chainVerdict(c.chain, c.indexDigest, { ...blobCfg, [k]: val });
+    assert.equal(v.checks.base_inspect_equals_the_config_blob, 'FAIL', k);
+    assert.deepEqual(v.inspect_vs_blob_differ, [k]);
+  }
+  const loose = chainVerdict(c.chain, c.indexDigest, { ...blobCfg, Volumes: null, OnBuild: null, User: undefined });
+  assert.equal(loose.checks.base_inspect_equals_the_config_blob, 'PASS');
+  const emptyList = makeChain({ ...blobCfg, Cmd: null });
+  assert.equal(chainVerdict(emptyList.chain, emptyList.indexDigest, { ...blobCfg, Cmd: [] }).checks.base_inspect_equals_the_config_blob, 'FAIL', 'null and [] differ');
+});
+
+test('fetch: the base ref parses to a Docker Hub repository and its index digest; anything else is refused', () => {
+  const d = 'sha256:' + 'e9'.repeat(32);
+  assert.deepEqual(parseRef(`node:22-bookworm-slim@${d}`), { repo: 'library/node', digest: d });
+  assert.deepEqual(parseRef(`docker.io/library/node@${d}`), { repo: 'library/node', digest: d });
+  assert.equal(parseRef('node:22-bookworm-slim'), null);
+  assert.equal(parseRef(`ghcr.io:443/x@${d}`), null);
 });
 
 test('config: an extra base variable the rekey Env lacks, and an extra rekey variable, are red (names only)', () => {
@@ -51,7 +128,7 @@ test('config: NODE_OPTIONS added without the hand half is red, and the built-in 
   assert.equal(v.checks.env_exact_both_ways, 'FAIL');
   assert.deepEqual(v.details.env_extra, ['NODE_OPTIONS']);
   assert.ok(!JSON.stringify(v).includes('/x'));
-  assert.deepEqual(instrument(), { bites: true, extra_base_variable_red: true, node_options_red: true });
+  assert.deepEqual(instrument(), { bites: true, extra_base_variable_red: true, node_options_red: true, store_answers_other_config_red: true });
 });
 
 test('config: a base variable whose value changed without the hand half (PATH) is red; a duplicate name is red', () => {
@@ -142,23 +219,32 @@ test('config: hand-half user, workdir, entrypoint and cmd need their Dockerfile 
   assert.equal(bk(DF, { ...HAND, labels: {} }), 'FAIL');
 });
 
-test('config CLI: the real rekey-config.json is the VERIFY half; the run prints STOP, carries the read Id, and exits nonzero until pinned', () => {
+test('config CLI: the real rekey-config.json is the VERIFY half; the run prints STOP twice, carries the chain\'s digests, and exits nonzero until pinned', () => {
   const d = mkdtempSync(join(tmpdir(), 'cfg-'));
   try {
     const hand = JSON.parse(readFileSync(join(DIR, 'rekey-config.json'), 'utf8'));
     assert.equal(hand.base_config_digest, 'VERIFY');
-    const w = (n, o) => { const f = join(d, n); writeFileSync(f, typeof o === 'string' ? o : JSON.stringify(o)); return f; };
-    const args = (h) => [join(DIR, 'mediator-image-config.mjs'), w('rk.json', rekeyRec()), w('b.json', baseRec()), w('h.json', h), w('Dockerfile', DF), join(d, 'out.json')];
+    assert.equal(hand.base_manifest_digest, 'VERIFY');
+    const w = (n, o) => { const f = join(d, n); writeFileSync(f, typeof o === 'string' || Buffer.isBuffer(o) ? o : JSON.stringify(o)); return f; };
+    const ch = join(d, 'chain'); mkdirSync(ch);
+    for (const [n, b] of [['index.raw', C0.chain.index], ['manifest.raw', C0.chain.manifest], ['config.raw', C0.chain.config]]) writeFileSync(join(ch, n), b);
+    const args = (h, chainDir = ch) => [join(DIR, 'mediator-image-config.mjs'), w('rk.json', rekeyRec()), w('b.json', baseRec()), w('h.json', h), w('Dockerfile', DF), chainDir, join(d, 'out.json')];
     let r = spawnSync('node', args(hand), { encoding: 'utf8' });
     assert.equal(r.status, 1, r.stderr);
     let out = JSON.parse(readFileSync(join(d, 'out.json'), 'utf8'));
     assert.equal(out.checks.instrument_bites, 'PASS');
     assert.equal(out.checks.base_config_digest_pinned, 'STOP');
-    assert.equal(out.base_config_digest_read, ID);
-    r = spawnSync('node', args({ ...hand, base_config_digest: ID }), { encoding: 'utf8' });
+    assert.equal(out.checks.base_manifest_digest_pinned, 'STOP');
+    assert.equal(out.base_config_digest_read, C0.configDigest);
+    assert.equal(out.base_manifest_digest_read, C0.manifestDigest);
+    r = spawnSync('node', args({ ...hand, base_manifest_digest: C0.manifestDigest, base_config_digest: C0.configDigest }), { encoding: 'utf8' });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     out = JSON.parse(readFileSync(join(d, 'out.json'), 'utf8'));
     assert.equal(out.ok, true);
-    assert.deepEqual(Object.keys(out), ['what', 'ok', 'checks', 'instrument', 'base_config_digest_read', 'base_platform', 'base_half', 'hand_keys', 'details']);
+    assert.deepEqual(Object.keys(out), ['what', 'ok', 'checks', 'instrument', 'base_manifest_digest_read', 'base_config_digest_read', 'base_inspect_id', 'base_platform', 'base_half', 'hand_keys', 'details']);
+    // a chain dir the fetch never filled: red, never a pass
+    r = spawnSync('node', args({ ...hand, base_manifest_digest: C0.manifestDigest, base_config_digest: C0.configDigest }, join(d, 'nope')), { encoding: 'utf8' });
+    assert.equal(r.status, 1);
+    assert.equal(JSON.parse(readFileSync(join(d, 'out.json'), 'utf8')).checks.base_index_is_the_from_pin, 'FAIL');
   } finally { rmSync(d, { recursive: true, force: true }); }
 });

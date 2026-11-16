@@ -2,8 +2,13 @@
   "what": "The rekey image added set (Security 11869.4): every regular file the rekey image may hold that the pinned base does not. Widened or re-pinned only by a Security block (REPIN.md item 12), never in place.",
   "tool": {
     "path": "/opt/rekey/mediator-store.mjs",
-    "sha256": "6c1af1dc4fd768e76ac9002eeefb6faf005f7cb4a115c157b91e8794f2054c7f",
-    "pin": "L8 (Security)"
+    "sha256": "23b135f1817320a924f7694d85999adae94569939efef8ade59b20063909b459",
+    "pin": "L8 (Security 12197.1, REPIN item 13: rebuilt from source at 261b4c9 with mediator-store-ship.mjs; 6c1af1dc…4c7f retired)"
+  },
+  "entrypoint": {
+    "path": "/opt/rekey/rekey-entrypoint.sh",
+    "sha256": "15620eb86cc79439ca7775c8059048c8b1fc105d3cb42378c92f52d2222b218e",
+    "pin": "L8 (Security 12197.1, REPIN item 13: the repo file byte for byte)"
   },
   "noble_from": "@noble/hashes 2.4.0, package-lock.json integrity sha512-X5XaVWZI…aW+eA==, read after npm ci on 2026-11-16 (WPI-BUILD); for Security to pin",
   "noble": [
