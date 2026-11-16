@@ -8,8 +8,9 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { gzipSync, deflateSync } from 'node:zlib';
 import { strip, shippedVerdict, subcommands } from '../sandbox/tsp-tests/mediator-store-ship.mjs';
-import { serviceVerdict, rekeyVerdict, SERVICE_ENTRYPOINT } from '../sandbox/tsp-tests/mediator-image-check.mjs';
+import { serviceVerdict, rekeyVerdict, archives, walk, SERVICE_ENTRYPOINT } from '../sandbox/tsp-tests/mediator-image-check.mjs';
 
 const DIR = new URL('../sandbox/tsp-tests/', import.meta.url).pathname;
 const SRC = readFileSync(join(DIR, 'mediator-store.mjs'), 'utf8');
@@ -29,6 +30,7 @@ function cleanService() {
 function planted() {
   const p = tmp();
   put(p, 'usr/lib/node/renamed-tool.js', SRC); put(p, 'opt/mediator-store.mjs', SRC);
+  put(p, 'usr/lib/node/renamed-tool.bin', gzipSync(Buffer.from(SRC)));
   put(p, 'usr/local/bin/mediator-setup'); put(p, 'usr/bin/dbus-daemon'); put(p, 'run/dbus/system_bus_socket'); put(p, 'run/user/10001/bus');
   return p;
 }
@@ -157,4 +159,52 @@ test('ship: getEntry (the one-value open) is dropped with admin-out, and a getEn
   const leaked = strip(SRC).replace('function writeAtomic(', 'export function getEntry(j) { return j; }\n\nfunction writeAtomic(');
   assert.deepEqual(shippedVerdict(leaked).forbidden_words, ['getEntry']);
   assert.equal(shippedVerdict(leaked).ok, false);
+});
+
+test('rekey image check 13081.2: an archive outside the shipped path is red by its bytes (a renamed one too); the list must hit the planted gzip', () => {
+  const REK = { User: '1000:1000', Entrypoint: ['node', '/opt/rekey/mediator-store.mjs'] };
+  const mk = () => { const r = tmp(); put(r, 'opt/rekey/mediator-store.mjs', strip(SRC)); put(r, 'usr/local/bin/node', 'ELF'); return r; };
+  const p = planted();
+  const SHIP = '/opt/rekey/mediator-store.mjs';
+  try {
+    const clean = mk();
+    try {
+      const v = rekeyVerdict(clean, REK, SHIP, p);
+      assert.equal(v.checks.archive_search_bites, 'PASS');
+      assert.equal(v.checks.no_archive_outside_the_shipped_path, 'PASS');
+      assert.deepEqual(v.archive_hits, []);
+    } finally { rmSync(clean, { recursive: true, force: true }); }
+    // the planted case Security named: a gzip of the full source passes the word search (compressed) but not this
+    const zipLocal = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.alloc(26)]);
+    for (const [rel, body, kind] of [
+      ['usr/lib/node/full.tgz', gzipSync(Buffer.from(SRC)), 'gzip'],
+      ['usr/lib/node/innocent.js', gzipSync(Buffer.from(SRC)), 'gzip'],
+      ['usr/share/x.zip', zipLocal, 'zip'],
+      ['usr/share/x.dat', deflateSync(Buffer.from(SRC)), 'zlib'],
+      ['usr/share/tool.js.br', 'brotli has no magic', 'by-name'],
+    ]) {
+      const r = mk();
+      try {
+        put(r, rel, body);
+        const v = rekeyVerdict(r, REK, SHIP, p);
+        assert.equal(v.checks.no_file_outside_the_shipped_path_carries_the_removed_words, 'PASS', `${rel}: the word search alone misses it`);
+        assert.equal(v.checks.no_archive_outside_the_shipped_path, 'FAIL', rel);
+        assert.ok(v.archive_hits.some((a) => a.path === `/${rel}` && a.kinds.includes(kind)), JSON.stringify(v.archive_hits));
+        assert.equal(Object.values(v.checks).every((x) => x === 'PASS'), false);
+      } finally { rmSync(r, { recursive: true, force: true }); }
+    }
+    // an instrument that can't hit can't pass: a planted dir with the renamed copy but no gzip
+    const noGz = tmp();
+    try {
+      put(noGz, 'usr/lib/node/renamed-tool.js', SRC);
+      const clean = mk();
+      try { assert.equal(rekeyVerdict(clean, REK, SHIP, noGz).checks.archive_search_bites, 'FAIL'); } finally { rmSync(clean, { recursive: true, force: true }); }
+    } finally { rmSync(noGz, { recursive: true, force: true }); }
+    // plain text, a JS file starting with x, and an empty file are not archives
+    const t = tmp();
+    try {
+      put(t, 'a.js', 'x = 1;\n'); put(t, 'b.txt', 'PK is just two letters here'); put(t, 'empty', '');
+      assert.deepEqual(archives(t, walk(t)), []);
+    } finally { rmSync(t, { recursive: true, force: true }); }
+  } finally { rmSync(p, { recursive: true, force: true }); }
 });

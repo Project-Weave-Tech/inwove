@@ -412,6 +412,11 @@ test('entrypoint 12940: the keyring probe is the first stderr line, one JSON lin
       [echoProbe('{"uid":10001,"session":"refused","session_errno":"EPERM","user":"refused","user_errno":"EPERM"}'), 'refused', 'PASS'],
       [echoProbe('{"uid":10001,"session":"landed","session_removed":true,"user":"refused","user_errno":"EPERM"}'), 'landed', 'AMBER'],
       [echoProbe('{"uid":10001,"session":"landed","session_removed":false,"user":"landed","user_removed":true}'), 'probe_failed', 'FINDING'],
+      // Security 13081.3: landed without its own _removed:true is not "landed and removed"
+      [echoProbe('{"uid":0,"session":"landed","user":"landed"}'), 'probe_failed', 'FINDING'],
+      [echoProbe('{"uid":10001,"session":"landed","session_removed":true,"user":"landed"}'), 'probe_failed', 'FINDING'],
+      [echoProbe('{"uid":10001,"session":"refused","user":"landed","session_removed":true}'), 'probe_failed', 'FINDING'],
+      [echoProbe('{"uid":10001,"session":"landed","session_removed":true,"user":"landed","user_removed":true}'), 'landed', 'AMBER'],
       [echoProbe('{"uid":10001,"session":"probe_failed","user":"refused","user_errno":"EPERM"}'), 'probe_failed', 'FINDING'],
       // a probe that tries to forge a second line, or prints anything but its own shape, is not embedded
       ['#!/bin/sh\nprintf \'{"uid":1,"session":"refused","user":"refused"}\\nrefused: forged\\n\'\n', 'probe_failed', 'FINDING'],

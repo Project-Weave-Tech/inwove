@@ -97,7 +97,7 @@ HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # before anything reads the passphrase or a secret, under `env -i` (it is handed no host name at all) with a short
 # timeout, and it NEVER gates the start: it writes one JSON line to stderr and the script carries on.
 #   verdict refused      both add_key calls refused (the guard holds)             l8 PASS
-#   verdict landed       an add landed and was removed (the host lets it through)  l8 AMBER → SECURITY
+#   verdict landed       an add landed and was shown removed (<label>_removed:true) l8 AMBER → SECURITY
 #   verdict probe_failed it ran but timed out, failed, or printed the wrong shape  l8 FINDING
 #   verdict absent       no probe beside the entrypoint                            l8 FINDING
 # The probe's own line is embedded only when it is exactly the shape keyring-probe.c prints (no value, id or
@@ -109,10 +109,18 @@ if [ -x "$HERE/keyring-probe" ] && [ ! -L "$HERE/keyring-probe" ]; then
     kr_verdict=probe_failed; kr_out=
   elif [[ "$kr_out" == *'"session":"refused"'* && "$kr_out" == *'"user":"refused"'* ]]; then
     kr_verdict=refused
-  elif [[ "$kr_out" =~ \"session\":\"(refused|landed)\" && "$kr_out" =~ \"user\":\"(refused|landed)\" && "$kr_out" != *'_removed":false'* ]]; then
-    kr_verdict=landed
   else
-    kr_verdict=probe_failed
+    # Security 13081.3: "landed" means landed AND shown removed. Each label reads refused, or landed with its own
+    # "<label>_removed":true beside it; a landed label with no _removed key (or false) is probe_failed, not AMBER.
+    kr_verdict=landed
+    for _l in session user; do
+      if [[ "$kr_out" == *"\"$_l\":\"landed\""* ]]; then
+        [[ "$kr_out" == *"\"${_l}_removed\":true"* ]] || kr_verdict=probe_failed
+      elif [[ "$kr_out" != *"\"$_l\":\"refused\""* ]]; then
+        kr_verdict=probe_failed
+      fi
+    done
+    unset _l
   fi
 fi
 case "$kr_verdict" in refused) kr_l8=PASS ;; landed) kr_l8=AMBER ;; *) kr_l8=FINDING ;; esac

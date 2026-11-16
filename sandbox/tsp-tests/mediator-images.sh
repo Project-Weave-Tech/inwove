@@ -55,6 +55,8 @@ docker image inspect "$SVC" > "$W/svc-inspect.json" && docker image inspect "$RE
 PL="$W/planted"; mkdir -p "$PL/usr/lib/node" "$PL/usr/local/bin" "$PL/usr/bin" "$PL/run/dbus" "$PL/run/user/10001" "$PL/opt"
 cp "$HERE/mediator-store.mjs" "$PL/usr/lib/node/renamed-tool.js"
 cp "$HERE/mediator-store.mjs" "$PL/opt/mediator-store.mjs"
+# Security 13081.2: a gzip of the full tool, named so only its first bytes say it is an archive
+gzip -9nc "$HERE/mediator-store.mjs" > "$PL/usr/lib/node/renamed-tool.bin"
 : > "$PL/usr/local/bin/mediator-setup"; : > "$PL/usr/bin/dbus-daemon"; : > "$PL/run/dbus/system_bus_socket"; : > "$PL/run/user/10001/bus"
 
 svc=0; node "$HERE/mediator-image-check.mjs" service "$W/svc-root" "$W/svc-inspect.json" "$PL" "$ODIR/service-image.json" || svc=$?
@@ -73,7 +75,8 @@ probe_v="$(printf '%s' "$probe" | node -e '
     const both = [j.session, j.user];
     if (j.uid === 0) console.log("FAIL");
     else if (both.every((x) => x === "refused")) console.log("PASS");
-    else if (both.every((x) => x === "refused" || x === "landed") && [j.session_removed, j.user_removed].every((x) => x !== false)) console.log("AMBER");
+    // Security 13081.3: every label that reads landed must carry its own <label>_removed: true
+    else if (both.every((x) => x === "refused" || x === "landed") && ["session", "user"].every((l) => j[l] !== "landed" || j[l + "_removed"] === true)) console.log("AMBER");
     else console.log("FAIL");
   });')"
 
@@ -142,5 +145,7 @@ const rec = {
 fs.writeFileSync(out, JSON.stringify(rec, null, 2) + '\n');
 console.log(JSON.stringify(lines));
 console.log(JSON.stringify(rec.rekey_calls));
+// Security 13081.1: the shipped tool's sha256 in the log too, so it can be read against the L8 pin without the artifact
+console.log(JSON.stringify({ shipped_tool_sha256: rec.shipped_tool_sha256, ship_strip_sha256: rec.ship_strip_sha256, rekey_archive_hits: rek && rek.archive_hits }));
 process.exit(Object.values(lines).some((v) => v === 'FAIL') ? 1 : 0);
 EOF

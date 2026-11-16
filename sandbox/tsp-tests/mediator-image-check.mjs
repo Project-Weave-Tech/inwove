@@ -16,8 +16,10 @@
 //     the shipped tool's subcommands are within rekey/opens/names/absent (rekey present), none of the removed words
 //     is in it, its sha256 for L8; (d) no mediator-setup; no mediator binary; no other copy of the store tool by
 //     name, AND (Security 12940 change 2) no regular file outside the shipped path whose bytes carry delete-admin,
-//     admin-out, seal-test or encrypt-test (`rekey` is left out: node itself may carry it); no exposed port; a
-//     non-root User. The content search first runs on <planted dir> and must hit its renamed copy.
+//     admin-out, seal-test or encrypt-test (`rekey` is left out: node itself may carry it); (Security 13081.2) no
+//     archive-shaped file outside the shipped path (by magic bytes; brotli by name), since a byte search can't see
+//     inside one; no exposed port; a non-root User. The content search first runs on <planted dir> and must hit its
+//     renamed copy, and the archive list must hit the planted gzip of the full tool.
 // Exit 0 only when every line is PASS.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -28,6 +30,35 @@ export const STORE_WORDS = ['rekey', 'delete-admin', 'admin-out', 'seal-test', '
 // tool's own subcommand and may be in node's own files.
 export const REKEY_IMAGE_WORDS = ['delete-admin', 'admin-out', 'seal-test', 'encrypt-test'];
 const DBUS_BINS = ['dbus-daemon', 'dbus-broker', 'dbus-launch'];
+// Security 13081.2: a byte search can't see inside a compressed file, so the rekey image also lists every
+// archive-shaped file outside the shipped path, by its first bytes (a renamed archive is still found) and, for brotli,
+// which has no magic, by name. Red outside ARCHIVES_ALLOWED (expected: none in the node base). Plain tar is not listed:
+// its members' bytes are stored as they are, so the content search already reads them.
+export const ARCHIVE_MAGIC = [
+  ['gzip', [0x1f, 0x8b]], ['zip', [0x50, 0x4b, 0x03, 0x04]], ['zip', [0x50, 0x4b, 0x05, 0x06]], ['zip', [0x50, 0x4b, 0x07, 0x08]],
+  ['bzip2', [0x42, 0x5a, 0x68]], ['xz', [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]], ['zstd', [0x28, 0xb5, 0x2f, 0xfd]],
+  ['7z', [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]], ['lz4', [0x04, 0x22, 0x4d, 0x18]], ['lzip', [0x4c, 0x5a, 0x49, 0x50]],
+  ['zlib', [0x78, 0x01]], ['zlib', [0x78, 0x5e]], ['zlib', [0x78, 0x9c]], ['zlib', [0x78, 0xda]],
+];
+export const ARCHIVE_NAME = /\.(gz|tgz|zip|br|bz2|tbz2?|xz|txz|zst|tzst|7z|lz4|lzma|lz|z|jar|whl)$/i;
+export const ARCHIVES_ALLOWED = [];
+// Every archive-shaped regular file under root: {path, kinds}. Reads only each file's first bytes.
+export function archives(root, entries) {
+  const out = [];
+  const head = Buffer.alloc(8);
+  for (const e of entries) {
+    if (e.kind !== 'file') continue;
+    const kinds = [];
+    let n = 0;
+    try { const fd = fs.openSync(path.join(root, e.rel), 'r'); try { n = fs.readSync(fd, head, 0, 8, 0); } finally { fs.closeSync(fd); } }
+    catch { out.push({ path: `/${e.rel}`, kinds: ['unreadable'] }); continue; }
+    for (const [k, m] of ARCHIVE_MAGIC) if (n >= m.length && m.every((b, i) => head[i] === b) && !kinds.includes(k)) kinds.push(k);
+    if (ARCHIVE_NAME.test(e.rel)) kinds.push('by-name');
+    if (kinds.length) out.push({ path: `/${e.rel}`, kinds });
+  }
+  return out;
+}
+
 export const SERVICE_ENTRYPOINT = ['/bin/bash', '-p', '/opt/mediator/mediator-entrypoint.sh'];
 
 // Every entry under root (lstat; symlinks are listed, never followed). Returns {rel, kind, size}.
@@ -121,6 +152,9 @@ export function rekeyVerdict(root, config, shipped, planted) {
   const p = planted ? searches(planted, walk(planted), REKEY_IMAGE_WORDS) : null;
   const plantedRenamedHit = !!p && p.store_words.some((h) => !h.path.endsWith('mediator-store.mjs') && h.words.length === REKEY_IMAGE_WORDS.length);
   const contentHits = s.store_words.filter((h) => h.path !== `/${rel}`);
+  // 13081.2: the archive list must first find the planted gzip of the full tool (named so only its bytes give it away)
+  const plantedArchive = !!planted && archives(planted, walk(planted)).some((a) => a.kinds.includes('gzip') && !a.kinds.includes('by-name'));
+  const archiveHits = archives(root, entries).filter((a) => a.path !== `/${rel}` && !ARCHIVES_ALLOWED.includes(a.path));
   let text = null;
   try { text = fs.readFileSync(path.join(root, rel), 'utf8'); } catch { /* checked below */ }
   const v = text === null ? null : shippedVerdict(text);
@@ -136,12 +170,15 @@ export function rekeyVerdict(root, config, shipped, planted) {
     no_other_store_tool_copy: P(otherCopies.length === 0),
     content_search_bites: P(plantedRenamedHit),
     no_file_outside_the_shipped_path_carries_the_removed_words: P(contentHits.length === 0),
+    archive_search_bites: P(plantedArchive),
+    no_archive_outside_the_shipped_path: P(archiveHits.length === 0),
     no_exposed_port: P(ports.length === 0),
     user_not_root: P(nonRoot(config.User)),
   };
   return { checks, shipped: shipped, shipped_sha256: text === null ? null : sha256(Buffer.from(text)), subcommands: v?.subcommands ?? null,
     forbidden_words: v?.forbidden_words ?? null, mediator_bins: mediatorBins, other_copies: otherCopies,
-    removed_word_hits: contentHits, planted_renamed_copy_found: plantedRenamedHit, exposed_ports: ports, user: config.User || '' };
+    removed_word_hits: contentHits, planted_renamed_copy_found: plantedRenamedHit,
+    archive_hits: archiveHits, archives_allowed: ARCHIVES_ALLOWED, planted_archive_found: plantedArchive, exposed_ports: ports, user: config.User || '' };
 }
 
 if (process.argv[1]?.endsWith('mediator-image-check.mjs')) {
