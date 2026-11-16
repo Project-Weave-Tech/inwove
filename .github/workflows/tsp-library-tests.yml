@@ -233,6 +233,17 @@ jobs:
         id: aclclosed
         continue-on-error: true
         run: node "$WPI_DIR/mediator-acl.mjs" "$RUNNER_TEMP/med/target/release/mediator" "$RUNNER_TEMP/med/docker/test/conf" "$WPI_DIR/redis-docker.sh" "$OUT/acl-closed.json" --closed-default
+      - name: the DIDComm admin client against a fake mediator (shapes from the source read; no network)
+        id: dcself
+        continue-on-error: true
+        run: node "$WPI_DIR/didcomm-admin-selftest.mjs" "$OUT/didcomm-admin-selftest.json"
+      - name: the same with --closed-default and the admin over DIDComm (block_remote_admin_msgs on; Railroad 11606 (a))
+        # The admin signs in over /authenticate (authcrypt) and every admin Trust Task rides the DIDComm binding
+        # envelope, so its sender kid carries #fragment and check_admin_signature can pass with the guard on. Everyone
+        # else stays on TSP. The TSP run above stays as the comparison: same conf, only the admin's carrier differs.
+        id: aclclosedd
+        continue-on-error: true
+        run: node "$WPI_DIR/mediator-acl.mjs" "$RUNNER_TEMP/med/target/release/mediator" "$RUNNER_TEMP/med/docker/test/conf" "$WPI_DIR/redis-docker.sh" "$OUT/acl-closed-didcomm.json" --closed-default --admin-didcomm
       - name: the mediator through its entrypoint (16.2(c) /proc environ = the allow list; 15(iv) marker passphrase; a refuse case)
         # Security 11984 §2(iii)-(iv) + 12144: started the way the host will start it (mediator-entrypoint.sh, env -i,
         # the record's deny file checked against the sha256 baked beside the script), from a platform-shaped host with a
@@ -275,8 +286,8 @@ jobs:
           path: results/mediator-early
           retention-days: 30
       - name: fail if any step failed
-        if: always() && (steps.feats.outcome == 'failure' || steps.envreads.outcome == 'failure' || steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.aclclosed.outcome == 'failure' || steps.entrypoint.outcome == 'failure' || steps.setupbuild.outcome == 'failure' || steps.setupfeats.outcome == 'failure' || steps.setuprun.outcome == 'failure')
-        run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed ${{ steps.aclclosed.outcome }}, entrypoint ${{ steps.entrypoint.outcome }}, setup build ${{ steps.setupbuild.outcome }}, setup features ${{ steps.setupfeats.outcome }}, setup run ${{ steps.setuprun.outcome }}" && exit 1
+        if: always() && (steps.feats.outcome == 'failure' || steps.envreads.outcome == 'failure' || steps.lean.outcome == 'failure' || steps.lined.outcome == 'failure' || steps.aclopen.outcome == 'failure' || steps.aclclosed.outcome == 'failure' || steps.dcself.outcome == 'failure' || steps.aclclosedd.outcome == 'failure' || steps.entrypoint.outcome == 'failure' || steps.setupbuild.outcome == 'failure' || steps.setupfeats.outcome == 'failure' || steps.setuprun.outcome == 'failure')
+        run: echo "features ${{ steps.feats.outcome }}, env reads ${{ steps.envreads.outcome }}, lean build ${{ steps.lean.outcome }}, line D ${{ steps.lined.outcome }}, acl open ${{ steps.aclopen.outcome }}, acl closed ${{ steps.aclclosed.outcome }}, didcomm selftest ${{ steps.dcself.outcome }}, acl closed over didcomm ${{ steps.aclclosedd.outcome }}, entrypoint ${{ steps.entrypoint.outcome }}, setup build ${{ steps.setupbuild.outcome }}, setup features ${{ steps.setupfeats.outcome }}, setup run ${{ steps.setuprun.outcome }}" && exit 1
 
   report:
     name: report (one markdown report; fails while a line is missing)

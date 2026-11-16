@@ -18,7 +18,7 @@
 //   and the admin account is set to explicit-allow with exactly the mediator's own DID (hashed) on its list, then read
 //   back with access-list/list, before any account/add. Without the flag the run is the 2026-11-15 shape (explicit-deny
 //   default, the upstream test conf's), so the two can be compared.
-// Usage: node mediator-acl.mjs <mediator binary> <conf dir> <redis-server> <out.json> [--closed-default]
+// Usage: node mediator-acl.mjs <mediator binary> <conf dir> <redis-server> <out.json> [--closed-default] [--admin-didcomm]
 // Test keys only; A, B, D, U are made here and die with the process. Prints statuses and problem codes, no keys.
 import { spawn } from 'node:child_process'
 import { mkdtempSync, cpSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
@@ -27,9 +27,14 @@ import { join, resolve } from 'node:path'
 import * as tsp from '@openvtc/vti-tsp-js'
 import { ed25519 } from '@noble/curves/ed25519.js'
 import { b58, utf8, eq, attachProof } from './lib.mjs'
+import * as didcommAdmin from './didcomm-admin.mjs'
 
 const [binArg, confArg, redisBin, outFile] = process.argv.slice(2).filter((a) => !a.startsWith('--'))
 const CLOSED = process.argv.includes('--closed-default')
+// --admin-didcomm (Railroad 11606 (a), binding 1): the admin signs in over DIDComm (/authenticate, authcrypt) and every
+// admin Trust Task rides the DIDComm binding envelope, so its sender kid is <admin DID>#<key> and check_admin_signature
+// can pass with the guard on. Everyone else (A, B, D, the strangers) stays on TSP, as the door will run.
+const ADMIN_DIDCOMM = process.argv.includes('--admin-didcomm')
 const BIN = resolve(binArg), CONF = resolve(confArg)
 const work = mkdtempSync(join(process.env.RUNNER_TEMP || tmpdir(), 'medacl-'))
 const RPORT = 20000 + Math.floor(Math.random() * 20000), MPORT = 40000 + Math.floor(Math.random() * 20000)
@@ -59,8 +64,13 @@ set('external_forwarding', 'false')
 toml = toml.replace(/^backend = "file:\/\/.*$/m, `backend = "file://${join(work, 'conf', 'secrets.json')}"`)
 if (/^trust_task_verification = .*$/m.test(toml)) set('trust_task_verification', 'enforce')
 else toml = toml.replace(/^\[security\]$/m, '[security]\ntrust_task_verification = "enforce"')
+// The guard: written on, never left to the default, so a run can't pass because an upstream conf turned it off.
+// Quoted like every other value the upstream conf carries (its values are strings with ${VAR:default} expansion).
+if (/^block_remote_admin_msgs = .*$/m.test(toml)) set('block_remote_admin_msgs', 'true')
+else toml = toml.replace(/^\[security\]$/m, '[security]\nblock_remote_admin_msgs = "true"')
+if (!/^block_remote_admin_msgs = "true"$/m.test(toml)) throw new Error('could not set block_remote_admin_msgs = true')
 writeFileSync(tomlPath, toml)
-results.setup = { mediator_acl_mode: 'explicit_allow', global_acl_default: DEFAULT_ACL, external_forwarding: false, enable_inter_mediator_relay: false, trust_task_verification: 'enforce' }
+results.setup = { mediator_acl_mode: 'explicit_allow', global_acl_default: DEFAULT_ACL, external_forwarding: false, enable_inter_mediator_relay: false, trust_task_verification: 'enforce', block_remote_admin_msgs: true, admin_transport: ADMIN_DIDCOMM ? 'didcomm' : 'tsp' }
 
 procs.push(spawn(redisBin, ['--port', String(RPORT), '--bind', '127.0.0.1', '--requirepass', PW, '--save', '', '--appendonly', 'no'], { stdio: 'ignore' }))
 // Wait until Redis takes connections (a container start can take longer than a local binary), up to ~15 s.
@@ -145,20 +155,26 @@ async function accountReal(v) {
   return { real: f.status === 200 && (f.json?.data?.success ?? []).length === 0, fetch_status: f.status }
 }
 
+// The admin's own calls: over DIDComm with --admin-didcomm, else the TSP task() above.
+const MED = { id: medVid, epk: M.epk }
+const adminSignIn = () => ADMIN_DIDCOMM ? didcommAdmin.signIn(post, ADMIN, MED) : signIn(ADMIN)
+const adminTask = (typeUri, payload) => ADMIN_DIDCOMM ? didcommAdmin.task(post, ADMIN, sAdm.token, MED, typeUri, payload) : task(ADMIN, sAdm.token, typeUri, payload)
+
 // ---- C1: closed mode refuses an unknown DID ----
 const su = await signIn(U)
 results.checks.C1_unknown_did_cannot_sign_in = { pass: !su.ok, ...su, token: undefined }
 log('C1 unknown DID signs in', su.ok ? 'ALLOWED (fail)' : { refused_at: su.step, status: su.status, problem: su.problem })
 
 // ---- the admin registers A (open inbox with a deny list), B and D ----
-const sAdm = await signIn(ADMIN); log('admin sign-in', sAdm.ok ? 'ok' : sAdm)
+const sAdm = await adminSignIn(); log('admin sign-in', sAdm.ok ? (sAdm.via ?? 'tsp') : { ...sAdm, token: undefined })
+results.setup.admin_sign_in = { ok: sAdm.ok, via: ADMIN_DIDCOMM ? 'didcomm' : 'tsp', ...(sAdm.ok ? {} : { step: sAdm.step, status: sAdm.status, problem: sAdm.problem }) }
 if (!sAdm.ok) { results.error = 'admin could not sign in'; writeFileSync(outFile, JSON.stringify(results, null, 2) + '\n'); process.exit(1) }
 // ---- --closed-default: the admin account gets exactly the mediator's own DID on its explicit-allow list ----
 if (CLOSED) {
   const medHash = await sha256hex(medVid), admHash = await sha256hex(ADMIN.id)
   // The answer to this update is the mediator's, into an inbox whose list is still empty, so none is expected.
-  const u = await task(ADMIN, sAdm.token, LIST_UPDATE, { did: admHash, clear: true, add: [medHash] })
-  const l = await task(ADMIN, sAdm.token, LIST_LIST, { did: admHash, entries: [medHash] })
+  const u = await adminTask(LIST_UPDATE, { did: admHash, clear: true, add: [medHash] })
+  const l = await adminTask(LIST_LIST, { did: admHash, entries: [medHash] })
   const listed = (l.answer?.entries ?? []).map(String)
   results.setup.admin_list = { update_status: u.status, update_answer: u.answerType, list_answer: l.answerType, accessListCount: l.answer?.accessListCount ?? null, mediator_listed: listed.includes(medHash), only_entry: l.answer?.accessListCount === 1 && listed.includes(medHash) }
   results.checks.S2_admin_allow_list_is_mediator_only = { pass: results.setup.admin_list.only_entry, ...results.setup.admin_list }
@@ -167,7 +183,7 @@ if (CLOSED) {
 const aclA = { accessListMode: 'explicitDeny', selfManageList: true, local: true, sendMessages: true, receiveMessages: true }
 results.setup.account_A_acl = aclA
 for (const [name, v, acl] of [['A', A, aclA], ['B', B], ['D', D]]) {
-  const r = await task(ADMIN, sAdm.token, ACCOUNT_ADD, { did: await sha256hex(v.id), ...(acl ? { acl } : {}) })
+  const r = await adminTask(ACCOUNT_ADD, { did: await sha256hex(v.id), ...(acl ? { acl } : {}) })
   results.setup["account_add_" + name] = { status: r.status, answerType: r.answerType, problem: r.problem ?? null, confirmed: !!r.answerType }
   log(`admin account/add ${name}`, { status: r.status, answer: r.answerType ?? r.problem })
 }
@@ -200,7 +216,7 @@ if (CLOSED) results.checks.S2_adds_confirmed_under_closed_default = { pass: ['A'
 
 // ---- R1: a plain-DID add is answered, but the setup check turns it red ----
 const P = keyVid()
-const r1 = await task(ADMIN, sAdm.token, ACCOUNT_ADD, { did: P.id })
+const r1 = await adminTask(ACCOUNT_ADD, { did: P.id })
 const r1real = await accountReal(P)
 results.checks.R1_plain_did_add_turns_check_red = { pass: !r1real.real, add_answer: r1.answerType, add_status: r1.status, check: r1real, note: 'pass = the setup check refused it (red), whatever the add answered' }
 log('R1 plain-DID add', { answer: r1.answerType, check_real: r1real.real, refused_at: r1real.refused_at ?? null })
@@ -212,14 +228,14 @@ results.checks.R1_hashed_add_passes_check = { pass: realA.real, check: realA }
 // Pass = refused somewhere in the sign-in (the record says where), never a token.
 const NK = keyVid()
 NK.id = 'did:peer:2.Vz' + b58(new Uint8Array([0xed, 0x01, ...NK.spk]))
-const nkAdd = await task(ADMIN, sAdm.token, ACCOUNT_ADD, { did: await sha256hex(NK.id) })
+const nkAdd = await adminTask(ACCOUNT_ADD, { did: await sha256hex(NK.id) })
 const nk = await signIn(NK)
 results.checks.A_no_x25519_keyagreement_refused = { pass: !nk.ok, add_answer: nkAdd.answerType ?? nkAdd.problem ?? null, refused_at: nk.step ?? null, status: nk.status ?? null, problem: nk.problem ?? null, kind: nk.kind ?? null }
 log('A no-X25519 DID signs in', nk.ok ? 'ALLOWED (fail)' : { refused_at: nk.step, status: nk.status, problem: nk.problem, kind: nk.kind })
 // Control: the same shape with the X25519 key added (V + E) does sign in, so the refusal above is the missing key.
 const NE = keyVid()
 NE.id = 'did:peer:2.Vz' + b58(new Uint8Array([0xed, 0x01, ...NE.spk])) + '.Ez' + b58(new Uint8Array([0xec, 0x01, ...NE.epk]))
-await task(ADMIN, sAdm.token, ACCOUNT_ADD, { did: await sha256hex(NE.id) })
+await adminTask(ACCOUNT_ADD, { did: await sha256hex(NE.id) })
 const ne = await signIn(NE)
 results.checks.A_control_with_x25519_signs_in = { pass: ne.ok, refused_at: ne.step ?? null, status: ne.status ?? null, problem: ne.problem ?? null, kind: ne.kind ?? null }
 log('A control (V+E) signs in', ne.ok ? 'ok' : { refused_at: ne.step, status: ne.status, problem: ne.problem, kind: ne.kind })
@@ -264,7 +280,7 @@ log('C4 D → A (denied)', { status: c4.status, problem: c4.problem, reached_A: 
 // consume_account_add has none either. Here the admin re-adds A's hash with no acl; if A's selfManageList is gone,
 // A's own access-list/update is refused afterwards. (In explicit_deny mode a non-admin could do the same to anyone.)
 {
-  const re = await task(ADMIN, sAdm.token, ACCOUNT_ADD, { did: await sha256hex(A.id) })
+  const re = await adminTask(ACCOUNT_ADD, { did: await sha256hex(A.id) })
   const sa2 = await signIn(A)
   const after = sa2.ok ? await task(A, sa2.token, LIST_UPDATE, { did: await sha256hex(A.id), add: [await sha256hex(X.id)] }) : null
   results.findings = { Z3_readd_existing_account: { readd_answer: re.answerType ?? re.problem ?? null, a_signs_in_after: sa2.ok, a_list_update_after: after ? { status: after.status, answerType: after.answerType, problem: after.problem ?? null } : null, overwritten: !!after && !after.answerType } }
