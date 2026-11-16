@@ -7,14 +7,14 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { configVerdict, instrument, makeChain, chainVerdict, BLOB_FIELDS } from '../sandbox/tsp-tests/mediator-image-config.mjs';
+import { configVerdict, instrument, makeChain, chainVerdict, BLOB_FIELDS, PLANT_LAYERS } from '../sandbox/tsp-tests/mediator-image-config.mjs';
 import { parseRef, amd64Descriptor } from '../sandbox/tsp-tests/mediator-base-fetch.mjs';
 
 const DIR = new URL('../sandbox/tsp-tests/', import.meta.url).pathname;
 const ID = 'sha256:' + 'ab'.repeat(32);
 const ENV = ['PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'NODE_VERSION=22.11.0', 'YARN_VERSION=1.22.22'];
 const EP = ['/bin/bash', '-p', '/opt/rekey/rekey-entrypoint.sh'];
-const baseRec = (over = {}, top = {}) => [{ Id: ID, Architecture: 'amd64', Os: 'linux', Config: { Env: [...ENV], Entrypoint: ['docker-entrypoint.sh'], Cmd: ['node'], User: '', WorkingDir: '', ...over }, ...top }];
+const baseRec = (over = {}, top = {}) => [{ Id: ID, Architecture: 'amd64', Os: 'linux', RootFS: { Type: 'layers', Layers: [...PLANT_LAYERS] }, Config: { Env: [...ENV], Entrypoint: ['docker-entrypoint.sh'], Cmd: ['node'], User: '', WorkingDir: '', ...over }, ...top }];
 const rekeyRec = (over = {}) => [{ Config: { Env: [...ENV], Entrypoint: EP, Cmd: null, User: '1000:1000', WorkingDir: '', ...over } }];
 const HAND = { base_manifest_digest: 'VERIFY', base_config_digest: 'VERIFY', user: '1000:1000', entrypoint: EP, cmd: null, env: {} };
 // The registry chain is made from the base record's own Config unless a test hands one in; the FROM line names its index.
@@ -71,7 +71,7 @@ test('chain: no linux/amd64 manifest, two of them, or only a variant one, is red
   assert.equal(v.config_digest_read, null);
   // attestation manifests (platform unknown/unknown) beside the one amd64 manifest are fine
   const att = makeChain(baseRec()[0].Config, { extraManifests: [{ digest: 'sha256:' + 'ef'.repeat(32), platform: { os: 'unknown', architecture: 'unknown' } }] });
-  assert.deepEqual(Object.values(chainVerdict(att.chain, att.indexDigest, baseRec()[0].Config).checks), ['PASS', 'PASS', 'PASS', 'PASS']);
+  assert.deepEqual(Object.values(chainVerdict(att.chain, att.indexDigest, baseRec()[0].Config, PLANT_LAYERS).checks), ['PASS', 'PASS', 'PASS', 'PASS', 'PASS']);
 });
 
 test('chain: a manifest or config blob whose bytes differ from what names it is red', () => {
@@ -105,6 +105,29 @@ test('chain: inspect that differs from the pinned blob in any one field is red, 
   assert.equal(chainVerdict(emptyList.chain, emptyList.indexDigest, { ...blobCfg, Cmd: [] }).checks.base_inspect_equals_the_config_blob, 'FAIL', 'null and [] differ');
 });
 
+// Security 12278.5 (change C): inspect's RootFS.Layers is tied to the pinned blob's rootfs.diff_ids, same values,
+// same order, so base.tar (the base side of the file-by-file diff) comes from the pinned bytes too.
+test('chain: inspect layers that differ from the blob\'s diff_ids in one digest, in order, in count, or are absent, are red', () => {
+  const c = makeChain(baseRec()[0].Config);
+  const lay = (layers) => chainVerdict(c.chain, c.indexDigest, baseRec()[0].Config, layers).checks.base_inspect_layers_equal_the_blob;
+  assert.equal(lay([...PLANT_LAYERS]), 'PASS');
+  assert.equal(lay([PLANT_LAYERS[0], 'sha256:' + '33'.repeat(32)]), 'FAIL', 'one diff_id changed');
+  assert.equal(lay([...PLANT_LAYERS].reverse()), 'FAIL', 'same values, other order');
+  assert.equal(lay([PLANT_LAYERS[0]]), 'FAIL', 'a layer missing');
+  assert.equal(lay([...PLANT_LAYERS, 'sha256:' + '44'.repeat(32)]), 'FAIL', 'a layer extra');
+  assert.equal(lay(undefined), 'FAIL', 'inspect without RootFS');
+  const empty = makeChain(baseRec()[0].Config, { diffIds: [] });
+  assert.equal(chainVerdict(empty.chain, empty.indexDigest, baseRec()[0].Config, []).checks.base_inspect_layers_equal_the_blob, 'FAIL', 'no layers on either side is no tie');
+  const flip = (b) => { const x = Buffer.from(b); x[x.length - 2] ^= 1; return x; };
+  assert.equal(chainVerdict({ ...c.chain, config: flip(c.chain.config) }, c.indexDigest, baseRec()[0].Config, PLANT_LAYERS).checks.base_inspect_layers_equal_the_blob, 'FAIL', 'no blob, no tie');
+  // through configVerdict: the base record's RootFS.Layers is what is compared, and only the layers line goes red
+  const v = run({ hand: PINNED, base: baseRec({}, { RootFS: { Type: 'layers', Layers: [PLANT_LAYERS[0], 'sha256:' + '33'.repeat(32)] } }) });
+  assert.deepEqual(lines(v), { base_inspect_layers_equal_the_blob: 'FAIL' });
+  assert.equal(v.details.inspect_layers, 2);
+  assert.equal(v.details.blob_diff_ids, 2);
+  assert.equal(instrument().store_answers_other_layers_red, true);
+});
+
 test('fetch: the base ref parses to a Docker Hub repository and its index digest; anything else is refused', () => {
   const d = 'sha256:' + 'e9'.repeat(32);
   assert.deepEqual(parseRef(`node:22-bookworm-slim@${d}`), { repo: 'library/node', digest: d });
@@ -128,7 +151,7 @@ test('config: NODE_OPTIONS added without the hand half is red, and the built-in 
   assert.equal(v.checks.env_exact_both_ways, 'FAIL');
   assert.deepEqual(v.details.env_extra, ['NODE_OPTIONS']);
   assert.ok(!JSON.stringify(v).includes('/x'));
-  assert.deepEqual(instrument(), { bites: true, extra_base_variable_red: true, node_options_red: true, store_answers_other_config_red: true });
+  assert.deepEqual(instrument(), { bites: true, extra_base_variable_red: true, node_options_red: true, store_answers_other_config_red: true, store_answers_other_layers_red: true });
 });
 
 test('config: a base variable whose value changed without the hand half (PATH) is red; a duplicate name is red', () => {
@@ -219,12 +242,13 @@ test('config: hand-half user, workdir, entrypoint and cmd need their Dockerfile 
   assert.equal(bk(DF, { ...HAND, labels: {} }), 'FAIL');
 });
 
-test('config CLI: the real rekey-config.json is the VERIFY half; the run prints STOP twice, carries the chain\'s digests, and exits nonzero until pinned', () => {
+test('config CLI: the real rekey-config.json carries Security 12278.2\'s pins; a VERIFY half prints STOP twice, carries the chain\'s digests, and exits nonzero until pinned', () => {
   const d = mkdtempSync(join(tmpdir(), 'cfg-'));
   try {
-    const hand = JSON.parse(readFileSync(join(DIR, 'rekey-config.json'), 'utf8'));
-    assert.equal(hand.base_config_digest, 'VERIFY');
-    assert.equal(hand.base_manifest_digest, 'VERIFY');
+    const real = JSON.parse(readFileSync(join(DIR, 'rekey-config.json'), 'utf8'));
+    assert.equal(real.base_manifest_digest, 'sha256:47725aca53d3295ec2d3be8f62726599b3033cc262edc2c7e429909b3ac599fc');
+    assert.equal(real.base_config_digest, 'sha256:b774d993885c47eca14db241ba8cc7e5789235142f76e4a2a6a65ec350a1bac0');
+    const hand = { ...real, base_manifest_digest: 'VERIFY', base_config_digest: 'VERIFY' };
     const w = (n, o) => { const f = join(d, n); writeFileSync(f, typeof o === 'string' || Buffer.isBuffer(o) ? o : JSON.stringify(o)); return f; };
     const ch = join(d, 'chain'); mkdirSync(ch);
     for (const [n, b] of [['index.raw', C0.chain.index], ['manifest.raw', C0.chain.manifest], ['config.raw', C0.chain.config]]) writeFileSync(join(ch, n), b);

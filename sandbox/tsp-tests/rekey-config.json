@@ -1,7 +1,7 @@
 {
-  "what": "the rekey Dockerfile's own config lines, hand-pinned; the base half is read from the pinned digest in the job (Security 11935); the base's linux/amd64 manifest digest and its config digest are read from the registry chain and pinned by Security from the first run it reads (12197.2, 12232.1); changed only by a Security block",
-  "base_manifest_digest": "VERIFY",
-  "base_config_digest": "VERIFY",
+  "what": "the rekey Dockerfile's own config lines, hand-pinned; the base half is read from the pinned digest in the job (Security 11935); the base's linux/amd64 manifest digest and its config digest are read from the registry chain and pinned by Security (12278.2, from the Docker Hub blobs it fetched and hashed itself; 12197.2, 12232.1); changed only by a Security block",
+  "base_manifest_digest": "sha256:47725aca53d3295ec2d3be8f62726599b3033cc262edc2c7e429909b3ac599fc",
+  "base_config_digest": "sha256:b774d993885c47eca14db241ba8cc7e5789235142f76e4a2a6a65ec350a1bac0",
   "user": "1000:1000",
   "entrypoint": ["/bin/bash", "-p", "/opt/rekey/rekey-entrypoint.sh"],
   "cmd": null,

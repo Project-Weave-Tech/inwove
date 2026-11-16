@@ -12,10 +12,14 @@
 //       line's digest, picks the one linux/amd64 manifest (no variant), checks that manifest's own sha256 (and size)
 //       against its descriptor, takes its config.digest, checks the config blob's sha256 against it, and ties the
 //       inspect read to those bytes: the blob's config Env/Entrypoint/Cmd/User/WorkingDir/ExposedPorts/Healthcheck/
-//       OnBuild/Volumes must equal inspect's (absent and null read alike; null and [] differ). Any mismatch, or a
-//       blob that was not fetched, is FAIL. `base_manifest_digest` and `base_config_digest` in rekey-config.json are
-//       pinned by Security from the first run it reads; while either is "VERIFY" its line reads STOP (neither PASS nor
-//       FAIL) and the verdict carries base_manifest_digest_read / base_config_digest_read so it can be pinned. The base
+//       OnBuild/Volumes must equal inspect's (absent and null read alike; null and [] differ). Security 12278.5 (change
+//       C): inspect's RootFS.Layers must equal the blob's rootfs.diff_ids, the same values in the same order (a non-empty
+//       list on both sides), so the local pull that base.tar is exported from is tied to the pinned bytes as well; a
+//       store answering with the right config but other layers is red. Labels are not compared (they change nothing
+//       that runs). Any mismatch, or a blob that was not fetched, is FAIL. `base_manifest_digest` and
+//       `base_config_digest` in rekey-config.json are pinned by Security (12278.2, from the Docker Hub blobs it hashed
+//       itself); while either is "VERIFY" its line reads STOP (neither PASS nor FAIL) and the verdict carries
+//       base_manifest_digest_read / base_config_digest_read so it can be pinned. The base
 //       must be linux/amd64 (pulled with --platform linux/amd64 by digest; the blob's own architecture/os too).
 //   (b) exact both ways: the rekey Env, as a set of NAME=value strings with no duplicate name, must equal the base's Env
 //       as read with each hand-half env entry applied on top (override or add). An extra variable, a missing one, or a
@@ -99,9 +103,10 @@ const STR_FIELDS = ['User', 'WorkingDir'];
 const blobNorm = (k, v) => (STR_FIELDS.includes(k) ? (v ?? '') : (v === undefined ? null : v));
 
 // The registry chain (Security 12197.2 a-c). chain: {index, manifest, config} as Buffers (any may be missing);
-// indexPin: the FROM line's digest; inspectConfig: base inspect's Config. Returns {checks, manifest_digest_read,
-// config_digest_read, blob_platform, inspect_vs_blob_differ}.
-export function chainVerdict(chain, indexPin, inspectConfig) {
+// indexPin: the FROM line's digest; inspectConfig: base inspect's Config; inspectLayers: base inspect's RootFS.Layers
+// (Security 12278.5). Returns {checks, manifest_digest_read, config_digest_read, blob_platform, inspect_vs_blob_differ,
+// layers_read, blob_diff_ids}.
+export function chainVerdict(chain, indexPin, inspectConfig, inspectLayers) {
   const c = chain ?? {};
   const indexOk = !!c.index && indexPin !== null && sha(c.index) === indexPin;
   const desc = indexOk ? amd64Descriptor(parse(c.index)) : null;
@@ -113,16 +118,20 @@ export function chainVerdict(chain, indexPin, inspectConfig) {
   const bc = blob?.config ?? {};
   const ic = inspectConfig ?? {};
   const differ = blob ? BLOB_FIELDS.filter((k) => J(blobNorm(k, bc[k])) !== J(blobNorm(k, ic[k]))) : BLOB_FIELDS;
+  const diffIds = Array.isArray(blob?.rootfs?.diff_ids) ? blob.rootfs.diff_ids : null;
+  const layersOk = !!diffIds && diffIds.length > 0 && Array.isArray(inspectLayers) && J(inspectLayers) === J(diffIds);
   return {
     checks: {
       base_index_is_the_from_pin: P(indexOk),
       base_one_linux_amd64_manifest_matches_its_descriptor: P(manifestOk),
       base_config_blob_matches_the_manifest: P(blobOk && blob?.architecture === 'amd64' && blob?.os === 'linux'),
       base_inspect_equals_the_config_blob: P(!!blob && !differ.length),
+      base_inspect_layers_equal_the_blob: P(layersOk),
     },
     manifest_digest_read: desc?.digest ?? null, config_digest_read: configDigest,
     blob_platform: blob ? { architecture: blob.architecture ?? null, os: blob.os ?? null } : null,
     inspect_vs_blob_differ: differ,
+    layers_read: Array.isArray(inspectLayers) ? inspectLayers.length : null, blob_diff_ids: diffIds ? diffIds.length : null,
   };
 }
 
@@ -133,7 +142,7 @@ export function configVerdict(rekeyInspect, baseInspect, hand, dockerfileText, c
   hand = hand ?? {};
   const base_half = { Env: bc.Env ?? null, Entrypoint: bc.Entrypoint ?? null, Cmd: bc.Cmd ?? null, User: bc.User ?? '', WorkingDir: bc.WorkingDir ?? '' };
   // (a) the config digest is the chain's, never inspect's Id
-  const ch = chainVerdict(chain, fromDigest(dockerfileText), bc);
+  const ch = chainVerdict(chain, fromDigest(dockerfileText), bc, rb.RootFS?.Layers);
   const pinned = (pin, read) => (pin === 'VERIFY' ? 'STOP' : P(typeof pin === 'string' && read !== null && pin === read));
   // (b) env
   const hEnv = handEnv(hand);
@@ -192,20 +201,22 @@ export function configVerdict(rekeyInspect, baseInspect, hand, dockerfileText, c
     ok: Object.values(checks).every((x) => x === 'PASS'), checks,
     base_manifest_digest_read: ch.manifest_digest_read, base_config_digest_read: ch.config_digest_read, base_inspect_id: rb.Id ?? null, base_platform: { Architecture: rb.Architecture ?? null, Os: rb.Os ?? null },
     base_half, hand_keys: Object.keys(hand).filter((k) => HAND_KEYS.includes(k) && !['what', 'base_manifest_digest', 'base_config_digest'].includes(k)).sort(),
-    details: { inspect_vs_blob_differ: ch.inspect_vs_blob_differ, blob_platform: ch.blob_platform, env_extra: extra, env_missing: missing, env_changed: changed, env_duplicate: dup, hand_not_backed: problems, hand_restates_base: restated, rekey_has: rekeyHas, base_has: baseHas },
+    details: { inspect_vs_blob_differ: ch.inspect_vs_blob_differ, inspect_layers: ch.layers_read, blob_diff_ids: ch.blob_diff_ids, blob_platform: ch.blob_platform, env_extra: extra, env_missing: missing, env_changed: changed, env_duplicate: dup, hand_not_backed: problems, hand_restates_base: restated, rekey_has: rekeyHas, base_has: baseHas },
   };
 }
 
 // The two planted cases. Each must come back red on the env line.
 const PATH = 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
-const fakeBase = (env) => [{ Id: 'sha256:planted', Architecture: 'amd64', Os: 'linux', Config: { Env: env, Entrypoint: ['docker-entrypoint.sh'], Cmd: ['node'], User: '', WorkingDir: '' } }];
+// Two made-up layer digests: the default diff_ids of makeChain and the RootFS.Layers of the planted base record.
+export const PLANT_LAYERS = ['sha256:' + '11'.repeat(32), 'sha256:' + '22'.repeat(32)];
+const fakeBase = (env, layers = PLANT_LAYERS) => [{ Id: 'sha256:planted', Architecture: 'amd64', Os: 'linux', RootFS: { Type: 'layers', Layers: [...layers] }, Config: { Env: env, Entrypoint: ['docker-entrypoint.sh'], Cmd: ['node'], User: '', WorkingDir: '' } }];
 const fakeRekey = (env) => [{ Config: { Env: env, Entrypoint: ['/bin/bash', '-p', '/opt/rekey/rekey-entrypoint.sh'], Cmd: null, User: '1000:1000', WorkingDir: '' } }];
 const PLANT_HAND = { user: '1000:1000', entrypoint: ['/bin/bash', '-p', '/opt/rekey/rekey-entrypoint.sh'], cmd: null, env: {} };
 const PLANT_DF = 'FROM x\nUSER 1000:1000\nENTRYPOINT ["/bin/bash", "-p", "/opt/rekey/rekey-entrypoint.sh"]\n';
 // A made-up registry chain whose config blob carries `config` (an inspect-shaped Config), consistent end to end:
 // {chain, indexDigest, manifestDigest, configDigest}. Exported for the units; the instrument plants from it too.
-export function makeChain(config, { arch = 'amd64', os = 'linux', extraManifests = [] } = {}) {
-  const cfgBytes = Buffer.from(JSON.stringify({ architecture: arch, os, config, rootfs: { type: 'layers', diff_ids: [] } }));
+export function makeChain(config, { arch = 'amd64', os = 'linux', extraManifests = [], diffIds = PLANT_LAYERS } = {}) {
+  const cfgBytes = Buffer.from(JSON.stringify({ architecture: arch, os, config, rootfs: { type: 'layers', diff_ids: diffIds } }));
   const configDigest = sha(cfgBytes);
   const manBytes = Buffer.from(JSON.stringify({ schemaVersion: 2, mediaType: 'application/vnd.oci.image.manifest.v1+json',
     config: { mediaType: 'application/vnd.oci.image.config.v1+json', digest: configDigest, size: cfgBytes.length }, layers: [] }));
@@ -229,7 +240,13 @@ export function instrument() {
   const b = fakeBase([PATH, 'NODE_VERSION=22']), c = makeChain(fakeBase([PATH])[0].Config);
   const store = configVerdict(fakeRekey([PATH, 'NODE_VERSION=22']), b, PLANT_HAND, PLANT_DF.replace('FROM x', `FROM x@${c.indexDigest}`), c.chain);
   const storeRed = !store.ok && store.checks.base_inspect_equals_the_config_blob === 'FAIL' && store.checks.base_config_blob_matches_the_manifest === 'PASS';
-  return { bites: red(extraInBase) && red(nodeOptions) && storeRed, extra_base_variable_red: red(extraInBase), node_options_red: red(nodeOptions), store_answers_other_config_red: storeRed };
+  // Security 12278.5: a local store that answers with the right config but one layer other than the blob's diff_ids
+  // must turn the layers line red, with the config tie and every hash in the chain still good.
+  const other = [PLANT_LAYERS[0], 'sha256:' + '33'.repeat(32)];
+  const lb = fakeBase([PATH, 'NODE_VERSION=22'], other), lc = makeChain(fakeBase([PATH, 'NODE_VERSION=22'])[0].Config);
+  const lay = configVerdict(fakeRekey([PATH, 'NODE_VERSION=22']), lb, PLANT_HAND, PLANT_DF.replace('FROM x', `FROM x@${lc.indexDigest}`), lc.chain);
+  const layersRed = !lay.ok && lay.checks.base_inspect_layers_equal_the_blob === 'FAIL' && lay.checks.base_inspect_equals_the_config_blob === 'PASS' && lay.checks.base_config_blob_matches_the_manifest === 'PASS';
+  return { bites: red(extraInBase) && red(nodeOptions) && storeRed && layersRed, extra_base_variable_red: red(extraInBase), node_options_red: red(nodeOptions), store_answers_other_config_red: storeRed, store_answers_other_layers_red: layersRed };
 }
 
 if (process.argv[1]?.endsWith('mediator-image-config.mjs')) {
@@ -244,7 +261,7 @@ if (process.argv[1]?.endsWith('mediator-image-config.mjs')) {
     const checks = { instrument_bites: P(ins.bites), ...v.checks };
     const ok = Object.values(checks).every((x) => x === 'PASS');
     const { ok: _o, checks: _c, ...rest } = v;
-    fs.writeFileSync(out, `${JSON.stringify({ what: 'rekey image config record (Security 11935, 12197.2, 12232.1)', ok, checks, instrument: ins, ...rest }, null, 2)}\n`);
+    fs.writeFileSync(out, `${JSON.stringify({ what: 'rekey image config record (Security 11935, 12197.2, 12232.1, 12278)', ok, checks, instrument: ins, ...rest }, null, 2)}\n`);
     console.log(JSON.stringify({ ok, checks, base_manifest_digest_read: v.base_manifest_digest_read, base_config_digest_read: v.base_config_digest_read, base_inspect_id: v.base_inspect_id, base_platform: v.base_platform, details: v.details }));
     process.exit(ok ? 0 : 1);
   } catch (e) { console.error(`mediator-image-config: ${e.message}`); process.exit(1); }
