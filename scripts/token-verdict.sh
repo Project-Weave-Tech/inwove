@@ -38,7 +38,8 @@ if [ "$valid" = true ]; then
   if jq -e '.data == null' "$body" >/dev/null 2>&1; then data_is_null=true; fi
   raw=$(jq -r '.errors[0].message? // empty | tostring' "$body" 2>/dev/null | head -n1 | head -c 200)
   if printf '%s' "$raw" | grep -Eq "^[A-Za-z .,'-]{1,80}$"; then
-    if [ "$(printf '%s' "$raw" | wc -l)" = "0" ]; then msg="$raw"; fi
+    # macOS's wc pads its count ("       0"), so only the digits are compared (the live room's keeper tests on a Mac)
+    if [ "$(printf '%s' "$raw" | wc -l | tr -d '[:space:]')" = "0" ]; then msg="$raw"; fi
   fi
 fi
 safe_code=$(printf '%s' "$code" | tr -cd '0-9' | head -c 3)

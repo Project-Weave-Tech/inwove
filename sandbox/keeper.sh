@@ -90,16 +90,19 @@ while sleep 60; do
   git -C "$LIVE" fetch -q origin "$BRANCH" 2>>"$LOG" || continue
   cur="$(git -C "$LIVE" rev-parse HEAD)"; new="$(git -C "$LIVE" rev-parse "origin/$BRANCH")"
   [ "$cur" = "$new" ] && continue
+  # a commit that failed once is not tested again every minute (2026-11-16: a failing main kept the whole suite
+  # running on this Mac nonstop); the next commit on the branch is tested as usual
+  [ "$new" = "${FAILED:-}" ] && continue
   log "new commit ${new:0:7}: testing it inside the sandbox"
   git -C "$LIVE" worktree remove --force "$STAGE" 2>/dev/null; rm -rf "$STAGE"
   git -C "$LIVE" worktree add -q --detach "$STAGE" "$new" 2>>"$LOG"
   if boxed "$STAGE" npm ci --no-audit --no-fund --loglevel=error >> "$LOG" 2>&1 && tested "$STAGE" npm test >> "$ROOT/tests.log" 2>&1; then
     git -C "$LIVE" checkout -q --detach "$new" && boxed "$LIVE" npm ci --no-audit --no-fund --loglevel=error >> "$LOG" 2>&1
     if start_room; then log "updated to ${new:0:7}"; else
-      log "rolling back to ${cur:0:7}"; git -C "$LIVE" checkout -q --detach "$cur"; boxed "$LIVE" npm ci --no-audit --no-fund --loglevel=error >> "$LOG" 2>&1; start_room
+      FAILED="$new"; log "rolling back to ${cur:0:7}"; git -C "$LIVE" checkout -q --detach "$cur"; boxed "$LIVE" npm ci --no-audit --no-fund --loglevel=error >> "$LOG" 2>&1; start_room
     fi
   else
-    log "tests failed on ${new:0:7}: staying on ${cur:0:7} (see tests.log)"
+    FAILED="$new"; log "tests failed on ${new:0:7}: staying on ${cur:0:7} (see tests.log); not testing it again"
   fi
   git -C "$LIVE" worktree remove --force "$STAGE" 2>/dev/null
 done
